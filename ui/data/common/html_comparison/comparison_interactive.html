@@ -1,0 +1,250 @@
+
+        <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Comparación Interactiva de Productos</title><style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding:0; background-color: #f4f7f6; color: #333; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 25px; font-size: 0.85em; box-shadow: 0 2px 5px rgba(0,0,0,0.1); background-color: white; }
+        th, td { border: 1px solid #ccc; padding: 10px; text-align: left; vertical-align: top; }
+        th { background-color: #e9ecef; color: #495057; font-weight: 600; }
+        .sku-page { display: none; border: 1px solid #dee2e6; border-radius: .25rem; padding: 15px; margin-bottom:20px; margin-left:15px; margin-right:15px; background-color: #fff; }
+        .sku-page.active { display: block; }
+        #sku-navigation-container { padding: 10px 0; background-color: #343a40; color:white; position: sticky; top: 0; z-index: 1001; box-shadow: 0 2px 4px rgba(0,0,0,0.1); width:100%;}
+        #sku-navigation { text-align: center; }
+        #sku-navigation button { padding: 8px 15px; font-size: 1em; margin: 0 10px; cursor: pointer; background-color: #007bff; color:white; border:none; border-radius:4px; }
+        #sku-navigation button:disabled { cursor: not-allowed; opacity: 0.65; background-color: #6c757d;}
+        #sku-nav-status { font-weight: bold; margin: 0 15px; }
+
+        .sku-header { background-color: #007bff; color: white; padding: 12px 15px; margin-top: 0; border-radius: 5px 5px 0 0; font-size: 1.2em; }
+        .field-name { font-weight: bold; min-width: 180px; background-color: #f8f9fa; }
+        .chosen-value-cell { background-color: #d1ecf1 !important; border-left: 3px solid #007bff; }
+        .country-val { padding: 8px; max-width: 300px; min-width:200px; word-wrap: break-word; }
+        .selection-group input[type="radio"], .selection-group input[type="checkbox"] { margin-right: 4px; vertical-align: middle; }
+        .selection-group label { margin-right: 12px; font-size: 0.95em; cursor: pointer; }
+        #save-button-container { position: fixed; bottom: 0; left: 0; width: 100%; background-color: #343a40; padding: 15px 0; text-align: center; box-shadow: 0 -2px 5px rgba(0,0,0,0.2); z-index: 1000; }
+        #save-button { padding: 12px 28px; font-size: 1.1em; background-color: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        #status-message { text-align: center; margin-top: 8px; font-weight: bold; height:20px; color: #fff; }
+        .image-container { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+        .image-container img { max-width: 100px; max-height: 100px; border: 2px solid transparent; cursor: pointer; border-radius: 3px; }
+        .image-container img.selected-image { border-color: #007bff; box-shadow: 0 0 8px rgba(0,123,255,0.5); }
+        .url-list, .specifications-list ul { padding-left: 20px; margin:0; list-style-type: disc; }
+        .url-list li, .specifications-list li { margin-bottom: 4px; }
+        .url-list a { text-decoration: none; color: #007bff; } .url-list a:hover { text-decoration: underline; }
+
+        .specifications-cell ul.specifications-sublist { list-style-type: none; padding-left: 0; margin: 0; }
+        .specifications-sublist li { margin-bottom: 6px; padding: 4px; border-radius: 3px; }
+        .specifications-sublist li:hover { background-color: #f0f8ff; }
+        .specifications-sublist input[type="checkbox"] { margin-right: 8px; vertical-align: middle; transform: scale(1.1); }
+        .specifications-sublist label { font-size: 0.9em; cursor: pointer; display: inline; }
+        .specifications-selection-display ul.specifications-chosen-list { list-style-type: none; padding-left: 0; margin: 5px 0 0 0; font-size: 0.9em; }
+        .specifications-chosen-list li { margin-bottom: 3px; background-color: #e9ecef; padding: 3px 6px; border-radius: 3px;}
+        .specifications-chosen-list em { font-style: normal; color: #007bff; font-weight: bold; }
+        h1#main-title {text-align:center; margin-top: 15px; margin-bottom: 15px;}
+        </style></head><body><h1 id="main-title">Comparación Interactiva de Productos</h1>
+        <div id="save-button-container"><button id="save-button" onclick="saveAllSelections()">Guardar Selecciones</button><div id="status-message"></div></div>
+
+        <div id="sku-navigation-container">
+          <div id="sku-navigation">
+            <button id="prev-sku-btn" onclick="navigateSku(-1)" disabled>Anterior SKU</button>
+            <span id="sku-nav-status"></span>
+            <button id="next-sku-btn" onclick="navigateSku(1)">Siguiente SKU</button>
+          </div>
+        </div>
+        <div id="skus-content-container" style="margin-bottom: 80px; margin-top: 15px;"> 
+        <div class='sku-page active' id='sku-page-10264'><h2 class='sku-header'>SKU: 10264</h2><table><thead><tr><th>Campo</th><th>Valor ES</th><th>Valor UK</th><th>Valor ITA</th><th>Selección</th></tr></thead><tbody><tr><td class='field-name'>Specifications</td><td class='country-val es-val specifications-cell' data-source='ES'><ul class='specifications-sublist'><li><input type='checkbox' id='cb-10264-Specifications-ES-Color_Temperature-0' name='specgroup-10264-Specifications-Color_Temperature' data-sku='10264' data-field='Specifications' data-spec-key='Color Temperature' data-spec-value='2050K' data-source-country='ES' checked onchange='handleSpecCheckboxChange(this)'><label for='cb-10264-Specifications-ES-Color_Temperature-0'><strong>Color Temperature:</strong> 2050K</label></li></ul></td><td class='country-val uk-val specifications-cell' data-source='UK'><ul class='specifications-sublist'><li><input type='checkbox' id='cb-10264-Specifications-UK-Color_Temperature-0' name='specgroup-10264-Specifications-Color_Temperature' data-sku='10264' data-field='Specifications' data-spec-key='Color Temperature' data-spec-value='3000K' data-source-country='UK'  onchange='handleSpecCheckboxChange(this)'><label for='cb-10264-Specifications-UK-Color_Temperature-0'><strong>Color Temperature:</strong> 3000K</label></li></ul></td><td class='country-val ita-val specifications-cell' data-source='ITA'>-(todos los subatributos son idénticos o no hay datos)-</td><td class='selection-display specifications-selection-display' id='selection-display-10264-Specifications'>Seleccionados:<ul class='specifications-chosen-list'><li><strong>Color Temperature:</strong> 2050K <em>(ES)</em></li></ul></td></tr></tbody></table></div><div class='sku-page ' id='sku-page-1401'><h2 class='sku-header'>SKU: 1401</h2><table><thead><tr><th>Campo</th><th>Valor ES</th><th>Valor UK</th><th>Valor ITA</th><th>Selección</th></tr></thead><tbody><tr><td class='field-name'>Name</td><td class='country-val es-val' data-source='ES'>VT-1172 3W LED STEP LIGHT 4000K GREY BODY</td><td class='country-val uk-val' data-source='UK'>VT-1172 3W LED STEP LIGHT  GREY BODY</td><td class='country-val ita-val' data-source='ITA'></td><td class='selection-group'><input type='radio' name='sel-1401-Name' value='ES' id='radio-sel-1401-Name-ES' checked data-sku='1401' data-field='Name' onchange='recordSelection(this)'><label for='radio-sel-1401-Name-ES'>ES</label><input type='radio' name='sel-1401-Name' value='UK' id='radio-sel-1401-Name-UK'  data-sku='1401' data-field='Name' onchange='recordSelection(this)'><label for='radio-sel-1401-Name-UK'>UK</label><input type='radio' name='sel-1401-Name' value='ITA' id='radio-sel-1401-Name-ITA'  data-sku='1401' data-field='Name' onchange='recordSelection(this)'><label for='radio-sel-1401-Name-ITA'>ITA</label></td></tr></tbody></table></div><div class='sku-page ' id='sku-page-14983'><h2 class='sku-header'>SKU: 14983</h2><table><thead><tr><th>Campo</th><th>Valor ES</th><th>Valor UK</th><th>Valor ITA</th><th>Selección</th></tr></thead><tbody><tr><td class='field-name'>Specifications</td><td class='country-val es-val specifications-cell' data-source='ES'><ul class='specifications-sublist'><li><input type='checkbox' id='cb-14983-Specifications-ES-Dimmable-0' name='specgroup-14983-Specifications-Dimmable' data-sku='14983' data-field='Specifications' data-spec-key='Dimmable' data-spec-value='Yes' data-source-country='ES' checked onchange='handleSpecCheckboxChange(this)'><label for='cb-14983-Specifications-ES-Dimmable-0'><strong>Dimmable:</strong> Yes</label></li></ul></td><td class='country-val uk-val specifications-cell' data-source='UK'><ul class='specifications-sublist'><li><input type='checkbox' id='cb-14983-Specifications-UK-Dimmable-0' name='specgroup-14983-Specifications-Dimmable' data-sku='14983' data-field='Specifications' data-spec-key='Dimmable' data-spec-value='No' data-source-country='UK'  onchange='handleSpecCheckboxChange(this)'><label for='cb-14983-Specifications-UK-Dimmable-0'><strong>Dimmable:</strong> No</label></li></ul></td><td class='country-val ita-val specifications-cell' data-source='ITA'>-(todos los subatributos son idénticos o no hay datos)-</td><td class='selection-display specifications-selection-display' id='selection-display-14983-Specifications'>Seleccionados:<ul class='specifications-chosen-list'><li><strong>Dimmable:</strong> Yes <em>(ES)</em></li></ul></td></tr></tbody></table></div><div class='sku-page ' id='sku-page-3790'><h2 class='sku-header'>SKU: 3790</h2><table><thead><tr><th>Campo</th><th>Valor ES</th><th>Valor UK</th><th>Valor ITA</th><th>Selección</th></tr></thead><tbody><tr><td class='field-name'>standard_price</td><td class='country-val es-val' data-source='ES'>6.8</td><td class='country-val uk-val' data-source='UK'>6.85</td><td class='country-val ita-val' data-source='ITA'></td><td class='selection-group'><input type='radio' name='sel-3790-standard_price' value='ES' id='radio-sel-3790-standard_price-ES'  data-sku='3790' data-field='standard_price' onchange='recordSelection(this)'><label for='radio-sel-3790-standard_price-ES'>ES</label><input type='radio' name='sel-3790-standard_price' value='UK' id='radio-sel-3790-standard_price-UK'  data-sku='3790' data-field='standard_price' onchange='recordSelection(this)'><label for='radio-sel-3790-standard_price-UK'>UK</label><input type='radio' name='sel-3790-standard_price' value='ITA' id='radio-sel-3790-standard_price-ITA' checked data-sku='3790' data-field='standard_price' onchange='recordSelection(this)'><label for='radio-sel-3790-standard_price-ITA'>ITA</label></td></tr></tbody></table></div><div class='sku-page ' id='sku-page-8885'><h2 class='sku-header'>SKU: 8885</h2><table><thead><tr><th>Campo</th><th>Valor ES</th><th>Valor UK</th><th>Valor ITA</th><th>Selección</th></tr></thead><tbody><tr><td class='field-name'>website_description</td><td class='country-val es-val' data-source='ES'>&lt;ul&gt;&lt;li&gt;Pack of 6 GU10 Spotlights designed with fittings&lt;/li&gt;&lt;li&gt;Includes GU10 holder along with quick connector for easy wiring&lt;/li&gt;&lt;li&gt;Stable SMD technology for better reliability and longer lifespan&lt;/li&gt;&lt;li&gt;Up to 80% in energy savings when compared to standard Halogen spotlights&lt;/li&gt;&lt;li&gt;Easy to install recessed installation&lt;/li&gt;&lt;li&gt;Suitable for hotels, bars, commercial, residential lighting, exhibition stands etc.&lt;/li&gt;&lt;/ul&gt;</td><td class='country-val uk-val' data-source='UK'>&lt;ul&gt;&lt;li&gt;Pack of 3 GU10 Spotlights designed with fittings&lt;/li&gt;&lt;li&gt;Includes GU10 holder along with quick connector for easy wiring&lt;/li&gt;&lt;li&gt;Stable SMD technology for better reliability and longer lifespan&lt;/li&gt;&lt;li&gt;Up to 80% in energy savings when compared to standard Halogen spotlights&lt;/li&gt;&lt;li&gt;Easy to install recessed installation&lt;/li&gt;&lt;li&gt;Suitable for hotels, bars, commercial, residential lighting, exhibition stands etc.&lt;/li&gt;&lt;/ul&gt;</td><td class='country-val ita-val' data-source='ITA'></td><td class='selection-group'><input type='radio' name='sel-8885-website_description' value='ES' id='radio-sel-8885-website_description-ES' checked data-sku='8885' data-field='website_description' onchange='recordSelection(this)'><label for='radio-sel-8885-website_description-ES'>ES</label><input type='radio' name='sel-8885-website_description' value='UK' id='radio-sel-8885-website_description-UK'  data-sku='8885' data-field='website_description' onchange='recordSelection(this)'><label for='radio-sel-8885-website_description-UK'>UK</label><input type='radio' name='sel-8885-website_description' value='ITA' id='radio-sel-8885-website_description-ITA'  data-sku='8885' data-field='website_description' onchange='recordSelection(this)'><label for='radio-sel-8885-website_description-ITA'>ITA</label></td></tr></tbody></table></div>
+            </div> 
+            <script>
+                
+                const selections = {};
+                const urlListFieldsJS = ["Pdf_Urls", "Video_Urls"];
+                const structuredFieldsJS = ["specifications"];
+
+                let currentSkuIndex = 0; 
+                let skuPages = [];       
+                let prevSkuBtn = null;   
+                let nextSkuBtn = null;
+                let skuNavStatus = null;
+        
+
+                function handleSpecCheckboxChange(checkboxElement) {
+                    const groupName = checkboxElement.name;
+                    if (checkboxElement.checked) {
+                        document.querySelectorAll(`input[type="checkbox"][name="${groupName}"]`).forEach(cb => {
+                            if (cb !== checkboxElement) {
+                                cb.checked = false;
+                            }
+                        });
+                    }
+                    recordSelection(checkboxElement); 
+                }
+
+                function initializeSkuPagination() {
+                    if (skuPages.length > 0) {
+                        updateNavigationControls(); 
+                        if (skuPages.length === 1) {
+                            if(prevSkuBtn) prevSkuBtn.style.display = 'none';
+                            if(nextSkuBtn) nextSkuBtn.style.display = 'none';
+                        }
+                    } else { 
+                        const navContainer = document.getElementById('sku-navigation-container');
+                        if(navContainer) navContainer.style.display = 'none';
+                        const skusContentContainer = document.getElementById('skus-content-container');
+                        if (skusContentContainer) {
+                             skusContentContainer.innerHTML = "<p style='text-align:center; font-size:1.2em; margin-top:30px;'>No se encontraron SKUs con diferencias para mostrar.</p>";
+                        }
+                    }
+                }
+
+                function showSkuPage(index) {
+                    if (index < 0 || index >= skuPages.length) return;
+
+                    if (skuPages[currentSkuIndex]) {
+                        skuPages[currentSkuIndex].classList.remove('active');
+                    }
+                    if (skuPages[index]) {
+                        skuPages[index].classList.add('active');
+                    }
+                    currentSkuIndex = index; 
+                    updateNavigationControls();
+
+                    if (skuPages[currentSkuIndex]) { 
+                        const pageTop = skuPages[currentSkuIndex].offsetTop;
+                        const navContainer = document.getElementById('sku-navigation-container');
+                        const navHeight = navContainer ? navContainer.offsetHeight : 0;
+                        window.scrollTo({ top: pageTop - navHeight - 10, behavior: 'smooth' });
+                    }
+                }
+
+                function navigateSku(direction) {
+                    const newIndex = currentSkuIndex + direction; 
+                    showSkuPage(newIndex);
+                }
+
+                function updateNavigationControls() {
+                    if (!skuPages || skuPages.length === 0) { return; }
+                    if(prevSkuBtn) prevSkuBtn.disabled = currentSkuIndex === 0;
+                    if(nextSkuBtn) nextSkuBtn.disabled = currentSkuIndex >= skuPages.length - 1; 
+                    if(skuNavStatus && typeof skuNavStatus.textContent !== 'undefined') {
+                        skuNavStatus.textContent = "SKU " + (currentSkuIndex + 1) + " de " + skuPages.length;
+                    }
+                }
+
+                function escapeHtml(unsafeText) {
+                    const div = document.createElement('div');
+                    div.innerText = unsafeText;
+                    return div.innerHTML;
+                }
+
+                function recordSelection(element) {
+                    const sku = element.dataset.sku; 
+                    const field = element.dataset.field;
+                    if (!selections[sku]) selections[sku] = {};
+
+                    if (field === 'Image_Urls') {
+                        const cbs = document.querySelectorAll(`input[type="checkbox"][data-sku="${sku}"][data-field="Image_Urls"]:checked`);
+                        selections[sku][field] = Array.from(cbs).map(cb => cb.value);
+                        updateImageSelectionDisplay(sku, field);
+                    } else if (structuredFieldsJS.includes(field.toLowerCase()) && element.type === 'checkbox') {
+                        const allCheckedSpecCheckboxesForField = document.querySelectorAll(`input[type="checkbox"][data-sku="${sku}"][data-field="${field}"]:checked`);
+                        const currentSelectedItems = [];
+                        allCheckedSpecCheckboxesForField.forEach(cb => {
+                            currentSelectedItems.push({
+                                key: cb.dataset.specKey,
+                                value: cb.dataset.specValue,
+                                source_country: cb.dataset.sourceCountry
+                            });
+                        });
+                        selections[sku][field] = currentSelectedItems;
+                        updateStructuredFieldSelectionDisplay(sku, field, currentSelectedItems);
+
+                    } else if (element.type === 'radio' && element.checked) { 
+                        selections[sku][field] = element.value;
+                        const tr = element.closest('tr');
+                        if (tr) {
+                            tr.querySelectorAll('td.country-val').forEach(td => td.classList.remove('chosen-value-cell'));
+                            const targetTd = tr.querySelector(`td.country-val[data-source="${element.value}"]`);
+                            if (targetTd) targetTd.classList.add('chosen-value-cell');
+                        }
+                    }
+                }
+
+                function toggleImageSelection(imgEl, cbId) { const cb = document.getElementById(cbId); if (cb) { cb.checked = !cb.checked; imgEl.classList.toggle('selected-image', cb.checked); recordSelection(cb); } }
+
+                function updateImageSelectionDisplay(sku, field) {
+                    const safeId = field.replace(/[^a-zA-Z0-9_]/g, '_');
+                    const dispId = `selection-display-img-${sku}-${safeId}`;
+                    const dispCell = document.getElementById(dispId);
+                    if (!dispCell) return;
+                    const urls = selections[sku]?.[field] || [];
+                    if (urls.length > 0) {
+                        dispCell.innerHTML = "Seleccionadas: " + urls.map(url => `<img src="${escapeHtml(url)}" style="max-width:50px; max-height:50px; margin-right:5px; vertical-align:middle; border:1px solid #ddd;">`).join('');
+                    } else dispCell.innerHTML = "Ninguna seleccionada";
+                }
+
+                function updateStructuredFieldSelectionDisplay(sku, field, selectedItems) {
+                    const safeFieldName = field.replace(/[^a-zA-Z0-9_]/g, '_');
+                    const displayCellId = `selection-display-${sku}-${safeFieldName}`;
+                    const displayCell = document.getElementById(displayCellId);
+                    if (!displayCell) return;
+
+                    if (selectedItems && selectedItems.length > 0) {
+                        let html = "Seleccionados:<ul class='specifications-chosen-list'>";
+                        selectedItems.forEach(cs => {
+                            html += `<li><strong>${escapeHtml(cs.key)}:</strong> ${escapeHtml(cs.value)} <em>(${escapeHtml(cs.source_country)})</em></li>`;
+                        });
+                        html += "</ul>";
+                        displayCell.innerHTML = html;
+                    } else {
+                        displayCell.innerHTML = "Ninguno seleccionado";
+                    }
+                }
+
+                async function saveAllSelections() {
+                    const saveButton = document.getElementById('save-button'); const statusDiv = document.getElementById('status-message');
+                    saveButton.disabled = true; saveButton.textContent = 'Guardando...'; statusDiv.textContent = 'Enviando...'; statusDiv.style.color = '#ffc107';
+                    try {
+                        const response = await fetch('http://localhost:5050/save_selections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(selections) });
+                        const result = await response.json();
+                        if (response.ok && result.status === 'success') { statusDiv.textContent = '¡Guardado con éxito!'; statusDiv.style.color = '#28a745'; saveButton.textContent = 'Guardado'; }
+                        else { statusDiv.textContent = 'Error: ' + (result.message || 'Desconocido'); statusDiv.style.color = '#dc3545'; saveButton.disabled = false; saveButton.textContent = 'Reintentar'; }
+                    } catch (error) { statusDiv.textContent = 'Error de red: ' + error.message; statusDiv.style.color = '#dc3545'; saveButton.disabled = false; saveButton.textContent = 'Reintentar'; }
+                }
+
+                document.addEventListener('DOMContentLoaded', () => {
+                    console.log("--- DOMContentLoaded START (Paginación Reactivada) ---");
+                    try {
+                        skuPages = Array.from(document.querySelectorAll('.sku-page')); 
+                        prevSkuBtn = document.getElementById('prev-sku-btn');
+                        nextSkuBtn = document.getElementById('next-sku-btn');
+                        skuNavStatus = document.getElementById('sku-nav-status');
+
+                        initializeSkuPagination(); 
+
+                        document.querySelectorAll('input[type="radio"][data-sku][data-field], input[type="checkbox"][data-sku][data-field]').forEach(inp => {
+                            if (inp.checked) {
+                               // Para campos estructurados, el handleSpecCheckboxChange no se llamará en la carga inicial
+                               // así que necesitamos llamar a recordSelection directamente.
+                               // Para radio y otros checkboxes, esto también es seguro.
+                               recordSelection(inp); 
+                            }
+                        });
+
+                        const activePage = document.querySelector('.sku-page.active');
+                        if (activePage) {
+                            activePage.querySelectorAll('table tbody tr').forEach(tr => {
+                                const firstRadio = tr.querySelector('input[type="radio"][data-field]:checked');
+                                 if (firstRadio) {
+                                    const fieldName = firstRadio.dataset.field;
+                                    if (!structuredFieldsJS.includes(fieldName.toLowerCase())) { 
+                                        tr.querySelectorAll('td.country-val').forEach(td => td.classList.remove('chosen-value-cell'));
+                                        const targetTd = tr.querySelector(`td.country-val[data-source="${firstRadio.value}"]`);
+                                        if (targetTd) targetTd.classList.add('chosen-value-cell');
+                                    }
+                                }
+                            });
+                        }
+                       console.log("--- DOMContentLoaded END (Paginación Reactivada) ---");
+                    } catch (e) {
+                        console.error("Error during DOMContentLoaded (Paginación Reactivada):", e.message, e.stack);
+                        alert("JavaScript Initialization Error (Paginación Reactivada - consola para detalles): " + e.message);
+                    }
+                });
+                console.log("--- SCRIPT END (Paginación Reactivada) ---");
+            </script></body></html>
