@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import pandas as pd
@@ -6,6 +7,7 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from services.utils import Utils
 from enum import Enum
+from services.campos_odoo import ClavesExcel
 
 
 class ScrapMode(Enum):
@@ -63,21 +65,120 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
 
     product_links = []
     subcategorias = {}
+    categorias_principales = [
+        "https://led-italia.it/prodotti/M4E-fotovoltaico",
+        "https://led-italia.it/prodotti/M54-illuminazione-led",
+        "https://led-italia.it/prodotti/M68-materiale-elettrico"
+    ]
 
-    if modo_scrap == ScrapMode.TEST:
-        emit_progress("MODO TEST ACTIVADO")
-        product_links = [
-            "https://led-italia.it/prodotti/v-tac/fotovoltaico/11868/stazione...",
-            "https://led-italia.it/prodotti/v-tac/fotovoltaico/11529/inverter...",
-            "https://led-italia.it/prodotti/v-tac/zanzariere-elettriche/11180/...",
-        ]
+    SCRAP_SELECTIVO = False
+
+    if not SCRAP_SELECTIVO:
+
+        if modo_scrap == ScrapMode.TEST:
+            emit_progress("MODO TEST ACTIVADO")
+            product_links = [
+                "https://led-italia.it/prodotti/v-tac/fari/238256/faro-slim-led-smd-chip-cree-300w-135lmw-cavo-1m-nero-4000k-ip65?asq=dd7613cfa737b5ff557dc29df94e0ebe&c=ba7e65c516779208c95c2e8d35a34c58"
+            ]
+        else:
+            emit_progress("Explorando categorías principales...")
+
+            for i, url_categoria in enumerate(categorias_principales, 1):
+                emit_progress(f"📁 Buscando subcategorías ({i}/{len(categorias_principales)}): {url_categoria}")
+                driver.get(url_categoria)
+                time.sleep(1)
+
+                try:
+                    contenedor = driver.find_element(By.CSS_SELECTOR,
+                                                     "div.grid.grid-cols-2.lg\\:grid-cols-4.xl\\:grid-cols-6")
+                    enlaces = contenedor.find_elements(By.TAG_NAME, "a")
+                    for a in enlaces:
+                        href = a.get_attribute("href")
+                        try:
+                            nombre = a.find_element(By.CSS_SELECTOR, "div.text-primary").text.strip()
+                            if href and nombre:
+                                subcategorias[nombre] = href
+                        except:
+                            continue
+                except Exception as e:
+                    emit_progress(f"❌ No se encontró el contenedor en {url_categoria}: {e}")
+
+            #emit_progress(f"Encontradas {len(subcategorias)} subcategorías")
+
+            for idx, (nombre_cat, shop_link) in enumerate(subcategorias.items(), 1):
+                emit_progress(f"🔍 Procesando subcategoría ({idx}/{len(subcategorias)}): {nombre_cat}")
+
+                driver.get(shop_link)
+                time.sleep(1)
+                try:
+                    pagination = driver.find_elements(By.CSS_SELECTOR, "div.mt-4 ul.flex li div")
+                    last_page = max([int(p.text.strip()) for p in pagination if p.text.strip().isdigit()])
+                except:
+                    last_page = 1
+
+                if "sub%5B" in shop_link:
+                    shop_pages = [f"{shop_link}&page={i}" if i > 0 else shop_link for i in range(last_page)]
+                else:
+                    shop_pages = [f"{shop_link}?page={i}" if i > 0 else shop_link for i in range(last_page)]
+
+                for page_idx, page_url in enumerate(shop_pages, 1):
+                    if len(shop_pages) > 1:
+                        emit_progress(f"  📄 Página {page_idx}/{len(shop_pages)}")
+
+                    driver.get(page_url)
+                    time.sleep(3)
+                    grid = driver.find_elements(By.CSS_SELECTOR, "span.px-2.grid a")#No lo detecta
+                    for a in grid:
+                        href = a.get_attribute("href")
+                        if href and "/prodotti/" in href and href not in product_links:
+                            product_links.append(href)
+                            if modo_scrap == ScrapMode.MINI:
+                                break
+                    if modo_scrap == ScrapMode.MINI:
+                        break
+
+        if only_new_products:
+            emit_progress("🔍 Filtrando productos ya existentes...")
+            try:
+                if file_path:
+                    df_old = pd.read_excel(file_path)
+                    urls_existentes = set(df_old[ClavesExcel.URL.value].dropna().astype(str))
+                    original_count = len(product_links)
+                    product_links = [url for url in product_links if url not in urls_existentes]
+                    emit_progress(f"Productos totales: {original_count}, Nuevos detectados: {len(product_links)}")
+                    return product_links
+                else:
+                    emit_progress("No se seleccionó ningún archivo. Se devolverán todos los productos.")
+            except Exception as e:
+                emit_progress(f"Error al comparar productos previos: {e}")
+
+        emit_progress(f"Total de productos para procesar: {len(product_links)}")
+        return product_links
+
     else:
-        emit_progress("Explorando categorías principales...")
-        categorias_principales = [
-            "https://led-italia.it/prodotti/M4E-fotovoltaico",
-            "https://led-italia.it/prodotti/M54-illuminazione-led",
-            "https://led-italia.it/prodotti/M68-materiale-elettrico"
-        ]
+        emit_progress("🚀 MODO SCRAP SELECTIVO ITALIA ACTIVADO")
+        import re
+        #from services.utils import Utils
+        #file_path = Utils.seleccionar_excel()
+        SKU_EXCEL_PATH = file_path
+        SKU_COLUMN_NAME = "SKU"
+
+        # 1️⃣  Cargar SKUs válidos
+        try:
+            df_sku = pd.read_excel(SKU_EXCEL_PATH, usecols=[SKU_COLUMN_NAME])
+            allowed_skus = set(df_sku[SKU_COLUMN_NAME].dropna().astype(str).str.strip())
+            emit_progress(f"📑 SKUs cargados: {len(allowed_skus)}")
+        except Exception as e:
+            emit_progress(f"❌ No se pudo leer el Excel de SKUs: {e}")
+            return []
+
+        product_links = []  # se reutiliza la variable declarada arriba
+        subcategorias = {}
+        PAT_SKU = re.compile(r"SKU\s*([0-9]+)", re.I)
+
+        # ── Obtener subcategorías ──────────────────────────────────
+
+        emit_progress("Explorando categorías principales…")
 
         for i, url_categoria in enumerate(categorias_principales, 1):
             emit_progress(f"📁 Buscando subcategorías ({i}/{len(categorias_principales)}): {url_categoria}")
@@ -85,31 +186,33 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
             time.sleep(1)
 
             try:
-                contenedor = driver.find_element(By.CSS_SELECTOR,
-                                                 "div.grid.grid-cols-2.lg\\:grid-cols-4.xl\\:grid-cols-6")
+                contenedor = driver.find_element(
+                    By.CSS_SELECTOR,
+                    "div.grid.grid-cols-2.lg\\:grid-cols-4.xl\\:grid-cols-6"
+                )
                 enlaces = contenedor.find_elements(By.TAG_NAME, "a")
+
                 for a in enlaces:
                     href = a.get_attribute("href")
                     try:
                         nombre = a.find_element(By.CSS_SELECTOR, "div.text-primary").text.strip()
                         if href and nombre:
                             subcategorias[nombre] = href
-                    except:
+                    except Exception:
                         continue
             except Exception as e:
                 emit_progress(f"❌ No se encontró el contenedor en {url_categoria}: {e}")
 
-        emit_progress(f"Encontradas {len(subcategorias)} subcategorías")
+        # ── Recorrer subcategorías y páginas ───────────────────────
 
         for idx, (nombre_cat, shop_link) in enumerate(subcategorias.items(), 1):
             emit_progress(f"🔍 Procesando subcategoría ({idx}/{len(subcategorias)}): {nombre_cat}")
-
             driver.get(shop_link)
             time.sleep(1)
             try:
                 pagination = driver.find_elements(By.CSS_SELECTOR, "div.mt-4 ul.flex li div")
                 last_page = max([int(p.text.strip()) for p in pagination if p.text.strip().isdigit()])
-            except:
+            except Exception:
                 last_page = 1
 
             if "sub%5B" in shop_link:
@@ -123,33 +226,50 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
 
                 driver.get(page_url)
                 time.sleep(3)
-                grid = driver.find_elements(By.CSS_SELECTOR, "div.px-2.grid a")
-                for a in grid:
-                    href = a.get_attribute("href")
-                    if href and "/prodotti/" in href and href not in product_links:
-                        product_links.append(href)
-                        if modo_scrap == ScrapMode.MINI:
-                            break
-                if modo_scrap == ScrapMode.MINI:
-                    break
 
-    if only_new_products:
-        emit_progress("🔍 Filtrando productos ya existentes...")
-        try:
-            if file_path:
-                df_old = pd.read_excel(file_path)
-                urls_existentes = set(df_old["x_url_origen"].dropna().astype(str))
-                original_count = len(product_links)
-                product_links = [url for url in product_links if url not in urls_existentes]
-                emit_progress(f"Productos totales: {original_count}, Nuevos detectados: {len(product_links)}")
-                return product_links
-            else:
-                emit_progress("No se seleccionó ningún archivo. Se devolverán todos los productos.")
-        except Exception as e:
-            emit_progress(f"Error al comparar productos previos: {e}")
+                try:
+                    product_cards = driver.find_elements(
+                        By.CSS_SELECTOR,
+                        "div.select-none.border-thin"
+                    )
+                    print(f"Total: {len(product_cards)} productos")
+                    encontrados_en_pagina = 0
 
-    emit_progress(f"Total de productos para procesar: {len(product_links)}")
-    return product_links
+                    for card in product_cards:
+
+                        # 2.1 SKU
+                        try:
+                            sku_elem = card.find_element(By.CSS_SELECTOR, "p.text-primary")
+                            m = PAT_SKU.search(sku_elem.text)
+                            if not m:
+                                continue
+                            sku = m.group(1)
+                        except Exception:
+                            continue
+
+                        if sku not in allowed_skus:
+                            continue  # filtrado selectivo
+
+                        # 2.2 Enlace
+                        try:
+                            link_elem = card.find_element(By.CSS_SELECTOR, "a[href*='/prodotti/']")
+                            href = link_elem.get_attribute("href")
+                        except Exception:
+                            continue
+
+                        if href and href not in product_links:
+                            product_links.append(href)
+                            encontrados_en_pagina += 1
+
+                    if encontrados_en_pagina:
+                        emit_progress(f"  ✅ Añadidos {encontrados_en_pagina} productos en esta página")
+
+
+                except Exception as e:
+                    emit_progress(f"  ❌ Error leyendo productos: {e}")
+
+        emit_progress(f"🎯 Productos encontrados tras filtrado por SKU: {len(product_links)}")
+        return product_links
 
 
 # 👁️ Scrapea la información de cada producto desde su URL
@@ -194,7 +314,22 @@ def _scrape_productos(driver, product_links, progress_callback=None):
         except:
             pass
 
-        detalles_corregido = {key.replace("Ataque", "Casquillo"): val for key, val in detalles.items()}
+        #detalles_corregido = {key.replace("Ataque", "Casquillo"): val for key, val in detalles.items()}
+        #detalles = detalles_corregido
+        correcciones = {
+            "Ataque": "Casquillo",
+            "ANTES DE CRISTO": "AC"
+        }
+
+        # Aplicar las correcciones
+        detalles_corregido = {}
+        for key, val in detalles.items():
+            nueva_key = key
+            for original, reemplazo in correcciones.items():
+                if original in nueva_key:
+                    nueva_key = nueva_key.replace(original, reemplazo)
+            detalles_corregido[nueva_key] = val
+
         detalles = detalles_corregido
 
         # Descripción y video
@@ -214,6 +349,30 @@ def _scrape_productos(driver, product_links, progress_callback=None):
             main = driver.find_element(By.TAG_NAME, "main")
             elementos = main.find_elements(By.XPATH, ".//*")
             precio = next((el.text.strip() for el in elementos if "€" in el.text), "")
+
+            def extraer_precio(texto):
+                # 1. Buscar precio promocional (variaciones: promocional, promoción, promo)
+                promo_match = re.search(
+                    r'precio\s+(?:promocional|promoción)[^\d€]*€?\s*([\d\.]+,\d{2})',
+                    texto,
+                    re.IGNORECASE
+                )
+                if promo_match:
+                    return promo_match.group(1)
+
+                # 2. Buscar cualquier otro "precio" con número después (general)
+                normal_match = re.search(
+                    r'precio[^\d€]*€?\s*([\d\.]+,\d{2})',
+                    texto,
+                    re.IGNORECASE
+                )
+                if normal_match:
+                    return normal_match.group(1)
+
+                return None
+
+            precio = extraer_precio(precio)
+
         except:
             precio = ""
 
@@ -231,41 +390,60 @@ def _scrape_productos(driver, product_links, progress_callback=None):
         # PDFs
         pdfs = {}
         try:
-            pdf_links = driver.find_elements(By.CSS_SELECTOR, "div.grid a[href$='.pdf']")
+            pdf_links = driver.find_elements(
+                By.CSS_SELECTOR,
+                "div.grid.grid-cols-1.lg\\:flex.lg\\:flex-wrap.gap-2.py-2 a"
+            )
+
             for a in pdf_links:
                 href = a.get_attribute("href")
                 if "v-tac-scheda-tecnica" not in href:
                     text = a.text.strip()
                     pdfs[text] = href
+
         except:
             pass
 
         # Categoría desde breadcrumbs visibles
         x_categoria = ""
         try:
-            breadcrumb_links = driver.find_elements(By.CSS_SELECTOR, "div.lg\\:flex.items-center a")
-            if len(breadcrumb_links) >= 3:
-                nivel1 = breadcrumb_links[1].text.strip()
-                nivel2 = breadcrumb_links[2].text.strip()
-                x_categoria = f"{nivel1}/{nivel2}"
+            # obtenemos todos los enlaces como antes
+            breadcrumb_links = driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class,'gap-2')]/descendant::a"
+            )
+
+            categorias = []
+            for link in breadcrumb_links:
+                texto = link.text.strip()
+                if not texto:  # ignora vacíos
+                    continue
+                if "SKU" in texto:  # cortamos justo antes de la SKU
+                    break
+                categorias.append(texto)
+
+            x_categoria = " / ".join(categorias)
         except:
             pass
 
+        if precio: precio.strip().replace("\u00a3", "").strip()
+        else: precio=0
+
         producto = {
-            "x_url_origen": url,
-            "Name": titulo,
-            "standard_price": precio.strip().replace("\u00a3", "").strip(),
-            "Image": imagenes[0] if imagenes else "",
-            "Image_Urls": imagenes,
-            "website_description": _construir_html_desde_texto(desc),
-            "Video_Urls": video_url,
-            "Pdf_Urls": pdfs,
-            "Specifications": detalles,
-            "default_code": detalles.get("Código SKU") or detalles.get("SKU"),
-            "barcode": detalles.get("EAN", ""),
-            "weight": detalles.get("Peso", ""),
-            "x_marca": detalles.get("Marca", ""),
-            "x_categoria": x_categoria
+            ClavesExcel.URL.value: url,
+            ClavesExcel.NOMBRE.value: titulo,
+            ClavesExcel.PRECIO.value: precio,
+            ClavesExcel.IMAGEN.value: imagenes[0] if imagenes else "",
+            ClavesExcel.GALERIA.value: imagenes,
+            ClavesExcel.DESCRIPCION_WEB.value: _construir_html_desde_texto(desc),
+            ClavesExcel.VIDEOS.value: video_url,
+            ClavesExcel.DOCUMENTOS.value: pdfs,
+            ClavesExcel.ATRIBUTOS.value: detalles,
+            ClavesExcel.SKU.value: detalles.get("Código SKU") or detalles.get("SKU"),
+            ClavesExcel.REFERENCIA.value: detalles.get("EAN", ""),
+            ClavesExcel.PESO.value: detalles.get("Peso", ""),
+            ClavesExcel.MARCA.value: detalles.get("Marca", ""),
+            ClavesExcel.CATEGORIA.value: x_categoria
         }
 
         productos.append(producto)
@@ -281,34 +459,36 @@ def _scrape_productos(driver, product_links, progress_callback=None):
 
     return productos
 
-
 # 📊 Exporta los datos scrapeados a Excel
 def _guardar_excel(productos, excel_path):
     items = []
+    region = "it"
     for p in productos:
         row = {
-            "x_url_origen": p["x_url_origen"],
-            "Name": p["Name"],
-            "standard_price": p["standard_price"],
-            "Image": p["Image"],
-            "Image_Urls": p["Image_Urls"],
-            "website_description": p["website_description"],
-            "Video_Urls": p["Video_Urls"],
-            "Pdf_Urls": p["Pdf_Urls"],
-            "Specifications": json.dumps(p["Specifications"], ensure_ascii=False),
-            "default_code": p["default_code"],
-            "barcode": p["barcode"],
-            "weight": p["weight"],
-            "x_marca": p["x_marca"],
-            "x_categoria": p["x_categoria"]
+            ClavesExcel.URL.value: p[ClavesExcel.URL.value],
+            ClavesExcel.NOMBRE.value: p[ClavesExcel.NOMBRE.value],
+            ClavesExcel.IMAGEN.value: p[ClavesExcel.IMAGEN.value],
+            ClavesExcel.GALERIA.value: p[ClavesExcel.GALERIA.value],
+            ClavesExcel.DESCRIPCION_WEB.value: p[ClavesExcel.DESCRIPCION_WEB.value],
+            ClavesExcel.VIDEOS.value: p[ClavesExcel.VIDEOS.value],
+            ClavesExcel.DOCUMENTOS.value: p[ClavesExcel.DOCUMENTOS.value],
+            ClavesExcel.ATRIBUTOS.value: json.dumps(p[ClavesExcel.ATRIBUTOS.value], ensure_ascii=False),
+            ClavesExcel.SKU.value: p[ClavesExcel.SKU.value],
+            ClavesExcel.REFERENCIA.value: p[ClavesExcel.REFERENCIA.value],
+            ClavesExcel.PESO.value: p[ClavesExcel.PESO.value],
+            ClavesExcel.MARCA.value: p[ClavesExcel.MARCA.value],
+            ClavesExcel.CATEGORIA.value: p[ClavesExcel.CATEGORIA.value],
+            ClavesExcel.PRECIO.value: p[ClavesExcel.PRECIO.value]
         }
         items.append(row)
 
-    Utils.save_to_excel(items, "vtac_it")
-    Utils.excel_read_and_parse("vtac_it")
+    Utils.save_to_excel(items, "vtac_it", region)
+    Utils.excel_read_and_parse("vtac_it", region)
 
 
 def _construir_html_desde_texto(texto):
     lineas = [line.strip() for line in texto.split("\n") if line.strip()]
     html = "<div>" + "".join(f"<p>{line}</p>" for line in lineas) + "</div>"
     return html
+
+if __name__ == "__main__": run_vtac_italia_scraper(modo_scrap=ScrapMode.TEST)

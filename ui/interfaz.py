@@ -1,12 +1,9 @@
-import json
 import os
-import threading
 import tkinter as tk
 from enum import Enum, auto
 from tkinter import *  # Considera importar selectivamente
 from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
-import webbrowser
 
 # --- INICIO: Modificación para resolver ImportError de core.exceptions ---
 import sys
@@ -422,39 +419,6 @@ class Interface:
         generate_merged_btn.pack(side='left')
         self.hover(generate_merged_btn, "#218838", "#28A745")
 
-        excel_diff_frame = LabelFrame(content_frame, text="Comparación entre Excels Fusionados",
-                                      font=('Helvetica', 12, 'bold'), fg='white',
-                                      bg=self.BACKGROUND_COLOR, labelanchor='n', padx=15, pady=10)
-        excel_diff_frame.pack(pady=(15, 15), padx=10, fill='x')
-        file_selection_diff_outer_frame = Frame(excel_diff_frame, bg=self.BACKGROUND_COLOR)
-        file_selection_diff_outer_frame.pack(fill='x', padx=5, pady=(10, 5))
-
-        file_selection_diff_frame_old = Frame(file_selection_diff_outer_frame, bg=self.BACKGROUND_COLOR)
-        file_selection_diff_frame_old.pack(fill='x', pady=(0, 5))
-        Button(file_selection_diff_frame_old, text="📁 Excel Antiguo", **{**self.button_style, 'padx': 10, 'pady': 5},
-               # Más pequeño
-               command=lambda: self.select_file(self.controller.merge_controller.MERGED_EXCEL_PATH_OLD)).pack(
-            side='left', padx=(0, 5))
-        Entry(file_selection_diff_frame_old, textvariable=self.controller.merge_controller.MERGED_EXCEL_PATH_OLD,
-              font=('Helvetica', 10), state="disabled", bg='#E8E8E8').pack(side='left', fill='x', expand=True, ipady=3)
-
-        file_selection_diff_frame_new = Frame(file_selection_diff_outer_frame, bg=self.BACKGROUND_COLOR)
-        file_selection_diff_frame_new.pack(fill='x', pady=(5, 5))
-        Button(file_selection_diff_frame_new, text="📁 Excel Nuevo", **{**self.button_style, 'padx': 10, 'pady': 5},
-               command=lambda: self.select_file(self.controller.merge_controller.MERGED_EXCEL_PATH_NEW)).pack(
-            side='left', padx=(0, 5))
-        Entry(file_selection_diff_frame_new, textvariable=self.controller.merge_controller.MERGED_EXCEL_PATH_NEW,
-              font=('Helvetica', 10), state="disabled", bg='#E8E8E8').pack(side='left', fill='x', expand=True, ipady=3)
-
-        actions_frame_diff = Frame(excel_diff_frame, bg=self.BACKGROUND_COLOR)
-        actions_frame_diff.pack(pady=(10, 15))
-        excel_diff_btn_style = {**self.button_style, 'font': ('Helvetica', 12, 'bold'), 'bg': '#FF8C00', 'fg': 'white',
-                                'padx': 20, 'pady': 8}
-        excel_diff_btn = Button(actions_frame_diff, text="🔍 Comparar y Reportar",
-                                command=self._execute_excel_merge_comparison, **excel_diff_btn_style)
-        excel_diff_btn.pack()
-        self.hover(excel_diff_btn, "#E07B00", "#FF8C00")
-
     def import_interface(self):
         content_frame = self._setup_common_interface_structure("📥 CONFIGURACIÓN IMPORT ODOO")
 
@@ -475,6 +439,55 @@ class Interface:
             for i, (text, var, indent_level) in enumerate(options):
                 check = Checkbutton(section_frame, text=text, variable=var, **self.checkbutton_style)
                 check.pack(anchor="w", padx=10 + (indent_level * 25), pady=5)
+
+                # Si es el checkbox "Publicar productos", agregamos los checkboxes dependientes
+                if text == "Publicar productos":
+                    # Frame contenedor para los checkboxes dependientes (horizontal)
+                    dependent_frame = Frame(section_frame, bg=self.BACKGROUND_COLOR)
+                    dependent_frame.pack(anchor="w", padx=35, pady=(5, 0))
+
+                    # Checkbox SKU (lado izquierdo)
+                    sku_check = Checkbutton(dependent_frame, text="SKU",
+                                            variable=self.controller.import_controller.IF_USE_SKU,
+                                            **self.checkbutton_style)
+                    sku_check.pack(side='left', padx=(0, 20))  # ✅ CAMBIO: side='left' con espacio a la derecha
+
+                    # Checkbox Categoría (lado derecho)
+                    categoria_check = Checkbutton(dependent_frame, text="Categoría",
+                                                  variable=self.controller.import_controller.IF_USE_CATEGORIA,
+                                                  **self.checkbutton_style)
+                    categoria_check.pack(side='left')  # ✅ CAMBIO: side='left' (aparecerá al lado del anterior)
+
+                    # Configurar el comportamiento de los checkboxes
+                    def on_publish_change():
+                        if self.controller.import_controller.IF_PUBLISH_PRODUCTS.get():
+                            # Habilitar los checkboxes dependientes
+                            sku_check.config(state='normal')
+                            categoria_check.config(state='normal')
+                        else:
+                            # Deshabilitar y desmarcar los checkboxes dependientes
+                            sku_check.config(state='disabled')
+                            categoria_check.config(state='disabled')
+                            self.controller.import_controller.IF_USE_SKU.set(False)
+                            self.controller.import_controller.IF_USE_CATEGORIA.set(False)
+
+                    def on_sku_change():
+                        if self.controller.import_controller.IF_USE_SKU.get():
+                            # Si se marca SKU, desmarcar Categoría
+                            self.controller.import_controller.IF_USE_CATEGORIA.set(False)
+
+                    def on_categoria_change():
+                        if self.controller.import_controller.IF_USE_CATEGORIA.get():
+                            # Si se marca Categoría, desmarcar SKU
+                            self.controller.import_controller.IF_USE_SKU.set(False)
+
+                    # Asignar los comandos a los checkboxes
+                    check.config(command=on_publish_change)
+                    sku_check.config(command=on_sku_change)
+                    categoria_check.config(command=on_categoria_change)
+
+                    # Configurar estado inicial
+                    on_publish_change()
 
         action_frame = Frame(content_frame, bg=self.BACKGROUND_COLOR)
         action_frame.pack(pady=25)
@@ -538,49 +551,12 @@ class Interface:
             excel_path = self.controller.merge_controller.SCRAPPED_DATA_EXCEL_PATH.get()
             selections_path = self.controller.merge_controller.USER_SELECTIONS_PATH.get()
             if not excel_path or not os.path.exists(excel_path):
-                self.show_info_message("Selecciona el Excel de scrapping.", "Archivo Requerido");
-                return
-            if not selections_path or not os.path.exists(selections_path):
-                self.show_info_message(
-                    f"Archivo de selecciones no encontrado:\n{selections_path}\nRealiza la comparación primero.",
-                    "Archivo Requerido")
+                self.show_info_message("Selecciona el Excel de scrapping.", "Archivo Requerido")
                 return
 
-            output_filename = filedialog.asksaveasfilename(
-                title="Guardar Archivo Fusionado Como", defaultextension=".xlsx",
-                initialdir=os.path.join(os.getcwd(), "data", "vtac_merged"),
-                filetypes=[("Excel files", "*.xlsx"), ("JSON files", "*.json")])
-            if not output_filename: self.show_info_message("Guardado cancelado.", "Cancelado"); return
-
-            self._create_generic_progress_window("Generando Archivo Fusionado", "💾 GENERANDO ARCHIVO FUSIONADO...")
-            App_Merge.execute_final_merge_file_generation(self.controller.event_manager, excel_path, selections_path, output_filename)
+            App_Merge.preparar_excel_opt(self.controller.event_manager, excel_path)
         except Exception as e:
             self._close_progress_window(); messagebox.showerror("Error en Generación", f"Error: {str(e)}")
-
-    def _execute_excel_merge_comparison(self):
-        from core import App_Merge
-        try:
-            excel_old = self.controller.merge_controller.MERGED_EXCEL_PATH_OLD.get()
-            excel_new = self.controller.merge_controller.MERGED_EXCEL_PATH_NEW.get()
-            if not excel_old or not os.path.exists(excel_old):
-                self.show_info_message("Selecciona un Excel 'Antiguo (Base)' válido.", "Archivo Requerido")
-                return
-            if not excel_new or not os.path.exists(excel_new):
-                self.show_info_message("Selecciona un Excel 'Nuevo (A comparar)' válido.", "Archivo Requerido")
-                return
-
-            output_report_filename = filedialog.asksaveasfilename(
-                title="Guardar Reporte de Comparación Como", defaultextension=".xlsx",
-                initialdir=os.path.join(os.getcwd(), "data", "vtac_merged", "reports"),
-                filetypes=[("Excel files", "*.xlsx")])
-            if not output_report_filename: self.show_info_message("Guardado de reporte cancelado.", "Cancelado"); return
-            os.makedirs(os.path.dirname(output_report_filename), exist_ok=True)
-
-            self._create_generic_progress_window("Comparando Excels Merge", "🔍 COMPARANDO EXCEL MERGES...")
-            selections_diff_path = os.path.join('data', 'common', 'json', 'user_selections_excel_diff.json')
-            App_Merge.execute_excel_merge_comparison_and_launch_html(self.controller.event_manager, excel_old, excel_new, selections_diff_path, output_report_filename)
-        except Exception as e:
-            self._close_progress_window(); messagebox.showerror("Error en Comparación Excels", f"Error: {str(e)}")
 
     def _execute_import_with_validation(self):
         try:
@@ -730,10 +706,6 @@ class Interface:
 
 
 if __name__ == "__main__":
-    os.makedirs(os.path.join('data', 'common', 'json'), exist_ok=True)
-    os.makedirs(os.path.join('data', 'common', 'html_comparison'), exist_ok=True)
-    os.makedirs(os.path.join('data', 'vtac_merged'), exist_ok=True)
-    os.makedirs(os.path.join('data', 'vtac_merged', 'reports'), exist_ok=True)
 
     root = tk.Tk()
     root.withdraw()

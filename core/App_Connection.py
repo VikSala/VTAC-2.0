@@ -1,9 +1,9 @@
 import xmlrpc.client
 
-url = 'http://143.47.39.5:8070/'
-db = 'odoo1'
+url = 'https://b2b.optimaluz.com/'
+db = 'odoo0'
 username = 'admin'
-password = 'admin'
+password = '1324'
 
 common = None
 uid = None

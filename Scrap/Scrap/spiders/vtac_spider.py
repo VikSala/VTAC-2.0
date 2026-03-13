@@ -6,7 +6,7 @@ import os
 """
 cd Scrap/Scrap/spiders
 scrapy crawl vtac -a region=vtac_es
-scrapy crawl vtac -a region=vtac_it
+scrapy crawl vtac -a region=advance
 """
 
 class VtacSpider(scrapy.Spider):
@@ -14,18 +14,34 @@ class VtacSpider(scrapy.Spider):
     allowed_domains = []
     start_urls = []
 
-    def __init__(self, region=None, *args, **kwargs):
+    def __init__(self, region=None, comercial_scrap=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        if region not in ["vtac_es", "vtac_uk", "vtac_it", "buyled"]:
+        if region not in ["vtac_es", "vtac_uk", "vtac_it", "buyled", "advance"]:
             raise ValueError(f"Región no válida: {region}")
 
-        handler_path = os.path.join(os.path.dirname(__file__), "handlers", f"{region}.py")
-        spec = importlib.util.spec_from_file_location("handler_module", handler_path)
-        handler_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(handler_module)
-        self.handler = handler_module
-        self.handler.init(self)  # Inicializa el handler y carga start_urls y allowed_domains
+        # 1) Guardar el flag (soporta "1/0", "true/false", etc.)
+        def _to_bool(v):
+            if v is None:
+                return None
+            s = str(v).strip().lower()
+            return s in ("1","true","t","yes","y","on","si","sí")
+        self.comercial_scrap = _to_bool(comercial_scrap)
+
+        # 2) Cargar handler de forma “EXE-friendly”
+        try:
+            # Recomendado: importar por paquete (funciona mejor en PyInstaller)
+            self.handler = importlib.import_module(f".handlers.{region}", package=__package__ or __name__.rsplit('.',1)[0])
+        except Exception:
+            # Fallback: por ruta (como tenías antes)
+            handler_path = os.path.join(os.path.dirname(__file__), "handlers", f"{region}.py")
+            spec = importlib.util.spec_from_file_location("handler_module", handler_path)
+            handler_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(handler_module)
+            self.handler = handler_module
+
+        self.handler.init(self)  # carga allowed_domains/start_urls/etc.
+
 
     async def start(self):
         headers = {

@@ -5,6 +5,7 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from services.utils import Utils
 from enum import Enum
+from services.campos_odoo import ClavesExcel
 
 
 class ScrapMode(Enum):
@@ -60,17 +61,6 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
             progress_callback(message)
         print(message)
 
-    if modo_scrap == ScrapMode.TEST:
-        emit_progress("MODO TEST UK ACTIVADO")
-        return [
-            "https://www.vtacexports.com/default/vt-5361-1m-micro-usb-cable-l-type-gold-diamond-series.html",
-            "https://www.vtacexports.com/default/vt-5361-1m-micro-usb-cable-l-type-black-diamond-series.html",
-            "https://www.vtacexports.com/default/vt-6043-4-60w-led-ceiling-fan-with-rf-control-4-blades-ac-motor.html",
-            "https://www.vtacexports.com/default/vt-3042-3-30w-led-decorative-ceiling-fan-with-rf-control-cct-3-in-1-3-blades-dc-motor.html"
-        ]
-
-    emit_progress("Explorando categorías principales de Reino Unido...")
-
     CATEGORIES_LINKS = [
         'https://www.vtacexports.com/default/led-lighting.html',
         'https://www.vtacexports.com/default/decorative-lighting.html',
@@ -83,78 +73,187 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
         'https://www.vtacexports.com/default/top-products.html'
     ]
 
-    shop_links = set()
+    SCRAP_SELECTIVO = False
 
-    for idx, start_url in enumerate(CATEGORIES_LINKS, 1):
-        emit_progress(
-            f"🔍 Procesando categoría ({idx}/{len(CATEGORIES_LINKS)}): {start_url.split('/')[-1].replace('.html', '').replace('-', ' ').title()}")
+    if not SCRAP_SELECTIVO:
 
-        current_url = start_url
-        page_count = 0
+        if modo_scrap == ScrapMode.TEST:
+            emit_progress("MODO TEST UK ACTIVADO")
+            return [
+                "https://www.vtacexports.com/default/vt-44003-300w-led-floodlight-cree-chip-1m-wire-4000k-black-body-135lm-w-6yrs-wty-ip65.html",
+                "https://www.vtacexports.com/default/vt-61024-24w-backlit-recessed-panel-samsung-chip-4000k-rd.html"
+            ]
 
-        while current_url:
-            page_count += 1
-            if page_count > 1:
-                emit_progress(f"  📄 Página {page_count} de la categoría")
+        emit_progress("Explorando categorías principales de Reino Unido...")
 
-            driver.get(current_url)
-            time.sleep(1)
+        shop_links = set()
 
+        for idx, start_url in enumerate(CATEGORIES_LINKS, 1):
+            emit_progress(
+                f"🔍 Procesando categoría ({idx}/{len(CATEGORIES_LINKS)}): {start_url.split('/')[-1].replace('.html', '').replace('-', ' ').title()}")
+
+            current_url = start_url
+            page_count = 0
+
+            while current_url:
+                page_count += 1
+                if page_count > 1:
+                    emit_progress(f"  📄 Página {page_count} de la categoría")
+
+                driver.get(current_url)
+                time.sleep(1)
+
+                try:
+                    enlaces = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+                    products_found_in_page = 0
+
+                    for a in enlaces:
+                        href = a.get_attribute("href")
+                        if href and "default/vt-" in href:
+                            if href not in shop_links:
+                                shop_links.add(href)
+                                products_found_in_page += 1
+
+                            if modo_scrap == ScrapMode.MINI:
+                                break
+
+                    if products_found_in_page > 0:
+                        emit_progress(f"  ✅ Encontrados {products_found_in_page} productos en esta página")
+
+                except Exception as e:
+                    emit_progress(f"  ❌ Error al leer enlaces: {e}")
+
+                if modo_scrap == ScrapMode.MINI:
+                    break
+
+                # Buscar botón "siguiente"
+                try:
+                    next_button = driver.find_element(By.CSS_SELECTOR, "a.action.next")
+                    next_href = next_button.get_attribute("href")
+                    if next_href and next_href != current_url:
+                        current_url = next_href
+                    else:
+                        current_url = None
+                except:
+                    current_url = None
+
+            emit_progress(f"  📊 Total acumulado hasta ahora: {len(shop_links)} productos únicos")
+
+        emit_progress(f"🎯 Total de productos encontrados en UK: {len(shop_links)}")
+
+        if only_new_products:
+            emit_progress("🔍 Filtrando productos ya existentes...")
             try:
-                enlaces = driver.find_elements(By.CSS_SELECTOR, "a[href]")
-                products_found_in_page = 0
+                if file_path:
+                    df_old = pd.read_excel(file_path)
+                    urls_existentes = set(df_old[ClavesExcel.URL.value].dropna().astype(str))
+                    original_count = len(shop_links)
+                    product_links = [url for url in shop_links if url not in urls_existentes]
+                    emit_progress(f"Productos totales: {original_count}, Nuevos detectados: {len(product_links)}")
+                    return product_links
+                else:
+                    emit_progress("No se seleccionó ningún archivo. Se devolverán todos los productos.")
+            except Exception as e:
+                emit_progress(f"Error al comparar productos previos: {e}")
 
-                for a in enlaces:
-                    href = a.get_attribute("href")
-                    if href and "default/vt-" in href:
-                        if href not in shop_links:
+        emit_progress(f"Total de productos para procesar: {len(shop_links)}")
+        return list(shop_links)
+
+    else:
+        emit_progress("🚀 MODO SCRAP SELECTIVO ACTIVADO")
+
+        import re
+        from services.utils import Utils
+        file_path = Utils.seleccionar_excel()
+        SKU_EXCEL_PATH = file_path
+        SKU_COLUMN_NAME = "SKU"
+
+        # 1) Cargar SKUs válidos desde el Excel
+        try:
+            df_sku = pd.read_excel(SKU_EXCEL_PATH, usecols=[SKU_COLUMN_NAME])
+            allowed_skus = set(df_sku[SKU_COLUMN_NAME].dropna().astype(str).str.strip())
+            emit_progress(f"📑 SKUs cargados: {len(allowed_skus)}")
+        except Exception as e:
+            emit_progress(f"❌ No se pudo leer el Excel de SKUs: {e}")
+            return []
+
+        # 2) Recorrer categorías y filtrar por SKU
+        shop_links = set()
+        SKU_RE = re.compile(r"\d+")
+
+        for idx, start_url in enumerate(CATEGORIES_LINKS, 1):
+            emit_progress(
+                f"🔍 Procesando categoría ({idx}/{len(CATEGORIES_LINKS)}): "
+                f"{start_url.split('/')[-1].replace('.html', '').replace('-', ' ').title()}"
+            )
+
+            current_url = start_url
+            page_count = 0
+
+            while current_url:
+                page_count += 1
+                if page_count > 1:
+                    emit_progress(f"  📄 Página {page_count} de la categoría")
+
+                driver.get(current_url)
+                time.sleep(1)  # pequeño respiro para que cargue
+
+                try:
+                    product_cards = driver.find_elements(By.CSS_SELECTOR, "form[method='post']")
+                    encontrados_en_pagina = 0
+                    print(f"Total: {len(product_cards)} productos")
+
+                    for card in product_cards:
+                        # ── SKU ──────────────────────────────────────
+                        try:
+                            sku_elem = card.find_element(By.CSS_SELECTOR, "div.bg-dark")
+                            match = SKU_RE.search(sku_elem.text)
+                            if not match:
+                                print("No hay SKU")
+                                continue
+                            sku = match.group(0)
+                        except Exception:
+                            continue
+
+                        # ── Filtro por lista de SKUs ────────────────
+                        if sku not in allowed_skus:
+                            continue
+
+                        # ── Enlace ──────────────────────────────────
+                        try:
+                            link_elem = card.find_element(By.CSS_SELECTOR, "a[href*='default/vt-']")
+                            href = link_elem.get_attribute("href")
+                        except Exception:
+                            continue
+
+                        if href and href not in shop_links:
                             shop_links.add(href)
-                            products_found_in_page += 1
+                            encontrados_en_pagina += 1
 
                         if modo_scrap == ScrapMode.MINI:
                             break
 
-                if products_found_in_page > 0:
-                    emit_progress(f"  ✅ Encontrados {products_found_in_page} productos en esta página")
+                    if encontrados_en_pagina > 0:
+                        emit_progress(f"  ✅ Añadidos {encontrados_en_pagina} productos en esta página")
 
-            except Exception as e:
-                emit_progress(f"  ❌ Error al leer enlaces: {e}")
+                except Exception as e:
+                    emit_progress(f"  ❌ Error leyendo productos: {e}")
 
-            if modo_scrap == ScrapMode.MINI:
-                break
-
-            # Buscar botón "siguiente"
-            try:
-                next_button = driver.find_element(By.CSS_SELECTOR, "a.action.next")
-                next_href = next_button.get_attribute("href")
-                if next_href and next_href != current_url:
-                    current_url = next_href
-                else:
+                # ── Botón siguiente página ─────────────────────────
+                try:
+                    next_button = driver.find_element(By.CSS_SELECTOR, "a.action.next")
+                    next_href = next_button.get_attribute("href")
+                    if next_href and next_href != current_url:
+                        current_url = next_href
+                    else:
+                        current_url = None
+                except Exception:
                     current_url = None
-            except:
-                current_url = None
 
-        emit_progress(f"  📊 Total acumulado hasta ahora: {len(shop_links)} productos únicos")
+            emit_progress(f"  📊 Total acumulado hasta ahora: {len(shop_links)} productos")
 
-    emit_progress(f"🎯 Total de productos encontrados en UK: {len(shop_links)}")
-
-    if only_new_products:
-        emit_progress("🔍 Filtrando productos ya existentes...")
-        try:
-            if file_path:
-                df_old = pd.read_excel(file_path)
-                urls_existentes = set(df_old["x_url_origen"].dropna().astype(str))
-                original_count = len(shop_links)
-                product_links = [url for url in shop_links if url not in urls_existentes]
-                emit_progress(f"Productos totales: {original_count}, Nuevos detectados: {len(product_links)}")
-                return product_links
-            else:
-                emit_progress("No se seleccionó ningún archivo. Se devolverán todos los productos.")
-        except Exception as e:
-            emit_progress(f"Error al comparar productos previos: {e}")
-
-    emit_progress(f"Total de productos para procesar: {len(shop_links)}")
-    return list(shop_links)
+        emit_progress(f"🎯 Productos encontrados tras filtrado por SKU: {len(shop_links)}")
+        return list(shop_links)
 
 
 # 📊 Procesa cada URL de producto y extrae todos sus campos
@@ -255,14 +354,31 @@ def _scrape_productos(driver, product_links, progress_callback=None):
         except:
             pass
 
-        storage = {}
+        correcciones = {
+            "Ataque": "Casquillo",
+            "ANTES DE CRISTO": "AC"
+        }
+
+        # Aplicar las correcciones
+        detalles_corregido = {}
+        for key, val in especificaciones.items():
+            nueva_key = key
+            for original, reemplazo in correcciones.items():
+                if original in nueva_key:
+                    nueva_key = nueva_key.replace(original, reemplazo)
+            detalles_corregido[nueva_key] = val
+
+        especificaciones = detalles_corregido
+
+        # Storage
+        '''storage = {}
         try:
             for li in driver.find_elements(By.CSS_SELECTOR, "div.grid.grid-cols-2 li.flex"):
                 label = li.find_element(By.CSS_SELECTOR, "span.font-semibold").text.strip().replace(":", "")
                 total = li.find_element(By.CSS_SELECTOR, "div.text-sm").text.strip().replace(label, "").strip()
                 storage[label] = total
         except:
-            pass
+            pass'''
 
         # Descripción
         website_description = ""
@@ -290,31 +406,31 @@ def _scrape_productos(driver, product_links, progress_callback=None):
             pass
 
         # Datasheet
-        datasheet = ""
+        '''datasheet = ""
         try:
             for a in driver.find_elements(By.CSS_SELECTOR, "a[href*='qpdf/product/generate']"):
                 datasheet = a.get_attribute("href")
                 break
         except:
-            pass
+            pass'''
 
         producto = {
-            "x_url_origen": url,
-            "Name": titulo,
-            "standard_price": precio,
-            "Image": imagenes[0] if imagenes else "",
-            "Image_Urls": imagenes,
-            "website_description": website_description,
-            "Video_Urls": "",
-            "Pdf_Urls": pdfs,
-            "Specifications": especificaciones,
-            "default_code": sku,
-            "barcode": ean,
-            "weight": peso,
-            "x_marca": marca,
-            "datasheet": datasheet,
-            "storage": storage,
-            "x_categoria": x_categoria
+            ClavesExcel.URL.value: url,
+            ClavesExcel.NOMBRE.value: titulo,
+            ClavesExcel.COSTE.value: precio,
+            ClavesExcel.IMAGEN.value: imagenes[0] if imagenes else "",
+            ClavesExcel.GALERIA.value: imagenes,
+            ClavesExcel.DESCRIPCION_WEB.value: website_description,
+            ClavesExcel.VIDEOS.value: "",
+            ClavesExcel.DOCUMENTOS.value: pdfs,
+            ClavesExcel.ATRIBUTOS.value: especificaciones,
+            ClavesExcel.SKU.value: sku,
+            ClavesExcel.REFERENCIA.value: ean,
+            ClavesExcel.PESO.value: peso,
+            ClavesExcel.MARCA.value: marca,
+            ClavesExcel.CATEGORIA.value: x_categoria
+            #"datasheet": datasheet,
+            #"storage": storage,
         }
 
         productos.append(producto)
@@ -322,7 +438,7 @@ def _scrape_productos(driver, product_links, progress_callback=None):
 
     # Progreso final
     emit_progress(f"UK: 100% ({productos_totales}/{productos_totales}) productos completados!")
-
+    print(f"UK: 100% ({productos_totales}/{productos_totales}) productos completados!")
     try:
         driver.quit()
     except:
@@ -334,29 +450,30 @@ def _scrape_productos(driver, product_links, progress_callback=None):
 # 📄 Guarda los productos extraídos en un Excel
 def _guardar_excel(productos, output_path):
     items = []
+    region = "uk"
     for p in productos:
         row = {
-            "x_url_origen": p["x_url_origen"],
-            "Name": p["Name"],
-            "standard_price": p["standard_price"],
-            "Image": p["Image"],
-            "Image_Urls": p["Image_Urls"],
-            "website_description": p["website_description"],
-            "Video_Urls": p["Video_Urls"],
-            "Pdf_Urls": p["Pdf_Urls"],
-            "Specifications": p["Specifications"],
-            "default_code": p["default_code"],
-            "barcode": p["barcode"],
-            "weight": p["weight"],
-            "x_marca": p["x_marca"],
-            "datasheet": p["datasheet"],
-            "storage": p["storage"],
-            "x_categoria": p["x_categoria"]
+            ClavesExcel.URL.value: p[ClavesExcel.URL.value],
+            ClavesExcel.NOMBRE.value: p[ClavesExcel.NOMBRE.value],
+            ClavesExcel.IMAGEN.value: p[ClavesExcel.IMAGEN.value],
+            ClavesExcel.GALERIA.value: p[ClavesExcel.GALERIA.value],
+            ClavesExcel.DESCRIPCION_WEB.value: p[ClavesExcel.DESCRIPCION_WEB.value],
+            ClavesExcel.VIDEOS.value: p[ClavesExcel.VIDEOS.value],
+            ClavesExcel.DOCUMENTOS.value: p[ClavesExcel.DOCUMENTOS.value],
+            ClavesExcel.ATRIBUTOS.value: p[ClavesExcel.ATRIBUTOS.value],
+            ClavesExcel.SKU.value: p[ClavesExcel.SKU.value],
+            ClavesExcel.REFERENCIA.value: p[ClavesExcel.REFERENCIA.value],
+            ClavesExcel.PESO.value: p[ClavesExcel.PESO.value],
+            ClavesExcel.MARCA.value: p[ClavesExcel.MARCA.value],
+            ClavesExcel.CATEGORIA.value: p[ClavesExcel.CATEGORIA.value],
+            ClavesExcel.COSTE.value: p[ClavesExcel.COSTE.value]
+            #"datasheet": p["datasheet"],
+            #"storage": p["storage"],
         }
         items.append(row)
 
-    Utils.save_to_excel(items, "vtac_uk")
-    Utils.excel_read_and_parse("vtac_uk")
+    Utils.save_to_excel(items, "vtac_uk", region)
+    Utils.excel_read_and_parse("vtac_uk", region)
 
 # Permite ejecutar directamente desde terminal
-#if __name__ == "__main__": run_vtac_uk_scraper(modo_scrap=ScrapMode.MINI)
+if __name__ == "__main__": run_vtac_uk_scraper(modo_scrap=ScrapMode.TEST)
