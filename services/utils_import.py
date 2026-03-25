@@ -129,13 +129,13 @@ SCRIPT_JS_HTML = """
 import base64
 import requests
 import time
+from PIL import Image
+from io import BytesIO
 
-def image_url_to_base64_(url, max_retries=3, timeout=10):
+def image_url_to_base64_(url, max_retries=3, timeout=10, force_png=True):
     """
-    Descarga una imagen desde una URL y la convierte en base64.
-    - Reintenta hasta max_retries veces si hay fallos.
-    - Timeout máximo de 'timeout' segundos por petición.
-    - Devuelve None si no se logra descargar.
+    Descarga una imagen desde una URL, opcionalmente la convierte a PNG,
+    y devuelve su base64.
     """
 
     headers = {
@@ -155,7 +155,21 @@ def image_url_to_base64_(url, max_retries=3, timeout=10):
 
             if response.status_code == 200:
                 print(f"✅ Imagen descargada correctamente ({elapsed}s) → {url}")
-                return base64.b64encode(response.content).decode("utf-8")
+
+                image_bytes = response.content
+
+                # 🔥 Si queremos forzar PNG (por ejemplo para evitar WEBP)
+                if force_png:
+                    try:
+                        img = Image.open(BytesIO(image_bytes)).convert("RGBA")
+                        buffer = BytesIO()
+                        img.save(buffer, format="PNG")
+                        image_bytes = buffer.getvalue()
+                    except Exception as e:
+                        print(f"⚠️ Error convirtiendo a PNG: {e}")
+
+                return base64.b64encode(image_bytes).decode("utf-8")
+
             else:
                 print(f"⚠️ [{intento}/{max_retries}] Respuesta {response.status_code} ({elapsed}s) → {url}")
 
@@ -164,7 +178,6 @@ def image_url_to_base64_(url, max_retries=3, timeout=10):
         except Exception as e:
             print(f"⚠️ [{intento}/{max_retries}] Error al descargar {url}: {e}")
 
-        # Espera antes de reintentar (excepto en el último)
         if intento < max_retries:
             time.sleep(2)
 
@@ -260,6 +273,7 @@ def build_product_data_from_row_(fila, utils, df):
     Solo incluye campos con valor válido.
     """
     product_data = {}
+    OLD_FORMAT = False
     ODOO16 = False #True
     ADVANCE = False
     LEDSPRESS = False
@@ -288,7 +302,7 @@ def build_product_data_from_row_(fila, utils, df):
             valor = GoogleTranslator(source='pt', target='es').translate(valor)
             product_data[campo_odoo] = valor
 
-        if campo_odoo == excel_a_odoo.get(ClavesExcel.DESCRIPCION_WEB.value):
+        if campo_odoo == excel_a_odoo.get(ClavesExcel.DESCRIPCION_WEB.value) and OLD_FORMAT:
             downloads = DESCRIPTION_HTML_2
             pdf_html = """<div class="row">"""
 
@@ -315,14 +329,6 @@ def build_product_data_from_row_(fila, utils, df):
                         pdf_html += bloque
                 except Exception as e:
                     print(f"⚠️ Error procesando documentos PDF: {e}")
-
-            """ LEDSPRESS
-            <div class="product-details" style="margin-bottom: 5%;">
-                  <div class="sku-line">
-                    SKU {sku}{modelo}
-                  </div>
-                  {resumen}
-            </div>"""
 
             downloads += pdf_html + DESCRIPTION_HTML_2_END
             description = DESCRIPTION_HTML_1 + f"<p>{safe_text_(valor)}</p>{pdf_html + '</div>'}" + DESCRIPTION_HTML_1_END
@@ -486,7 +492,7 @@ def preparar_marca_para_producto_(row, product_data, params):
 #Iconos
 def ico_match_(nombre, valor):
     ico_url = ""
-    ruta = "http://79.72.55.217:8069"
+    ruta = "http://158.179.220.107:8069"
     if not valor:
         if "AMAZON" in nombre or "GOOGLE" in nombre or "ALEXA" in nombre: ico_url = ruta + "/web/image/978-39bca721/DUAL%20CONTROL%20APP%20%26%20REMOTE%201.png,"
         if "BRIDGELUX" in nombre: ico_url += ruta + "/web/image/966-503077fa/BRIDGELUX%20CHIP.png,"

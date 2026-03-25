@@ -1,335 +1,8 @@
 import pandas as pd
-from openpyxl import load_workbook
+import xmlrpc.client
 from utils import Utils
 
 ruta = Utils.seleccionar_excel()
-
-def detectar_cambios_excel(ruta_excel):
-    """
-    Compara las hojas Odoo16 y Odoo18 y crea la hoja 'Cambios' con:
-      - default_code
-      - Solo las columnas que difieren (valores tomados de Odoo16)
-        Si el valor fue eliminado (vacío en 16 pero no en 18) se marca con '*'.
-    Las demás columnas quedan vacías.
-    """
-
-    # Leer las hojas
-    df16 = pd.read_excel(ruta_excel, sheet_name='Odoo16')
-    df18 = pd.read_excel(ruta_excel, sheet_name='Odoo18')
-
-    if 'default_code' not in df16.columns or 'default_code' not in df18.columns:
-        raise ValueError("Falta la columna 'default_code' en una o ambas hojas.")
-
-    # Limpiar duplicados y vacíos
-    df16 = df16.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
-    df18 = df18.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
-
-    # Indexar por default_code
-    df16 = df16.set_index('default_code')
-    df18 = df18.set_index('default_code')
-
-    comunes = df16.index.intersection(df18.index)
-    columnas_comunes = [col for col in df16.columns if col in df18.columns]
-
-    cambios = []
-
-    for code in comunes:
-        fila16 = df16.loc[code]
-        fila18 = df18.loc[code]
-
-        dif_cols = [
-            col for col in columnas_comunes
-            if str(fila16[col]).strip() != str(fila18[col]).strip()
-        ]
-
-        if dif_cols:
-            fila_resultado = {col: "" for col in columnas_comunes}  # vacío por defecto
-            fila_resultado['default_code'] = code
-
-            for col in dif_cols:
-                val16 = str(fila16[col]).strip()
-                val18 = str(fila18[col]).strip()
-
-                # Si el valor fue eliminado (antes existía y ahora está vacío)
-                if val16 in ["", "nan", "None"] and val18 not in ["", "nan", "None"]:
-                    fila_resultado[col] = "*"  # marca eliminación
-                else:
-                    fila_resultado[col] = fila16[col]  # valor normal de Odoo16
-
-            cambios.append(fila_resultado)
-
-    if not cambios:
-        print("✅ No se detectaron diferencias entre Odoo16 y Odoo18.")
-        return
-
-    # Crear DataFrame con las mismas columnas
-    df_cambios = pd.DataFrame(cambios)
-    columnas_finales = ['default_code'] + [c for c in columnas_comunes if c != 'default_code']
-    df_cambios = df_cambios[columnas_finales]
-
-    # Guardar resultados
-    with pd.ExcelWriter(ruta_excel, mode='a', engine='openpyxl', if_sheet_exists='replace') as writer:
-        df_cambios.to_excel(writer, sheet_name='Cambios', index=False)
-
-    print(f"💾 {len(df_cambios)} productos con diferencias guardados en 'Cambios'.")
-
-def rellenar_stock_multialmacen(ruta_excel):
-    import pandas as pd
-    from openpyxl import load_workbook
-
-    try:
-        # Leer todas las hojas del Excel
-        xls = pd.ExcelFile(ruta_excel)
-        df_main = pd.read_excel(xls, sheet_name="Sheet1")
-        df_madrid = pd.read_excel(xls, sheet_name="Madrid")
-        df_bulgaria = pd.read_excel(xls, sheet_name="Bulgaria")
-
-        # Asegurar columnas de destino en Sheet1
-        for col in ["M_STOCK", "B_STOCK", "UNDELIVERED ORDER"]:
-            if col not in df_main.columns:
-                df_main[col] = ""
-
-        print("🔍 Rellenando datos desde las hojas 'Madrid' y 'Bulgaria'...")
-
-        # --- 1️⃣ Copiar STOCK de Madrid a M_STOCK ---
-        dict_madrid = dict(zip(df_madrid["SKU"], df_madrid["STOCK"]))
-        df_main["M_STOCK"] = df_main["SKU"].map(dict_madrid).fillna(df_main["M_STOCK"])
-
-        # --- 2️⃣ Copiar STOCK de Bulgaria a B_STOCK ---
-        dict_bulgaria_stock = dict(zip(df_bulgaria["SKU"], df_bulgaria["STOCK"]))
-        df_main["B_STOCK"] = df_main["SKU"].map(dict_bulgaria_stock).fillna(df_main["B_STOCK"])
-
-        # --- 3️⃣ Si STOCK vacío o < 0 y UNDELIVERED ORDER tiene valor → copiarlo ---
-        if "UNDELIVERED ORDER" in df_bulgaria.columns:
-            dict_bulgaria_order = dict(zip(df_bulgaria["SKU"], df_bulgaria["UNDELIVERED ORDER"]))
-            for i, row in df_main.iterrows():
-                sku = row["SKU"]
-                if pd.isna(sku):
-                    continue
-
-                stock_bulg = dict_bulgaria_stock.get(sku, None)
-                undelivered_val = dict_bulgaria_order.get(sku, None)
-
-                if (pd.isna(stock_bulg) or stock_bulg < 0) and pd.notna(undelivered_val):
-                    df_main.at[i, "UNDELIVERED ORDER"] = undelivered_val
-
-        # --- Guardar cambios ---
-        with pd.ExcelWriter(ruta_excel, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-            df_main.to_excel(writer, sheet_name="Sheet1", index=False)
-
-        print("✅ Datos actualizados correctamente en 'Sheet1'.")
-
-    except Exception as e:
-        print(f"❌ Error en el proceso: {e}")
-
-
-import xmlrpc.client
-
-def listar_informes(url, db, username, password, modelo="sale.order"):
-    """
-    Lista todos los informes PDF (ir.actions.report) registrados en Odoo
-    para un modelo dado (por defecto 'sale.order').
-    """
-    print(f"🔌 Conectando a {url}...")
-    common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True)
-    uid = common.authenticate(db, username, password, {})
-    if not uid:
-        print("❌ Autenticación fallida.")
-        return
-
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
-    print(f"✅ Autenticado con UID {uid}")
-
-    # Buscar informes asociados al modelo indicado
-    report_ids = models.execute_kw(
-        db, uid, password,
-        "ir.actions.report", "search_read",
-        [[("model", "=", modelo), ("report_type", "=", "qweb-pdf")]],
-        {"fields": ["id", "name", "report_name", "binding_model_id", "report_file"]}
-    )
-
-    if not report_ids:
-        print(f"⚠️ No se encontraron informes PDF para el modelo '{modelo}'.")
-        return
-
-    print(f"📄 Informes encontrados ({len(report_ids)}):\n")
-    for r in report_ids:
-        print(f"  ID: {r['id']}")
-        print(f"  Nombre visible: {r['name']}")
-        print(f"  report_name: {r['report_name']}")
-        print(f"  report_file: {r['report_file']}")
-        print(f"  Modelo: {r.get('binding_model_id', [''])[1] if r.get('binding_model_id') else '—'}")
-        print("-" * 60)
-
-
-import xmlrpc.client
-import math
-import time
-
-
-def migrar_tarea(origen, destino, origen_task_id, destino_task_id, lote=30, delay=0.2):
-    """
-    Migra una tarea de project.task desde Odoo origen → destino.
-
-    origen: dict con url, db, user, password
-    destino: dict con url, db, user, password
-    origen_task_id : ID de tarea en origen
-    destino_task_id : ID de tarea en destino
-    lote : cantidad de adjuntos por lote (default 30)
-    delay : segundos entre lotes para evitar saturación (default 0.2)
-    """
-
-    print(f"\n=== MIGRANDO TAREA {origen_task_id} → {destino_task_id} ===")
-
-    # --- LOGIN ORIGEN ---
-    common = xmlrpc.client.ServerProxy(f'{origen['url']}/xmlrpc/2/common', allow_none=True)
-    uid = common.authenticate(origen['db'], origen['user'], origen['password'], {})
-
-    if not uid:
-        print("❌ No se pudo autenticar.")
-        return
-
-    print(f'🔌 Conectado como {origen['user']} (uid: {uid})')
-    models = xmlrpc.client.ServerProxy(f'{origen['url']}/xmlrpc/2/object', allow_none=True)
-
-    # --- LOGIN DESTINO ---
-    dest_common = xmlrpc.client.ServerProxy(f'{destino['url']}/xmlrpc/2/common', allow_none=True)
-    dest_uid = dest_common.authenticate(destino['db'], destino['user'], destino['password'], {})
-
-    if not dest_uid:
-        print("❌ No se pudo autenticar.")
-        return
-
-    print(f'🔌 Conectado como {destino['user']} (uid: {dest_uid})')
-    dest_models = xmlrpc.client.ServerProxy(f'{destino['url']}/xmlrpc/2/object', allow_none=True)
-
-    # -----------------------------
-    # 3) MIGRAR ADJUNTOS
-    # -----------------------------
-    print("\nLeyendo adjuntos del origen...")
-
-    attach_ids = models.execute_kw(
-        origen['db'], uid, origen['password'],
-        'ir.attachment', 'search',
-        [[['res_model', '=', 'project.task'], ['res_id', '=', origen_task_id]]]
-    )
-
-    total_adjuntos = len(attach_ids)
-    print(f"Total adjuntos encontrados: {total_adjuntos}")
-
-    if total_adjuntos == 0:
-        print("No hay adjuntos que migrar.")
-        return
-
-    # Calculamos lotes
-    num_lotes = math.ceil(total_adjuntos / lote)
-
-    for i in range(num_lotes):
-        inicio = i * lote
-        fin = inicio + lote
-        lote_ids = attach_ids[inicio:fin]
-
-        print(f"\nProcesando lote {i + 1}/{num_lotes} ({len(lote_ids)} adjuntos)...")
-
-        '''adjuntos = models.execute_kw(
-            origen['db'], uid, origen['password'],
-            'ir.attachment', 'read',
-            [lote_ids, ['name', 'file_size', 'mimetype']]
-        )
-
-        for att in adjuntos:
-            print(f"Adjunto: {att['name']} pesa: {att['file_size']}")'''
-
-        adjuntos = models.execute_kw(
-            origen['db'], uid, origen['password'],
-            'ir.attachment', 'read',
-            [lote_ids, ['name', 'datas', 'mimetype']]
-        )
-
-        # Crear adjuntos en destino
-        for att in adjuntos:
-            try:
-                dest_models.execute_kw(
-                    destino['db'], dest_uid, destino['password'],
-                    'ir.attachment', 'create',
-                    [{
-                        'name': att['name'],
-                        'datas': att['datas'],
-                        'mimetype': att['mimetype'],
-                        'res_model': 'project.task',
-                        'res_id': destino_task_id,
-                    }]
-                )
-            except Exception as e:
-                print(f"⚠️ Error importando {att['name']}: {e}")
-
-        print(f"✓ Lote {i + 1}/{num_lotes} completado.")
-
-        time.sleep(delay)
-
-    print("\n=== MIGRACIÓN COMPLETADA CORRECTAMENTE ===")
-
-origen = {
-    'url': "https://optimaluz.soluntec.net",
-    'db': "Test",#"Real",
-    'user': "jcoronado@optimaluz.com",
-    'password': "AlAi4ever"
-}
-
-destino = {
-    'url': "http://79.72.61.76:8070/",
-    'db': "odoo1",
-    'user': "admin",
-    'password': "admin"
-}
-
-'''migrar_tarea(
-    origen,
-    destino,
-    origen_task_id=1426,
-    destino_task_id=1523,
-    lote=1,      # tamaño del lote
-    delay=0.1     # descanso entre lotes
-)'''
-
-
-def rellenar_ref3_excel(
-    ruta_excel,
-    hoja="Sheet1",
-    col_ref1="Ref1",
-    col_ref2="Ref2",
-    col_ref3="Ref3"
-):
-    # Leer solo la hoja necesaria
-    df = pd.read_excel(ruta_excel, sheet_name=hoja)
-
-    # Normalizar valores (string limpio)
-    ref2_set = set(
-        df[col_ref2]
-        .dropna()
-        .astype(str)
-        .str.strip()
-    )
-
-    def calcular_ref3(valor):
-        if pd.isna(valor):
-            return None
-        valor = str(valor).strip()
-        return valor if valor not in ref2_set else None
-
-    # Aplicar lógica
-    df[col_ref3] = df[col_ref1].apply(calcular_ref3)
-
-    # Guardar SOLO la hoja indicada sin borrar el resto del Excel
-    with pd.ExcelWriter(
-        ruta_excel,
-        engine="openpyxl",
-        mode="a",
-        if_sheet_exists="replace"
-    ) as writer:
-        df.to_excel(writer, sheet_name=hoja, index=False)
-
-    print("✅ Ref3 rellenado correctamente sin borrar el resto del Excel")
 
 def detectar_cambios_excel(ruta_excel):
     """
@@ -459,198 +132,19 @@ def detectar_cambios_excel(ruta_excel):
 
     resaltar_cambios_no_default_code(ruta_excel)
 
-from openpyxl import load_workbook
+origen = {
+    'url': "https://optimaluz.soluntec.net",
+    'db': "Test",#"Real",
+    'user': "jcoronado@optimaluz.com",
+    'password': "AlAi4ever"
+}
 
-def copiar_datos_por_sku_excel(
-    excel_path,
-    sheet_dest="Sheet1",
-    sheet_src="Sheet2",
-    col_sku="SKU"
-):
-    """
-    Copia las columnas de Sheet2 a Sheet1 para SKUs coincidentes.
-    Abre el Excel en modo apéndice (sin borrar nada).
-    """
-
-    wb = load_workbook(excel_path)
-    ws_dest = wb[sheet_dest]
-    ws_src = wb[sheet_src]
-
-    # --- Leer cabeceras ---
-    headers_dest = {cell.value: idx + 1 for idx, cell in enumerate(ws_dest[1])}
-    headers_src = {cell.value: idx + 1 for idx, cell in enumerate(ws_src[1])}
-
-    if col_sku not in headers_dest or col_sku not in headers_src:
-        raise ValueError("❌ La columna SKU no existe en alguna de las hojas")
-
-    # --- Crear columnas faltantes en destino ---
-    for col_name in headers_src:
-        if col_name == col_sku:
-            continue
-        if col_name not in headers_dest:
-            ws_dest.cell(row=1, column=ws_dest.max_column + 1, value=col_name)
-            headers_dest[col_name] = ws_dest.max_column
-
-    # --- Mapa SKU → fila destino ---
-    sku_dest_map = {}
-    for row in range(2, ws_dest.max_row + 1):
-        sku = ws_dest.cell(row=row, column=headers_dest[col_sku]).value
-        if sku:
-            sku_dest_map[str(sku).strip()] = row
-
-    # --- Copiar datos ---
-    copiados = 0
-
-    for row in range(2, ws_src.max_row + 1):
-        sku = ws_src.cell(row=row, column=headers_src[col_sku]).value
-        if not sku:
-            continue
-
-        sku = str(sku).strip()
-        if sku not in sku_dest_map:
-            continue
-
-        dest_row = sku_dest_map[sku]
-
-        for col_name, src_col_idx in headers_src.items():
-            if col_name == col_sku:
-                continue
-
-            dest_col_idx = headers_dest[col_name]
-            ws_dest.cell(
-                row=dest_row,
-                column=dest_col_idx,
-                value=ws_src.cell(row=row, column=src_col_idx).value
-            )
-
-        copiados += 1
-
-    wb.save(excel_path)
-
-    print(f"✅ SKUs actualizados en Sheet1: {copiados}")
-
-def copiar_payable_entre_hojas(
-    excel_entrada,
-    excel_salida=None,
-    sheet_origen="Sheet1",
-    sheet_destino="Sheet2"
-):
-    """
-    Copia property_account_payable_id de Sheet1 a Sheet2
-    haciendo match por la columna 'name'.
-    """
-
-    # 📥 Leer Excel
-    xls = pd.ExcelFile(excel_entrada)
-
-    df_origen = pd.read_excel(xls, sheet_name=sheet_origen)
-    df_destino = pd.read_excel(xls, sheet_name=sheet_destino)
-
-    # 🧪 Validaciones
-    for col in ["name", "property_account_payable_id"]:
-        if col not in df_origen.columns:
-            raise ValueError(f"❌ Falta columna '{col}' en {sheet_origen}")
-
-    if "name" not in df_destino.columns:
-        raise ValueError(f"❌ Falta columna 'name' en {sheet_destino}")
-
-    # ➕ Crear columna en destino si no existe
-    if "property_account_payable_id" not in df_destino.columns:
-        df_destino["property_account_payable_id"] = None
-
-    # 🧠 Diccionario name → payable (origen)
-    mapa_payable = (
-        df_origen
-        .dropna(subset=["name"])
-        .drop_duplicates(subset=["name"])
-        .set_index("name")["property_account_payable_id"]
-        .to_dict()
-    )
-
-    # 🔁 Copiar valores en destino
-    coincidencias = 0
-
-    for idx, row in df_destino.iterrows():
-        name = row["name"]
-        if name in mapa_payable:
-            df_destino.at[idx, "property_account_payable_id"] = mapa_payable[name]
-            coincidencias += 1
-
-    print(f"✔ Coincidencias actualizadas: {coincidencias}")
-
-    # 💾 Guardar resultado
-    salida = excel_salida or excel_entrada
-
-    with pd.ExcelWriter(salida, engine="openpyxl") as writer:
-        df_origen.to_excel(writer, sheet_name=sheet_origen, index=False)
-        df_destino.to_excel(writer, sheet_name=sheet_destino, index=False)
-
-    print(f"📄 Archivo generado: {salida}")
-
-
-def copiar_filas_por_sku(
-    excel_path,
-    hoja_origen="ES",
-    hoja_destino="NEW",
-    columna_sku="SKU",
-    sobrescribir_destino=True
-):
-    """
-    Copia filas completas de la hoja ORIGEN a DESTINO
-    cuando el SKU coincide en ambas hojas.
-
-    excel_path : ruta del Excel
-    hoja_origen : nombre hoja origen (ES)
-    hoja_destino : nombre hoja destino (NEW)
-    columna_sku : nombre columna SKU
-    sobrescribir_destino : True = reemplaza filas en NEW
-    """
-
-    # --------------------------------------------------
-    # 📥 LEER EXCEL
-    # --------------------------------------------------
-    df_es = pd.read_excel(excel_path, sheet_name=hoja_origen)
-    df_new = pd.read_excel(excel_path, sheet_name=hoja_destino)
-
-    if columna_sku not in df_es.columns or columna_sku not in df_new.columns:
-        raise ValueError(f"❌ La columna '{columna_sku}' debe existir en ambas hojas")
-
-    # Normalizar SKU
-    df_es[columna_sku] = df_es[columna_sku].astype(str).str.strip()
-    df_new[columna_sku] = df_new[columna_sku].astype(str).str.strip()
-
-    # --------------------------------------------------
-    # 🔍 DETECTAR COINCIDENCIAS
-    # --------------------------------------------------
-    skus_comunes = set(df_es[columna_sku]) & set(df_new[columna_sku])
-    print(f"🔎 SKUs coincidentes encontrados: {len(skus_comunes)}")
-
-    if not skus_comunes:
-        print("⚠️ No hay SKUs coincidentes.")
-        return
-
-    # Filtrar filas ES coincidentes
-    filas_es = df_es[df_es[columna_sku].isin(skus_comunes)]
-
-    # --------------------------------------------------
-    # 🧠 ACTUALIZAR DESTINO
-    # --------------------------------------------------
-    if sobrescribir_destino:
-        # Eliminar filas antiguas en NEW
-        df_new = df_new[~df_new[columna_sku].isin(skus_comunes)]
-
-    # Añadir filas copiadas
-    df_new_final = pd.concat([df_new, filas_es], ignore_index=True)
-
-    # --------------------------------------------------
-    # 💾 GUARDAR EXCEL
-    # --------------------------------------------------
-    with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        df_es.to_excel(writer, sheet_name=hoja_origen, index=False)
-        df_new_final.to_excel(writer, sheet_name=hoja_destino, index=False)
-
-    print("✅ Filas copiadas correctamente de ES → NEW")
-
+destino = {
+    'url': "http://79.72.61.76:8070/",
+    'db': "odoo1",
+    'user': "admin",
+    'password': "admin"
+}
 
 def transferencia_productos_por_sku():
     def migrate_products_by_sku(models_src, db_src, uid_src, pwd_src,
@@ -1680,6 +1174,151 @@ def migrar_ausencias(models_src, db_src, uid_src, pwd_src,
     except Exception as e:
         print(f"❌ Error migrando ausencias: {e}")
 
+def corregir_lineas_qty(models_src, db_src, uid_src, pwd_src,
+                        models, db, uid, pwd):
+
+    try:
+
+        print("🔎 Buscando líneas origen con qty=0")
+
+        # -------------------------------------------------
+        # 1️⃣ Leer líneas origen qty=0
+        # -------------------------------------------------
+
+        lines_src = models_src.execute_kw(
+            db_src, uid_src, pwd_src,
+            'sale.order.line', 'search_read',
+            [[('product_uom_qty', '=', 0)]],
+            {'fields': ['order_id', 'product_id']}
+        )
+
+        if not lines_src:
+            print("ℹ️ No hay líneas origen con qty=0")
+            return
+
+        # productos origen
+        product_ids_src = list({l['product_id'][0] for l in lines_src if l['product_id']})
+
+        products_src = models_src.execute_kw(
+            db_src, uid_src, pwd_src,
+            'product.product', 'read',
+            [product_ids_src],
+            {'fields': ['default_code']}
+        )
+
+        sku_map_src = {p['id']: p['default_code'] for p in products_src}
+
+        # pedidos origen
+        order_ids_src = list({l['order_id'][0] for l in lines_src if l['order_id']})
+
+        orders_src = models_src.execute_kw(
+            db_src, uid_src, pwd_src,
+            'sale.order', 'read',
+            [order_ids_src],
+            {'fields': ['name']}
+        )
+
+        order_map_src = {o['id']: o['name'] for o in orders_src}
+
+        src_keys = set()
+
+        for l in lines_src:
+
+            if not l['product_id'] or not l['order_id']:
+                continue
+
+            sku = sku_map_src.get(l['product_id'][0])
+            order_name = order_map_src.get(l['order_id'][0])
+
+            if sku and order_name:
+                src_keys.add((order_name, sku))
+
+        print(f"📦 Líneas origen relevantes: {len(src_keys)}")
+
+        # -------------------------------------------------
+        # 2️⃣ Buscar pedidos destino
+        # -------------------------------------------------
+
+        order_names = list({k[0] for k in src_keys})
+
+        orders_dst = models.execute_kw(
+            db, uid, pwd,
+            'sale.order', 'search_read',
+            [[('name', 'in', order_names)]],
+            {'fields': ['id', 'name']}
+        )
+
+        order_map_dst = {o['id']: o['name'] for o in orders_dst}
+
+        order_ids_dst = list(order_map_dst.keys())
+
+        # -------------------------------------------------
+        # 3️⃣ Leer líneas destino
+        # -------------------------------------------------
+
+        lines_dst = models.execute_kw(
+            db, uid, pwd,
+            'sale.order.line', 'search_read',
+            [[('order_id', 'in', order_ids_dst)]],
+            {'fields': ['id', 'order_id', 'product_id', 'product_uom_qty', 'price_unit']}
+        )
+
+        # obtener SKUs destino
+        product_ids_dst = list({l['product_id'][0] for l in lines_dst if l['product_id']})
+
+        products_dst = models.execute_kw(
+            db, uid, pwd,
+            'product.product', 'read',
+            [product_ids_dst],
+            {'fields': ['default_code']}
+        )
+
+        sku_map_dst = {p['id']: p['default_code'] for p in products_dst}
+
+        # -------------------------------------------------
+        # 4️⃣ Corregir líneas
+        # -------------------------------------------------
+
+        corregidas = 0
+
+        for l in lines_dst:
+
+            if not l['product_id'] or not l['order_id']:
+                continue
+
+            order_name = order_map_dst.get(l['order_id'][0])
+            sku = sku_map_dst.get(l['product_id'][0])
+
+            if not order_name or not sku:
+                continue
+
+            key = (order_name, sku)
+
+            if key in src_keys and l['product_uom_qty'] == 1:
+
+                price = l['price_unit']
+
+                models.execute_kw(
+                    db, uid, pwd,
+                    'sale.order.line', 'write',
+                    [[l['id']], {
+                        'product_uom_qty': 0,
+                        'price_unit': price
+                    }]
+                )
+
+                corregidas += 1
+
+                print(
+                    f"✔ Corregido pedido {order_name} | "
+                    f"SKU {sku} | qty 1→0 | price_unit mantenido {price}"
+                )
+
+        print(f"\n🎯 Líneas corregidas: {corregidas}")
+
+    except Exception as e:
+        print(f"❌ Error corrigiendo líneas: {e}")
+
 def ejecutar_funciones_transferencia():
     # region CONEXION
     # -----------------------
@@ -1687,17 +1326,17 @@ def ejecutar_funciones_transferencia():
     # -----------------------
 
     origen = {
-        'url': "http://158.179.220.107:8069/",#"https://optimaluz.soluntec.net",#
-        'db': "odoo0",#"Real",#
-        'user': "admin",#"jcoronado@optimaluz.com",#
-        'password': "admin",#"AlAi4ever"#
+        'url': "http://37.59.66.189:8069/",#"http://158.179.220.107:8069/",#
+        'db': "Real",#"odoo0",#
+        'user': "jcoronado@optimaluz.com",#"admin",#
+        'password': "AlAi4ever"#"admin",#
     }
 
     destino = {
-        'url': "http://141.253.197.145:8070/",
+        'url': "https://optimaluz.com/",
         'db': "odoo1",  # "odoo0",
         'user': "admin",
-        'password': "admin"
+        'password': "1324"
     }
 
     # -----------------------
@@ -1757,7 +1396,7 @@ def ejecutar_funciones_transferencia():
     # LLAMADA A LA MIGRACIÓN
     # -----------------------
 
-    actualizar_categorias_por_sku(
+    corregir_lineas_qty(
         models_src=models_src,
         db_src=origen['db'],
         uid_src=uid_src,
@@ -1768,7 +1407,7 @@ def ejecutar_funciones_transferencia():
         uid=uid_dst,
         pwd=destino['password'],
 
-        excel_path=ruta
+        #excel_path=ruta
     )
 
 
@@ -1850,3 +1489,5 @@ def extraer_skus_pdf_catalogo_a_excel(pdf_path, excel_salida="skus_extraidos.xls
 
     print(f"✔ {len(skus)} SKUs extraídos")
     print(f"📁 Excel generado: {excel_salida}")
+
+#detectar_cambios_excel(ruta)

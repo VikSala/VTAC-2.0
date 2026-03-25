@@ -1,8 +1,6 @@
 import math
 from collections import namedtuple
 
-from pywin.Demos.ocx.ocxtest import test1
-
 from services.campos_odoo import ClavesExcel, excel_a_odoo, FISCAL_POSITION_MAP
 from services.utils import Utils
 from collections import defaultdict
@@ -146,7 +144,7 @@ def attributes_to_odoo(product_template_id, specifications, params, row=None):
 def import_to_odoo(excel_path, limite = 0, import_all = False, event_manager=None):
     from App_Connection import models, db, uid, password
 
-    NOVEDADES = False
+    NOVEDADES = True
     LEDXPRESS = False
     ADVANCE = False
     ODOO16 = False #True
@@ -190,7 +188,7 @@ def import_to_odoo(excel_path, limite = 0, import_all = False, event_manager=Non
             if NOVEDADES:
                 print("3. Iconos")
                 atributos = ast.literal_eval(row["Atributos"])
-                product_data['x_icono1'] = Utils.image_url_to_base64("http://79.72.55.217:8069/web/image/1011-1dd7909f/V-TAC.png")
+                product_data['x_icono1'] = Utils.image_url_to_base64("http://158.179.220.107:8069/web/image/1011-1dd7909f/V-TAC.png")
                 icons_detected = Utils.ico_match(product_data['name'], False)
                 if isinstance(icons_detected, str):
                     icons_detected = icons_detected.split(',')
@@ -1131,14 +1129,17 @@ def main_import_with_event_manager(event_manager):
 
         atributos_cache = Utils.cargar_atributos_existentes(params)
         valores_cache = Utils.cargar_valores_atributos_existentes(params)
+        odoo16_connect = True
 
         url_src = 'http://37.59.66.189:8069/'#
         db_src = 'Real'#Test
         username_src = 'jcoronado@optimaluz.com'
         password_src = 'AlAi4ever' #AlAi4ever@optimaluz.com
-        common = xmlrpc.client.ServerProxy(f"{url_src}/xmlrpc/2/common")#""#
-        uid_src = common.authenticate(db_src, username_src, password_src, {})#""#
-        models_src = xmlrpc.client.ServerProxy(f"{url_src}/xmlrpc/2/object")#""#
+
+        common = xmlrpc.client.ServerProxy(f"{url_src}/xmlrpc/2/common") if odoo16_connect else ""
+        uid_src = common.authenticate(db_src, username_src, password_src, {}) if odoo16_connect else ""
+        models_src = xmlrpc.client.ServerProxy(f"{url_src}/xmlrpc/2/object") if odoo16_connect else ""
+
 
         def migrar_adjuntos_modelo(modelo, usar_lotes=True, limitar_fecha = False):
             """
@@ -1795,7 +1796,6 @@ def main_import_with_event_manager(event_manager):
             Lee la hoja CAMBIOS, detecta celdas en amarillo (FFFF00),
             y actualiza SOLO esas columnas en Odoo, buscando por default_code.
             """
-            from App_Connection import models, db, uid, password
             from openpyxl import load_workbook
 
             COLOR_AMARILLO = "FFFF00"
@@ -1872,6 +1872,7 @@ def main_import_with_event_manager(event_manager):
 
             print("✔ Todos los cambios han sido aplicados a Odoo correctamente.")
 
+        #aplicar_cambios_desde_excel()
 
         def aplicar_cambios_atributos_old_new(
                 ruta_excel,
@@ -3326,14 +3327,14 @@ def main_import_with_event_manager(event_manager):
             Exporta los pedidos de venta de Odoo 16 filtrados por estado.
             Optimizado para rendimiento: lee todas las líneas en bloque.
             """
-            company_id_src = 1  # OSE: 1 / ALM: 2
+            company_id_src = 3  # OSE: 1 / ALM: 2 / PRUEBAS: 3
             # ------------------------------------------------
             # 1️⃣ Buscar pedidos de venta
             # ------------------------------------------------
             so_ids = models_src.execute_kw(
                 db_src, uid_src, password_src,
                 "sale.order", "search",
-                [[("id", "=", 76117), ('company_id', '=', company_id_src)]],
+                [[('company_id', '=', company_id_src)]],
                 {"order": "date_order asc"}
             )
 
@@ -3472,6 +3473,7 @@ def main_import_with_event_manager(event_manager):
             total_existentes = 0
 
             is_from_16 = True
+            #is_from_pruebas = True
 
             for so in sale_orders:
                 name = so["name"]
@@ -3646,7 +3648,7 @@ def main_import_with_event_manager(event_manager):
                         product_id = productos[0] if productos else None
 
                     tax_ids = []
-                    if linea.get("tax_id"):
+                    if linea.get("tax_id"):# and not is_from_pruebas:
                         tax_origen = linea.get("tax_id")[0]
                         tax_id = Utils.get_by_x_id_interno("account.tax", tax_origen, db, uid, password, models) if is_from_16 else tax_origen
                         tax_ids = [tax_id] if tax_id else []
@@ -3655,10 +3657,10 @@ def main_import_with_event_manager(event_manager):
                         "order_id": new_so_id,
                         "name": linea.get("name"),
                         "product_id": product_id,
-                        "product_uom_qty": linea.get("product_uom_qty") or 1.0,
+                        "product_uom_qty": linea.get("product_uom_qty") or 0.0,
                         "price_unit": linea.get("price_unit") or 0.0,
                         "discount": linea.get("discount", 0.0),
-                        "tax_id": [(6, 0, [53])],
+                        "tax_id": [(6, 0, [tax_ids])],#[[6, 0, []]],
                         "x_nota_interna": linea.get("x_nota_interna"),
                     }
 
@@ -3711,10 +3713,10 @@ def main_import_with_event_manager(event_manager):
 
         def migrar_pedidos_venta():
             migrar_pedidos_venta_sale()
-            #migrar_pedidos_venta_draft()
-            #migrar_pedidos_venta_cancel()
+            migrar_pedidos_venta_draft()
+            migrar_pedidos_venta_cancel()
 
-        #ARCHIVAR: 1, dede, Desconocido, "Invergestión Levante, SL"
+        #migrar_pedidos_venta()#ARCHIVAR: 1, dede, Desconocido, "Invergestión Levante, SL"
 
         def exportar_tareas_con_adjuntos(company_name="ALMAITANA DE LUZ, S.L."):
             """
@@ -5445,7 +5447,7 @@ def main_import_with_event_manager(event_manager):
                             "order_id": new_po_id,
                             "name": line.get("name"),
                             "product_id": product_id,
-                            "product_qty": line.get("product_qty") or 1.0,
+                            "product_qty": line.get("product_qty") or 0.0,
                             "price_unit": line.get("price_unit") or 0.0,
                             "date_planned": line.get("date_planned"),
                             "sequence": line.get("sequence"),
@@ -12050,7 +12052,93 @@ def main_import_with_event_manager(event_manager):
             except Exception as e:
                 print(f"❌ Error: {e}")
 
-        actualizar_stock_almacen3_por_sku()
+        #actualizar_stock_almacen3_por_sku()
+
+        def procesar_skus_odoo_v1(ruta_excel = ruta):
+            # 1. Leer SKUs del Excel
+            df = pd.read_excel(ruta_excel)
+            # Aseguramos que tratamos el SKU como string y quitamos espacios
+            skus_excel = df['SKU'].astype(str).str.strip().tolist()
+
+            ya_tenian_corchete = []
+            modificados = []
+            no_encontrados = []
+
+            for sku in skus_excel:
+                # 2. Buscar producto en Odoo por default_code
+                productos = models.execute_kw(db, uid, password, 'product.template', 'search_read',
+                                              [[['default_code', '=', sku]]],
+                                              {'fields': ['id', 'name', 'default_code'], 'limit': 1}
+                                              )
+
+                if not productos:
+                    no_encontrados.append(sku)
+                    continue
+
+                producto = productos[0]
+                nombre_actual = producto['name']
+                id_producto = producto['id']
+
+                # 3. Lógica de filtrado y actualización
+                if "[" in nombre_actual:
+                    ya_tenian_corchete.append(sku)
+                else:
+                    nuevo_nombre = f"[VEE25{sku}1] {nombre_actual}"
+                    # Actualizar en Odoo
+                    models.execute_kw(db, uid, password, 'product.template', 'write',
+                                      [[id_producto], {'name': nuevo_nombre}]
+                                      )
+                    modificados.append(sku)
+
+            # 4. Resultados finales
+            print("\n--- RESUMEN DEL PROCESO ---")
+            print(f"✅ Modificados ({len(modificados)}): {modificados}")
+            print(f"⚠️ Ya tenían '[' ({len(ya_tenian_corchete)}): {ya_tenian_corchete}")
+            print(f"❌ No encontrados en Odoo ({len(no_encontrados)}): {no_encontrados}")
+
+        def procesar_skus_odoo(ruta_excel = ruta):
+            df = pd.read_excel(ruta_excel)
+            skus_excel = df['SKU'].astype(str).str.strip().tolist()
+
+            actualizados_con_cambio = []  # Los que ya tenían [] y se han sobrescrito
+            modificados_nuevos = []  # Los que no tenían nada y se han añadido
+            no_encontrados = []
+
+            for sku in skus_excel:
+                productos = models.execute_kw(db, uid, password, 'product.template', 'search_read',
+                                              [[['default_code', '=', sku]]],
+                                              {'fields': ['id', 'name'], 'limit': 1})
+
+                if not productos:
+                    no_encontrados.append(sku)
+                    continue
+
+                producto = productos[0]
+                nombre_actual = producto['name']
+                id_producto = producto['id']
+
+                nuevo_prefijo = f"[VEE25{sku}1]"
+
+                if "[" in nombre_actual:
+                    # re.sub busca '[' seguido de cualquier cosa hasta ']' y lo reemplaza
+                    # el strip() final es para evitar dobles espacios si queda alguno
+                    nuevo_nombre = re.sub(r'\[.*?\]', nuevo_prefijo, nombre_actual).strip()
+                    actualizados_con_cambio.append(sku)
+                else:
+                    nuevo_nombre = f"{nuevo_prefijo} {nombre_actual}"
+                    modificados_nuevos.append(sku)
+
+                # Solo disparamos el write si el nombre realmente cambia
+                if nuevo_nombre != nombre_actual:
+                    models.execute_kw(db, uid, password, 'product.template', 'write',
+                                      [[id_producto], {'name': nuevo_nombre}])
+
+            print("\n--- RESUMEN DEL PROCESO ---")
+            print(f"🔄 Sobrescritos (tenían []): {len(actualizados_con_cambio)}")
+            print(f"🆕 Nuevos (no tenían []): {len(modificados_nuevos)}")
+            print(f"❌ No encontrados: {len(no_encontrados)}")
+
+        #procesar_skus_odoo()
 
         ruta = Utils.seleccionar_excel()
 

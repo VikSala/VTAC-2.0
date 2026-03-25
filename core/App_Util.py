@@ -103,6 +103,7 @@ def update_comercial_stock(excel_path):
     # --- Config ---
     FIELD_MADRID = "x_transit_stock_custom"  # hoja Madrid
     FIELD_BULGARIA = "x_almacen1_custom"  # hoja Bulgaria
+    FIELD_ODOO = "x_almacen_local"  # hoja Odoo
 
     SHEET_MADRID = "Madrid"
     SHEET_BULGARIA = "Bulgaria"
@@ -247,15 +248,25 @@ def update_comercial_stock(excel_path):
         info = sku_index.get(sku)
         if not info:
             return False
+
         vals = _none_to_false({field_name: value})
-        if info["product_id"] and ((field_name == FIELD_MADRID and has_madrid_on_product) or
-                                   (field_name == FIELD_BULGARIA and has_bulgaria_on_product)):
-            models.execute_kw(db, uid, password, "product.product", "write", [[info["product_id"]], vals])
+
+        if info["product_id"]:
+            models.execute_kw(
+                db, uid, password,
+                "product.product", "write",
+                [[info["product_id"]], vals]
+            )
             return True
-        if info["template_id"] and ((field_name == FIELD_MADRID and has_madrid_on_template) or
-                                    (field_name == FIELD_BULGARIA and has_bulgaria_on_template)):
-            models.execute_kw(db, uid, password, "product.template", "write", [[info["template_id"]], vals])
+
+        if info["template_id"]:
+            models.execute_kw(
+                db, uid, password,
+                "product.template", "write",
+                [[info["template_id"]], vals]
+            )
             return True
+
         return False
 
     # ==========================
@@ -300,6 +311,24 @@ def update_comercial_stock(excel_path):
 
         if has_undelivered and cond_stock_bulg and cond_odoo:
             proximamente_skus.append(sku)
+
+    # ==========================
+    # 3) ODOO → x_almacen_local
+    # ==========================
+    updated_odoo = 0
+
+    if df_odoo is not None:
+        for _, row in df_odoo.iterrows():
+            sku = _coerce_sku(row["SKU"])
+            if not sku:
+                continue
+
+            stock_val = _to_float(row["STOCK"], default=0.0)
+
+            if write_field_for_sku(sku, FIELD_ODOO, stock_val):
+                updated_odoo += 1
+            else:
+                print(f"⚠ SKU no encontrado en Odoo: {sku}")
 
     # --- Escribir/actualizar la hoja "Proximamente" con los SKUs únicos ------
     try:
@@ -514,191 +543,6 @@ def update_names(excel_path):
 
     print("75%")
 
-def update_vz_products():
-    from App_Connection import db, uid, password, models
-
-    attr_test = False
-
-    # --- Constantes que has indicado ---
-    ATTR_NAME = "Disponibilidad"
-    ATTR_VALUE_NAME = "PRODUCTO DESCATALOGADO (Sin opción de compra. Seleccione otro artículo similar.)"
-    HINT_ATTR_VALUE_ID = 13265
-
-    DESCATALOGADO_BINARIO = "bin64"
-    OUT_OF_STOCK_MSG = (
-        '<div>'
-        '<p style="margin-bottom: 0px;">ESTE PRODUCTO ESTA DESCATALOGADO. YA NO HAY STOCK DISPONIBLE.</p>'
-        '<p style="margin-bottom: 0px;">Comuníquese con nosotros para ofrecerle un producto similar con stock inmediato.</p>'
-        '<p style="margin-bottom: 0px;">Contacto:</p>'
-        '<p style="margin-bottom: 0px;">·&nbsp;Email: <a href="https://comercial@optimaluz.com">comercial@optimaluz.com</a></p>'
-        '<p style="margin-bottom: 0px;">·&nbsp;WhatsApp / Telegram / Móvil: (+34) 610 139 920</p>'
-        '<p>·&nbsp;Teléfono: (+34) 966 116 649<br></p>'
-        '</div>'
-    )
-    NOTA_INTERNA = "<p>PRODUCTO ZOMBIE (DESCATALOGADO, SIN STOCK Y SIN POSIBILIDAD DE COMPRAR)</p>"
-
-    ctx = {"active_test": False, "lang": "es_ES"}
-
-    # ---- Imagen origen: obtener base64 de product.image (ID extraído de la URL) ----
-    src_image_b64 = DESCATALOGADO_BINARIO#Utils.image_url_to_base64(GALLERY_IMG_URL)
-
-    # ---- Resolver value_id y attr_id (usar hint; fallback por nombres) ----
-    value_id, attr_id = None, None
-    if attr_test:
-        try:
-            val = models.execute_kw(db, uid, password, "product.attribute.value", "read",
-                                    [[HINT_ATTR_VALUE_ID], ["id", "name", "attribute_id"]], {"context": ctx})
-            if val:
-                value_id = val[0]["id"]
-                attr_id = val[0]["attribute_id"][0]
-        except Exception:
-            pass
-
-        if not value_id or not attr_id:
-            # Fallback por nombre
-            attr_ids = models.execute_kw(db, uid, password, "product.attribute", "search",
-                                         [[["name", "=", ATTR_NAME]]], {"context": ctx})
-            if not attr_ids:
-                print(f"❌ Atributo '{ATTR_NAME}' no encontrado.")
-                return
-            attr_id = attr_ids[0]
-            val_ids = models.execute_kw(db, uid, password, "product.attribute.value", "search",
-                                        [[["attribute_id", "=", attr_id], ["name", "=", ATTR_VALUE_NAME]]],
-                                        {"context": ctx})
-            if not val_ids:
-                print(f"❌ Valor '{ATTR_VALUE_NAME}' no encontrado para el atributo '{ATTR_NAME}'.")
-                return
-            value_id = val_ids[0]
-
-    # ---- Buscar plantillas cuyo nombre empiece por "[VZ" y no contengan asteriscos----
-    tmpl_ids = models.execute_kw(
-        db, uid, password,
-        "product.template", "search",
-        [[
-            ["name", "ilike", "[VZ"],
-            ["name", "not ilike", "**"]
-        ]],
-        {"context": ctx}
-    )
-
-    print(f"➡ Plantillas [VZ…] encontradas: {len(tmpl_ids)}")
-    if not tmpl_ids:
-        return
-
-    updated = 0
-    for tmpl_id in tmpl_ids:
-        try:
-            # 1) Campos de disponibilidad + icono + mensaje
-            models.execute_kw(
-                db, uid, password, "product.template", "write",
-                [[tmpl_id], {
-                    "allow_out_of_stock_order": False,
-                    "show_availability": True,
-                    "available_threshold": 100000,
-                    "out_of_stock_message": OUT_OF_STOCK_MSG,
-                    "description": NOTA_INTERNA,
-                    "x_icono8": DESCATALOGADO_BINARIO#Utils.image_url_to_base64(ICON_URL),
-                }],
-                {"context": ctx}
-            )
-
-            # 2) Atributo "Disponibilidad": añadir el valor si no lo tiene
-            if attr_test:
-                line_ids = models.execute_kw(
-                    db, uid, password, "product.template.attribute.line", "search",
-                    [[["product_tmpl_id", "=", tmpl_id], ["attribute_id", "=", attr_id]]],
-                    {"context": ctx}
-                )
-                if not line_ids:
-                    # Crear línea con el valor indicado
-                    models.execute_kw(
-                        db, uid, password, "product.template.attribute.line", "create",
-                        [{
-                            "product_tmpl_id": tmpl_id,
-                            "attribute_id": attr_id,
-                            "value_ids": [(6, 0, [value_id])],  # asigna solo este valor al crear
-                        }],
-                        {"context": ctx}
-                    )
-                else:
-                    # Añadir sin eliminar otros valores (si ya está, no pasará nada)
-                    models.execute_kw(
-                        db, uid, password, "product.template.attribute.line", "write",
-                        [line_ids, {"value_ids": [(4, value_id)]}],
-                        {"context": ctx}
-                    )
-
-            # 3) Galería: usar la imagen indicada como primera SIN duplicar si ya existe
-            img_ids = models.execute_kw(
-                db, uid, password, "product.image", "search",
-                [[["product_tmpl_id", "=", tmpl_id]]],
-                {"context": ctx}
-            )
-
-            existing_match_id = None
-            if img_ids:
-                recs = models.execute_kw(
-                    db, uid, password, "product.image", "read",
-                    [img_ids, ["sequence", "image_1920"]],
-                    {"context": ctx}
-                )
-                for r in recs:
-                    if r.get("image_1920") == src_image_b64:
-                        existing_match_id = r["id"]
-                        break
-
-            if existing_match_id:
-                # Ya la tiene: no crear de nuevo. La movemos a la primera posición.
-                # Empujamos todas las secuencias y ponemos la coincidente a 0.
-                if img_ids:
-                    recs_seq = models.execute_kw(
-                        db, uid, password, "product.image", "read",
-                        [img_ids, ["sequence"]],
-                        {"context": ctx}
-                    )
-                    for r in recs_seq:
-                        models.execute_kw(
-                            db, uid, password, "product.image", "write",
-                            [[r["id"]], {"sequence": (r.get("sequence") or 0) + 1}],
-                            {"context": ctx}
-                        )
-                models.execute_kw(
-                    db, uid, password, "product.image", "write",
-                    [[existing_match_id], {"sequence": 0}],
-                    {"context": ctx}
-                )
-            else:
-                # No la tiene: incrementamos secuencias actuales y creamos nueva con sequence=0
-                if img_ids:
-                    recs_seq = models.execute_kw(
-                        db, uid, password, "product.image", "read",
-                        [img_ids, ["sequence"]],
-                        {"context": ctx}
-                    )
-                    for r in recs_seq:
-                        models.execute_kw(
-                            db, uid, password, "product.image", "write",
-                            [[r["id"]], {"sequence": (r.get("sequence") or 0) + 1}],
-                            {"context": ctx}
-                        )
-                models.execute_kw(
-                    db, uid, password, "product.image", "create",
-                    [{
-                        "product_tmpl_id": tmpl_id,
-                        "name": "PRODUCTO DESCATALOGADO",
-                        "image_1920": src_image_b64,
-                        "sequence": 0,
-                    }],
-                    {"context": ctx}
-                )
-
-            updated += 1
-        except Exception as e:
-            print(f"❌ Error actualizando plantilla {tmpl_id}: {e}")
-
-    print(f"✅ Plantillas actualizadas: {updated}/{len(tmpl_ids)}")
-    print("75%")
-
 def update_out_of_stock_msg_from_excel(excel_path):
     from App_Connection import db, uid, password, models
 
@@ -801,7 +645,7 @@ def actualizar_stock_comercial(excel_path):
     # Define aquí el orden y las funciones que quieres ejecutar
     tasks = [
         ("update_comercial_stock", update_comercial_stock),
-        ("update_names", update_names),#("update_vz_products", update_vz_products),
+        ("update_names", update_names),
         ("update_out_of_stock_msg_from_excel", update_out_of_stock_msg_from_excel),
     ]
 
