@@ -14,8 +14,11 @@ def detectar_cambios_excel(ruta_excel):
     """
 
     # Leer las hojas
-    df16 = pd.read_excel(ruta_excel, sheet_name='ODOO16')
-    df18 = pd.read_excel(ruta_excel, sheet_name='ODOO18')
+    df16 = pd.read_excel(ruta_excel, sheet_name='OLD')
+    df18 = pd.read_excel(ruta_excel, sheet_name='NEW')
+
+    df18['list_price'] = df18['list_price'].fillna(0).astype(float).round(2)
+    df16['list_price'] = df16['list_price'].fillna(0).astype(float).round(2)
 
     if 'default_code' not in df16.columns or 'default_code' not in df18.columns:
         raise ValueError("Falta la columna 'default_code' en una o ambas hojas.")
@@ -157,7 +160,7 @@ def transferencia_productos_por_sku():
         - image_1920 se lee producto a producto
         """
 
-        con_atributos = True
+        con_atributos = False
 
         # -------------------------------------------------
         # 1️⃣ Leer SKUs desde Excel
@@ -197,7 +200,8 @@ def transferencia_productos_por_sku():
             'x_url',
             'description',
             'out_of_stock_message',
-            'public_categ_ids'
+            'public_categ_ids',
+            'allow_out_of_stock_order',
         ]
 
         # -------------------------------------------------
@@ -264,7 +268,11 @@ def transferencia_productos_por_sku():
                     'x_url': product.get('x_url'),
                     'description': product.get('description'),
                     'out_of_stock_message': product.get('out_of_stock_message'),
-                    'list_price': 0.0
+                    'list_price': 0.0,
+                    'is_storable': True,
+                    'show_availability': True,
+                    'available_threshold': 100.000,
+                    'allow_out_of_stock_order': product.get('allow_out_of_stock_order'),
                 }
 
                 # -------------------------
@@ -440,17 +448,17 @@ def transferencia_productos_por_sku():
     # -----------------------
 
     origen = {
-        'url': "http://79.72.61.76:8069/",#"https://optimaluz.soluntec.net",
-        'db': "odoo0",#"Real",
-        'user': "admin",#"jcoronado@optimaluz.com",
-        'password': "admin",#"AlAi4ever"
+        'url': "https://optimaluz.com/",
+        'db': "odoo1",
+        'user': "admin",
+        'password': "1324",
     }
 
     destino = {
-        'url': "http://143.47.33.148:8070/",
-        'db': "odoo1",  # "odoo0",
+        'url': "https://b2b.optimaluz.com/", #"http://82.70.85.127:8069/",#
+        'db': "odoo0",
         'user': "admin",
-        'password': "admin"
+        'password': "1324"
     }
 
     # -----------------------
@@ -524,6 +532,7 @@ def transferencia_productos_por_sku():
     )
     # endregion
 
+#transferencia_productos_por_sku()
 
 def actualizar_categorias_por_sku(models_src, db_src, uid_src, pwd_src,
                                   models, db, uid, pwd,
@@ -1490,4 +1499,443 @@ def extraer_skus_pdf_catalogo_a_excel(pdf_path, excel_salida="skus_extraidos.xls
     print(f"✔ {len(skus)} SKUs extraídos")
     print(f"📁 Excel generado: {excel_salida}")
 
-#detectar_cambios_excel(ruta)
+
+def actualizar_odoos():
+    def actualizar_prods_diariamente(origen, destino):
+        from openpyxl import load_workbook
+        from openpyxl.styles import PatternFill
+        from datetime import datetime, timedelta
+        import os
+        import pandas as pd
+        import xmlrpc.client
+        import ast
+
+        def conectar(config):
+            common = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/common")
+            uid = common.authenticate(config['db'], config['user'], config['password'], {})
+
+            models = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/object")
+
+            return models, uid
+
+        # 🔌 Conexiones
+        models_o, uid_o = conectar(origen)
+        models_d, uid_d = conectar(destino)
+
+        def get_products_dataframe(models, db, uid, password, domain, fields):
+            products = models.execute_kw(
+                db, uid, password,
+                'product.template', 'search_read',
+                [domain],
+                {'fields': fields}
+            )
+
+            if not products:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(products)
+
+            df['categ_id'] = df['categ_id'].apply(
+                lambda x: x[1] if isinstance(x, (list, tuple)) else x
+            )
+
+            columns_order = [
+                'default_code', 'name', 'standard_price',
+                'list_price', 'categ_id', 'description', 'public_categ_ids'
+            ]
+
+            return df[columns_order]
+
+        def export_full_product_data():
+            # 📅 Rango fechas (solo origen)
+            today = datetime.today()
+            start_date = today.replace(day=1, hour=0, minute=0, second=0).strftime('%Y-%m-%d %H:%M:%S')
+            next_month = (today.replace(day=28) + timedelta(days=5)).replace(day=1, hour=0, minute=0, second=0)
+            end_date = next_month.strftime('%Y-%m-%d %H:%M:%S')
+
+            domain = [
+                ('write_uid', '=', 33),
+                ('write_date', '>=', start_date),
+                ('write_date', '<', end_date)
+            ]
+
+            fields = [
+                'default_code',
+                'name',
+                'standard_price',
+                'list_price',
+                'description',
+                'categ_id',
+                'public_categ_ids',
+                'is_published'
+            ]
+
+            # 📥 NEW → origen (filtrado)
+            df_new = get_products_dataframe(
+                models_o, origen['db'], uid_o, origen['password'],
+                domain, fields
+            )
+
+            if df_new.empty:
+                print("No hay registros en origen.")
+                return False
+
+            # 📥 OLD → destino (🔥 TODOS)
+            df_old = get_products_dataframe(
+                models_d, destino['db'], uid_d, destino['password'],
+                [], fields
+            )
+
+            # 📁 Archivo
+            filename = os.path.expanduser("~/Documents/SMI Files/cambios_ose.xlsx")
+
+            # 💾 Guardado
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                df_old.to_excel(writer, sheet_name='OLD', index=False)
+                df_new.to_excel(writer, sheet_name='NEW', index=False)
+
+            return filename
+
+        def detectar_cambios_excel(ruta_excel):
+            """
+            Compara las hojas Odoo16 y Odoo18 y crea la hoja 'Cambios' con:
+              - default_code
+              - Solo las columnas que difieren (valores tomados de Odoo16)
+                Si el valor fue eliminado (vacío en 16 pero no en 18) se marca con '*'.
+            Las demás columnas quedan vacías.
+            """
+
+            def normalize(val):
+                if pd.isna(val):
+                    return None
+
+                if isinstance(val, float):
+                    return round(val, 2)
+
+                if isinstance(val, list):
+                    return sorted(val)
+
+                # 🔥 NUEVO: detectar listas en string
+                if isinstance(val, str) and val.startswith("[") and val.endswith("]"):
+                    try:
+                        parsed = ast.literal_eval(val)
+                        if isinstance(parsed, list):
+                            return sorted(parsed)
+                    except:
+                        pass
+
+                return str(val).strip()
+
+            # Leer las hojas
+            df16 = pd.read_excel(ruta_excel, sheet_name='OLD')
+            df18 = pd.read_excel(ruta_excel, sheet_name='NEW')
+
+            df18['list_price'] = df18['list_price'].fillna(0).astype(float).round(2)
+            df16['list_price'] = df16['list_price'].fillna(0).astype(float).round(2)
+
+            if 'default_code' not in df16.columns or 'default_code' not in df18.columns:
+                raise ValueError("Falta la columna 'default_code' en una o ambas hojas.")
+
+            # Limpiar duplicados y vacíos
+            df16 = df16.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
+            df18 = df18.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
+
+            # Indexar por default_code
+            df16 = df16.set_index('default_code')
+            df18 = df18.set_index('default_code')
+
+            comunes = df16.index.intersection(df18.index)
+            columnas_comunes = [col for col in df16.columns if col in df18.columns]
+
+            cambios = []
+
+            for code in comunes:
+                fila16 = df16.loc[code]
+                fila18 = df18.loc[code]
+
+                dif_cols = [
+                    col for col in columnas_comunes
+                    if normalize(fila16[col]) != normalize(fila18[col])
+                ]
+
+                if dif_cols:
+                    fila_resultado = {col: "" for col in columnas_comunes}  # vacío por defecto
+                    fila_resultado['default_code'] = code
+
+                    for col in dif_cols:
+                        val16 = str(fila16[col]).strip()
+                        val18 = str(fila18[col]).strip()
+
+                        # Si el valor fue eliminado (antes existía y ahora está vacío)
+                        if val16 in ["", "nan", "None"] and val18 not in ["", "nan", "None"]:
+                            fila_resultado[col] = "*"  # marca eliminación
+                        else:
+                            fila_resultado[col] = fila16[col]  # valor normal de Odoo16
+
+                    cambios.append(fila_resultado)
+
+            if not cambios:
+                print("✅ No se detectaron diferencias entre Odoo origen y Odoo destino.")
+                return False
+
+            # Crear DataFrame con las mismas columnas
+            df_cambios = pd.DataFrame(cambios)
+            columnas_finales = ['default_code'] + [c for c in columnas_comunes if c != 'default_code']
+            df_cambios = df_cambios[columnas_finales]
+
+            # Guardar resultados
+            with pd.ExcelWriter(ruta_excel, mode='a', engine='openpyxl', if_sheet_exists='replace') as writer:
+                df_cambios.to_excel(writer, sheet_name='CAMBIOS', index=False)
+
+            print(f"💾 {len(df_cambios)} productos con diferencias guardados en 'CAMBIOS'.")
+
+            def resaltar_cambios_no_default_code(
+                    ruta_excel,
+                    hoja="CAMBIOS",
+                    columna_default_code="default_code"
+            ):
+                wb = load_workbook(ruta_excel)
+                ws = wb[hoja]
+
+                # Estilo amarillo
+                amarillo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+                # ---------------------------------------
+                # 1️⃣ Detectar índice de columna default_code
+                # ---------------------------------------
+                headers = {cell.value: idx + 1 for idx, cell in enumerate(ws[1])}
+
+                if columna_default_code not in headers:
+                    raise ValueError(f"No existe la columna '{columna_default_code}'")
+
+                col_default = headers[columna_default_code]
+
+                # ---------------------------------------
+                # 2️⃣ Obtener todos los valores default_code
+                # ---------------------------------------
+                default_codes = set()
+                for row in range(2, ws.max_row + 1):
+                    val = ws.cell(row=row, column=col_default).value
+                    if val not in (None, ""):
+                        default_codes.add(str(val).strip())
+
+                # ---------------------------------------
+                # 3️⃣ Recorrer resto de columnas
+                # ---------------------------------------
+                for col_name, col_idx in headers.items():
+                    if col_name == columna_default_code:
+                        continue
+
+                    for row in range(2, ws.max_row + 1):
+                        cell = ws.cell(row=row, column=col_idx)
+                        val = cell.value
+
+                        if val in (None, ""):
+                            continue
+
+                        if str(val).strip() not in default_codes:
+                            cell.fill = amarillo
+
+                # ---------------------------------------
+                # 4️⃣ Guardar cambios
+                # ---------------------------------------
+                wb.save(ruta_excel)
+                return ruta_excel
+
+                print("✅ Valores resaltados correctamente en amarillo")
+
+            return resaltar_cambios_no_default_code(ruta_excel)
+
+        def aplicar_cambios_desde_excel(
+                models, db, uid, password,
+                ruta_excel,
+                hoja_cambios="CAMBIOS",
+                columna_ref="default_code"):
+
+            COLOR_AMARILLO = "FFFF00"
+
+            # =========================
+            # 📄 1. Cargar Excel
+            # =========================
+
+            wb = load_workbook(ruta_excel, data_only=True)
+            ws = wb[hoja_cambios]
+
+            headers = [c.value for c in ws[1]]
+            col_index = {headers[i]: i + 1 for i in range(len(headers))}
+
+            # =========================
+            # 🟡 2. Detectar cambios
+            # =========================
+
+            cambios = []
+
+            for row in ws.iter_rows(min_row=2):
+                ref_cell = row[col_index[columna_ref] - 1]
+                ref_value = str(ref_cell.value).strip() if ref_cell.value else ""
+
+                if not ref_value:
+                    continue
+
+                for col_name, idx in col_index.items():
+                    cell = row[idx - 1]
+                    fill = cell.fill
+
+                    is_yellow = (
+                            fill
+                            and fill.fgColor
+                            and fill.fgColor.rgb is not None
+                            and fill.fgColor.rgb[-6:].upper() == COLOR_AMARILLO
+                    )
+
+                    if is_yellow:
+                        cambios.append({
+                            "default_code": ref_value,
+                            "columna": col_name,
+                            "valor": cell.value,
+                        })
+
+            if not cambios:
+                print("No se encontraron cambios resaltados en amarillo.")
+                return
+
+            # =========================
+            # 🚀 3. Aplicar cambios
+            # =========================
+
+            products = models.execute_kw(
+                db, uid, password,
+                "product.template", "search_read",
+                [[]],
+                {"fields": ["id", "default_code"]}
+            )
+
+            mapa = {p["default_code"]: p["id"] for p in products}
+
+            for cambio in cambios:
+                ref = cambio["default_code"]
+                col = cambio["columna"]
+                val = cambio["valor"]
+
+                product_id = mapa.get(ref)
+
+                if not product_id:
+                    print(f"⚠ No encontrado en Odoo → {ref}")
+                    continue
+
+                vals = {}
+
+                try:
+                    # =========================
+                    # 🧠 CAMPOS ESPECIALES
+                    # =========================
+
+                    if col == "categ_id":
+                        try:
+                            if val in [None, "", "nan", "*"]:
+                                vals["categ_id"] = False
+                            else:
+                                if isinstance(val, (list, tuple)):
+                                    vals["categ_id"] = val[0] if val else False
+                                else:
+                                    vals["categ_id"] = int(val)
+                        except Exception:
+                            print(f"⚠ Error parseando categ_id: {val}")
+                            continue
+
+                    elif col == "public_categ_ids":
+                        try:
+                            if val in [None, "", "nan", "*"]:
+                                vals["public_categ_ids"] = [(5, 0, 0)]
+                            else:
+                                if isinstance(val, str):
+                                    ids = ast.literal_eval(val)
+                                elif isinstance(val, list):
+                                    ids = val
+                                else:
+                                    ids = []
+
+                                vals["public_categ_ids"] = [(6, 0, ids)] if ids else [(5, 0, 0)]
+
+                        except Exception:
+                            print(f"⚠ Error parseando public_categ_ids: {val}")
+                            continue
+
+                    # =========================
+                    # 🧨 GESTIÓN DE ELIMINACIONES
+                    # =========================
+
+                    if val == "*" or val in [None, "", "nan"]:
+                        if col == "categ_id":
+                            vals["categ_id"] = False
+
+                        elif col == "public_categ_ids":
+                            vals["public_categ_ids"] = [(5, 0, 0)]  # eliminar todos
+
+                        else:
+                            vals[col] = False  # limpia el campo
+
+                    # =========================
+                    # 🟢 VALORES NORMALES
+                    # =========================
+                    else:
+                        if col in ["standard_price", "list_price"]:
+                            vals[col] = float(val)
+                        else:
+                            vals[col] = val
+
+                    # =========================
+                    # ✍️ WRITE
+                    # =========================
+
+                    models.execute_kw(
+                        db, uid, password,
+                        "product.template", "write",
+                        [[product_id], vals]
+                    )
+
+                    print(f"✔ Actualizado {ref}: {col} = {val}")
+
+                except Exception as e:
+                    print(f"❌ Error actualizando {ref} ({col}): {e}")
+
+            print("✔ Todos los cambios han sido aplicados a Odoo correctamente.")
+
+        excel_file = export_full_product_data()
+
+        if excel_file:
+            excel_file_cambios = detectar_cambios_excel(excel_file)
+
+            if excel_file_cambios:
+                aplicar_cambios_desde_excel(models_d, destino['db'], uid_d, destino['password'],
+                                            ruta_excel=excel_file_cambios)
+
+    origen = {
+        'url': "https://b2b.optimaluz.com/",
+        'db': "odoo0",
+        'user': "admin",
+        'password': "1324",
+    }
+
+    destinos = [
+        {
+            'url': "https://optimaluz.com/",
+            'db': "odoo1",
+            'user': "admin",
+            'password': "1324"
+        },
+        {
+            'url': "http://82.70.85.127:8069/",
+            'db': "odoo0",
+            'user': "admin",
+            'password': "1324"
+        }
+    ]
+
+    for destino in destinos:
+        print(f"\n🚀 Actualizando destino: {destino['url']}")
+        actualizar_prods_diariamente(origen, destino)
+
+
+#actualizar_odoos()
+

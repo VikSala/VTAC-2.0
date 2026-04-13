@@ -1,7 +1,7 @@
 import xmlrpc.client
 
-url = 'https://optimaluz.com/'
-db = 'odoo1'
+url = 'http://82.70.85.127:8069'
+db = 'odoo0'
 username = 'admin'
 password = '1324'
 

@@ -78,7 +78,18 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
         if modo_scrap == ScrapMode.TEST:
             emit_progress("MODO TEST ACTIVADO")
             product_links = [
-                "https://led-italia.it/prodotti/v-tac/fari/238256/faro-slim-led-smd-chip-cree-300w-135lmw-cavo-1m-nero-4000k-ip65?asq=dd7613cfa737b5ff557dc29df94e0ebe&c=ba7e65c516779208c95c2e8d35a34c58"
+                "https://led-italia.it/prodotti/v-tac/lampadine/21200216/lampadina-led-chip-cree-e27-22w-120lmw-g120-3000k?asq=ac67518b93a2324006af653033dafc74&c=44af3e96a6fe780b105761e98fb9e62b",
+                "https://led-italia.it/prodotti/v-tac/lampadine/21200226/lampadina-led-chip-cree-e27-22w-120lmw-g120-4000k?asq=ac67518b93a2324006af653033dafc74&c=f3fb3dec41b1c0dbffb3d74e421582ae",
+                "https://led-italia.it/prodotti/v-tac/lampadine/21200236/lampadina-led-chip-cree-e27-22w-120lmw-g120-6500k?asq=ac67518b93a2324006af653033dafc74&c=78b73f73f656060c5c48dafd9ff98df9",
+                "https://led-italia.it/prodotti/v-tac/lampadine/212356/lampadina-led-chip-cree-e14-2w-st26-4000k?asq=ac67518b93a2324006af653033dafc74&c=62891e0020cdf5e386ff7175179c4a31",
+                "https://led-italia.it/prodotti/v-tac/lampadine/2144566/lampadina-led-chip-cree-e27-17w-110lmw-a65-3000k?asq=ac67518b93a2324006af653033dafc74&c=0f05622b9611833eb61289c43bdd5dbe",
+                "https://led-italia.it/prodotti/v-tac/lampadine/2144576/lampadina-led-chip-cree-e27-17w-100lmw-a65-4000k?asq=ac67518b93a2324006af653033dafc74&c=4cda1734021db9312754b5a4604af29d",
+                "https://led-italia.it/prodotti/v-tac/tubi/216506/tubo-led-chip-cree-t8-9w-g13-60cm-in-nanoplastica-ruotabile-3000k?asq=8107fefdbe91fa336ef2f09ca6719a64&c=a00e03527ada2113598ae110532c1a83",
+                "https://led-italia.it/prodotti/v-tac/tubi/216516/tubo-led-chip-cree-t8-9w-g13-60cm-in-nanoplastica-ruotabile-4000k?asq=8107fefdbe91fa336ef2f09ca6719a64&c=98fe5aff9d54c67adba2b6f6002a4a35",
+                "https://led-italia.it/prodotti/v-tac/tubi/216526/tubo-led-chip-cree-t8-9w-g13-60cm-in-nanoplastica-ruotabile-6500k?asq=8107fefdbe91fa336ef2f09ca6719a64&c=f670b6f91a13cd1701ca52351a5e4ed3",
+                "https://led-italia.it/prodotti/v-tac/tubi/216556/tubo-led-chip-cree-t8-18w-100lmw-g13-120cm-in-nanoplastica-ruotabile-6500k?asq=8107fefdbe91fa336ef2f09ca6719a64&c=e0391cbda20618565377ed7e5e3a5faf",
+                "https://led-italia.it/prodotti/v-tac/tubi/216566/tubo-led-chip-cree-t8-20w-105lmw-g13-150cm-in-nanoplastica-ruotabile-3000k?asq=8107fefdbe91fa336ef2f09ca6719a64&c=d54c914a2b8b1cd33fdb4525479f7341",
+                "https://led-italia.it/prodotti/v-tac/illuminazione-di-emergenza/899-6/lampada-led-chip-cree-di-emergenza-38w-20led-montaggio-a-incassoplafone-e-modalita-sase-12h-di-ricarica-6000k-ip20?asq=b1cab57a42c92b551bc2d11eac03f150&c=e0b4a8a06acfce67d4f8077869f3e6cf",
             ]
         else:
             emit_progress("Explorando categorías principales...")
@@ -483,7 +494,7 @@ def _guardar_excel(productos, excel_path):
         items.append(row)
 
     Utils.save_to_excel(items, "vtac_it", region)
-    Utils.excel_read_and_parse("vtac_it", region)
+    Utils.excel_read_and_parse("vtac_it", region) # El parseo de atributos se guarda en scraped.xlsx
 
 
 def _construir_html_desde_texto(texto):

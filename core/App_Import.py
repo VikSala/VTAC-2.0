@@ -1788,27 +1788,217 @@ def main_import_with_event_manager(event_manager):
 
             print("\n✔ Proceso completado.")
 
+        def detectar_cambios_excel(ruta_excel):
+            """
+            Compara las hojas Odoo16 y Odoo18 y crea la hoja 'Cambios' con:
+              - default_code
+              - Solo las columnas que difieren (valores tomados de Odoo16)
+                Si el valor fue eliminado (vacío en 16 pero no en 18) se marca con '*'.
+            Las demás columnas quedan vacías.
+            """
+
+            # Leer las hojas
+            df18 = pd.read_excel(ruta_excel, sheet_name='OLD')
+            df16 = pd.read_excel(ruta_excel, sheet_name='NEW')
+
+            df18['list_price'] = df18['list_price'].fillna(0).astype(float).round(2)
+            df16['list_price'] = df16['list_price'].fillna(0).astype(float).round(2)
+
+            if 'default_code' not in df16.columns or 'default_code' not in df18.columns:
+                raise ValueError("Falta la columna 'default_code' en una o ambas hojas.")
+
+            # Limpiar duplicados y vacíos
+            df16 = df16.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
+            df18 = df18.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
+
+            # Indexar por default_code
+            df16 = df16.set_index('default_code')
+            df18 = df18.set_index('default_code')
+
+            comunes = df16.index.intersection(df18.index)
+            columnas_comunes = [col for col in df16.columns if col in df18.columns]
+
+            cambios = []
+
+            for code in comunes:
+                fila16 = df16.loc[code]
+                fila18 = df18.loc[code]
+
+                dif_cols = [
+                    col for col in columnas_comunes
+                    if str(fila16[col]).strip() != str(fila18[col]).strip()
+                ]
+
+                if dif_cols:
+                    fila_resultado = {col: "" for col in columnas_comunes}  # vacío por defecto
+                    fila_resultado['default_code'] = code
+
+                    for col in dif_cols:
+                        val16 = str(fila16[col]).strip()
+                        val18 = str(fila18[col]).strip()
+
+                        # Si el valor fue eliminado (antes existía y ahora está vacío)
+                        if val16 in ["", "nan", "None"] and val18 not in ["", "nan", "None"]:
+                            fila_resultado[col] = "*"  # marca eliminación
+                        else:
+                            fila_resultado[col] = fila16[col]  # valor normal de Odoo16
+
+                    cambios.append(fila_resultado)
+
+            if not cambios:
+                print("✅ No se detectaron diferencias entre Odoo16 y Odoo18.")
+                return
+
+            # Crear DataFrame con las mismas columnas
+            df_cambios = pd.DataFrame(cambios)
+            columnas_finales = ['default_code'] + [c for c in columnas_comunes if c != 'default_code']
+            df_cambios = df_cambios[columnas_finales]
+
+            # Guardar resultados
+            with pd.ExcelWriter(ruta_excel, mode='a', engine='openpyxl', if_sheet_exists='replace') as writer:
+                df_cambios.to_excel(writer, sheet_name='CAMBIOS', index=False)
+
+            print(f"💾 {len(df_cambios)} productos con diferencias guardados en 'CAMBIOS'.")
+
+            from openpyxl import load_workbook
+            from openpyxl.styles import PatternFill
+
+            def resaltar_cambios_no_default_code(
+                    ruta_excel,
+                    hoja="CAMBIOS",
+                    columna_default_code="default_code"
+            ):
+                wb = load_workbook(ruta_excel)
+                ws = wb[hoja]
+
+                # Estilo amarillo
+                amarillo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+                # ---------------------------------------
+                # 1️⃣ Detectar índice de columna default_code
+                # ---------------------------------------
+                headers = {cell.value: idx + 1 for idx, cell in enumerate(ws[1])}
+
+                if columna_default_code not in headers:
+                    raise ValueError(f"No existe la columna '{columna_default_code}'")
+
+                col_default = headers[columna_default_code]
+
+                # ---------------------------------------
+                # 2️⃣ Obtener todos los valores default_code
+                # ---------------------------------------
+                default_codes = set()
+                for row in range(2, ws.max_row + 1):
+                    val = ws.cell(row=row, column=col_default).value
+                    if val not in (None, ""):
+                        default_codes.add(str(val).strip())
+
+                # ---------------------------------------
+                # 3️⃣ Recorrer resto de columnas
+                # ---------------------------------------
+                for col_name, col_idx in headers.items():
+                    if col_name == columna_default_code:
+                        continue
+
+                    for row in range(2, ws.max_row + 1):
+                        cell = ws.cell(row=row, column=col_idx)
+                        val = cell.value
+
+                        if val in (None, ""):
+                            continue
+
+                        if str(val).strip() not in default_codes:
+                            cell.fill = amarillo
+
+                # ---------------------------------------
+                # 4️⃣ Guardar cambios
+                # ---------------------------------------
+                wb.save(ruta_excel)
+
+                print("✅ Valores resaltados correctamente en amarillo")
+
+            resaltar_cambios_no_default_code(ruta_excel)
+
         def aplicar_cambios_desde_excel(
-                ruta_excel = ruta,
+                models, db, uid, password,
+                ruta_excel=ruta,
                 hoja_cambios="CAMBIOS",
                 columna_ref="default_code"):
-            """
-            Lee la hoja CAMBIOS, detecta celdas en amarillo (FFFF00),
-            y actualiza SOLO esas columnas en Odoo, buscando por default_code.
-            """
+
             from openpyxl import load_workbook
 
             COLOR_AMARILLO = "FFFF00"
 
-            # === 1. Cargar Excel ===
+            # =========================
+            # 🔧 FUNCIONES AUXILIARES
+            # =========================
+
+            def get_category_by_path(path):
+                parts = [p.strip() for p in str(path).split("/")]
+
+                parent_id = False
+
+                for part in parts:
+                    domain = [["name", "=", part]]
+                    if parent_id:
+                        domain.append(["parent_id", "=", parent_id])
+                    else:
+                        domain.append(["parent_id", "=", False])
+
+                    ids = models.execute_kw(
+                        db, uid, password,
+                        "product.category", "search",
+                        [domain],
+                        {"limit": 1}
+                    )
+
+                    if not ids:
+                        return False
+
+                    parent_id = ids[0]
+
+                return parent_id
+
+            def get_public_category_by_path(path):
+                parts = [p.strip() for p in str(path).split("/")]
+
+                parent_id = False
+
+                for part in parts:
+                    domain = [["name", "=", part]]
+                    if parent_id:
+                        domain.append(["parent_id", "=", parent_id])
+                    else:
+                        domain.append(["parent_id", "=", False])
+
+                    ids = models.execute_kw(
+                        db, uid, password,
+                        "product.public.category", "search",
+                        [domain],
+                        {"limit": 1}
+                    )
+
+                    if not ids:
+                        return False
+
+                    parent_id = ids[0]
+
+                return parent_id
+
+            # =========================
+            # 📄 1. Cargar Excel
+            # =========================
+
             wb = load_workbook(ruta_excel, data_only=True)
             ws = wb[hoja_cambios]
 
-            # Obtener cabeceras
             headers = [c.value for c in ws[1]]
             col_index = {headers[i]: i + 1 for i in range(len(headers))}
 
-            # === 2. Recopilar cambios detectando celdas amarillas ===
+            # =========================
+            # 🟡 2. Detectar cambios
+            # =========================
+
             cambios = []
 
             for row in ws.iter_rows(min_row=2):
@@ -1816,13 +2006,12 @@ def main_import_with_event_manager(event_manager):
                 ref_value = str(ref_cell.value).strip() if ref_cell.value else ""
 
                 if not ref_value:
-                    continue  # ignoramos filas sin referencia
+                    continue
 
                 for col_name, idx in col_index.items():
                     cell = row[idx - 1]
                     fill = cell.fill
 
-                    # Detectar el amarillo
                     is_yellow = (
                             fill
                             and fill.fgColor
@@ -1841,13 +2030,15 @@ def main_import_with_event_manager(event_manager):
                 print("No se encontraron cambios resaltados en amarillo.")
                 return
 
-            # === 3. Procesar cambios en Odoo ===
+            # =========================
+            # 🚀 3. Aplicar cambios
+            # =========================
+
             for cambio in cambios:
                 ref = cambio["default_code"]
                 col = cambio["columna"]
                 val = cambio["valor"]
 
-                # Buscar el producto por default_code
                 product_ids = models.execute_kw(
                     db, uid, password,
                     "product.template", "search",
@@ -1858,13 +2049,67 @@ def main_import_with_event_manager(event_manager):
                     print(f"⚠ No encontrado en Odoo → {ref}")
                     continue
 
-                # Actualizar SOLO la columna modificada
+                vals = {}
+
                 try:
+                    # =========================
+                    # 🧠 CAMPOS ESPECIALES
+                    # =========================
+
+                    if col == "categ_id":
+                        cat_id = get_category_by_path(val)
+                        if cat_id:
+                            vals["categ_id"] = cat_id
+                        else:
+                            print(f"⚠ Categoría no encontrada: {val}")
+                            continue
+
+                    elif col == "public_categ_ids":
+                        paths = [v.strip() for v in str(val).split(",")]
+
+                        ids = []
+                        for path in paths:
+                            cat_id = get_public_category_by_path(path)
+                            if cat_id:
+                                ids.append(cat_id)
+                            else:
+                                print(f"⚠ Categoría pública no encontrada: {path}")
+
+                        if ids:
+                            vals["public_categ_ids"] = [(6, 0, ids)]
+                        else:
+                            continue
+
+                    # =========================
+                    # 🧨 GESTIÓN DE ELIMINACIONES
+                    # =========================
+
+                    if val == "*" or val in [None, "", "nan"]:
+                        if col == "categ_id":
+                            vals["categ_id"] = False
+
+                        elif col == "public_categ_ids":
+                            vals["public_categ_ids"] = [(5, 0, 0)]  # eliminar todos
+
+                        else:
+                            vals[col] = False  # limpia el campo
+
+                    # =========================
+                    # 🟢 VALORES NORMALES
+                    # =========================
+                    else:
+                        vals[col] = val
+
+                    # =========================
+                    # ✍️ WRITE
+                    # =========================
+
                     models.execute_kw(
                         db, uid, password,
                         "product.template", "write",
-                        [product_ids, {col: val}]
+                        [product_ids, vals]
                     )
+
                     print(f"✔ Actualizado {ref}: {col} = {val}")
 
                 except Exception as e:
@@ -1939,8 +2184,17 @@ def main_import_with_event_manager(event_manager):
                     valor_old = str(row[old_col]).strip() if pd.notna(row[old_col]) else ""
                     valor_new = str(row[new_col]).strip() if pd.notna(row[new_col]) else ""
 
-                    if not valor_old or not valor_new:
-                        continue  # ignorar instrucciones incompletas
+                    # Ignorar filas sin OLD
+                    if not valor_old:
+                        continue
+
+                    # 🔴 CASO ELIMINACIÓN
+                    if valor_new == "*":
+                        modo = "eliminar"
+                    elif not valor_new:
+                        continue
+                    else:
+                        modo = "cambiar"
 
                     print(f"\n➡ Cambio: '{valor_old}' → '{valor_new}'")
 
@@ -3334,7 +3588,12 @@ def main_import_with_event_manager(event_manager):
             so_ids = models_src.execute_kw(
                 db_src, uid_src, password_src,
                 "sale.order", "search",
-                [[('company_id', '=', company_id_src)]],
+                [[
+                    ('company_id', '=', company_id_src),
+                    ('state', '=', state),
+                    #('date_order', '>=', '2026-03-30 00:00:00'),
+                    #('date_order', '<=', '2026-03-31 23:59:59')
+                ]],
                 {"order": "date_order asc"}
             )
 
@@ -3469,11 +3728,17 @@ def main_import_with_event_manager(event_manager):
             import xmlrpc.client
             from App_Connection import db, uid, password, models
 
+            context = {
+                'mail_create_nosummary': True,
+                'mail_create_nolog': True,
+                'tracking_disable': True,
+                'no_reset_password': True
+            }
+
             total_creados = 0
             total_existentes = 0
 
             is_from_16 = True
-            #is_from_pruebas = True
 
             for so in sale_orders:
                 name = so["name"]
@@ -3588,8 +3853,8 @@ def main_import_with_event_manager(event_manager):
                     "x_comentarios": so.get("x_comentarios"),
                     "client_order_ref": so.get("client_order_ref"),
                     "state": state,
-                    "fiscal_position_id": fiscal_position_id,
-                    "user_id": user_id,
+                    #"fiscal_position_id": fiscal_position_id,
+                    "user_id": 43, #user_id,
                     "create_date": so.get("create_date"),
                 }
 
@@ -3597,7 +3862,8 @@ def main_import_with_event_manager(event_manager):
                     new_so_id = models.execute_kw(
                         db, uid, password,
                         "sale.order", "create",
-                        [vals_so]
+                        [vals_so],
+                        {'context': context}
                     )
                     print(f"✅ Pedido creado: {name} (ID {new_so_id})")
                     total_creados += 1
@@ -3625,7 +3891,7 @@ def main_import_with_event_manager(event_manager):
                         try:
                             models.execute_kw(
                                 db, uid, password,
-                                "sale.order.line", "create", [vals_line]
+                                "sale.order.line", "create", [vals_line], {'context': context}
                             )
                             print(f"   📝 {display_type} creada: {linea.get('name')}")
                         except Exception as e:
@@ -3648,7 +3914,7 @@ def main_import_with_event_manager(event_manager):
                         product_id = productos[0] if productos else None
 
                     tax_ids = []
-                    if linea.get("tax_id"):# and not is_from_pruebas:
+                    if linea.get("tax_id"):
                         tax_origen = linea.get("tax_id")[0]
                         tax_id = Utils.get_by_x_id_interno("account.tax", tax_origen, db, uid, password, models) if is_from_16 else tax_origen
                         tax_ids = [tax_id] if tax_id else []
@@ -3660,7 +3926,7 @@ def main_import_with_event_manager(event_manager):
                         "product_uom_qty": linea.get("product_uom_qty") or 0.0,
                         "price_unit": linea.get("price_unit") or 0.0,
                         "discount": linea.get("discount", 0.0),
-                        "tax_id": [(6, 0, [tax_ids])],#[[6, 0, []]],
+                        "tax_id": [(6, 0, [])],#[(6, 0, [tax_ids])],#
                         "x_nota_interna": linea.get("x_nota_interna"),
                     }
 
@@ -3668,7 +3934,8 @@ def main_import_with_event_manager(event_manager):
                         models.execute_kw(
                             db, uid, password,
                             "sale.order.line", "create",
-                            [vals_line]
+                            [vals_line],
+                            {'context': context}
                         )
                         print(f"   ➕ Línea creada: {linea.get('name')}")
                     except Exception as e:
@@ -3679,21 +3946,6 @@ def main_import_with_event_manager(event_manager):
             print("\n📊 MIGRACIÓN COMPLETADA")
             print(f"   Total creados: {total_creados}")
             print(f"   Ya existentes: {total_existentes}")
-
-        # Ejecución directa opcional
-        # migrar_tareas()
-
-        #Facturas/Pagos clientes/proveedores
-        #cuentas analiticas:
-        # accounts = export_cuentas_analiticas()
-        # import_cuentas_analiticas(accounts)
-        # apuntes analiticos:
-        # lines = export_apuntes_analiticos()
-        # import_apuntes_analiticos(lines)
-        #proyectos y tareas
-        #comprobar reasignacion: comprobar_reasignaciones_analiticas()
-        # Reasignar (si procede)
-        # Conciliacion
 
         def migrar_pedidos_venta_draft():
             orders = export_sale_orders_by_state("draft")
@@ -11988,7 +12240,7 @@ def main_import_with_event_manager(event_manager):
             except Exception as e:
                 print(f"❌ Error eliminando atributos de productos: {e}")
 
-        def actualizar_stock_almacen3_por_sku(pwd=password, excel_path=ruta):
+        def actualizar_stock_local_por_sku(pwd=password, excel_path=ruta):
 
             try:
                 import pandas as pd
@@ -12052,51 +12304,9 @@ def main_import_with_event_manager(event_manager):
             except Exception as e:
                 print(f"❌ Error: {e}")
 
-        #actualizar_stock_almacen3_por_sku()
+        #actualizar_stock_local_por_sku()
 
-        def procesar_skus_odoo_v1(ruta_excel = ruta):
-            # 1. Leer SKUs del Excel
-            df = pd.read_excel(ruta_excel)
-            # Aseguramos que tratamos el SKU como string y quitamos espacios
-            skus_excel = df['SKU'].astype(str).str.strip().tolist()
-
-            ya_tenian_corchete = []
-            modificados = []
-            no_encontrados = []
-
-            for sku in skus_excel:
-                # 2. Buscar producto en Odoo por default_code
-                productos = models.execute_kw(db, uid, password, 'product.template', 'search_read',
-                                              [[['default_code', '=', sku]]],
-                                              {'fields': ['id', 'name', 'default_code'], 'limit': 1}
-                                              )
-
-                if not productos:
-                    no_encontrados.append(sku)
-                    continue
-
-                producto = productos[0]
-                nombre_actual = producto['name']
-                id_producto = producto['id']
-
-                # 3. Lógica de filtrado y actualización
-                if "[" in nombre_actual:
-                    ya_tenian_corchete.append(sku)
-                else:
-                    nuevo_nombre = f"[VEE25{sku}1] {nombre_actual}"
-                    # Actualizar en Odoo
-                    models.execute_kw(db, uid, password, 'product.template', 'write',
-                                      [[id_producto], {'name': nuevo_nombre}]
-                                      )
-                    modificados.append(sku)
-
-            # 4. Resultados finales
-            print("\n--- RESUMEN DEL PROCESO ---")
-            print(f"✅ Modificados ({len(modificados)}): {modificados}")
-            print(f"⚠️ Ya tenían '[' ({len(ya_tenian_corchete)}): {ya_tenian_corchete}")
-            print(f"❌ No encontrados en Odoo ({len(no_encontrados)}): {no_encontrados}")
-
-        def procesar_skus_odoo(ruta_excel = ruta):
+        def procesar_skus_VEE_odoo(ruta_excel = ruta):
             df = pd.read_excel(ruta_excel)
             skus_excel = df['SKU'].astype(str).str.strip().tolist()
 
@@ -12138,7 +12348,93 @@ def main_import_with_event_manager(event_manager):
             print(f"🆕 Nuevos (no tenían []): {len(modificados_nuevos)}")
             print(f"❌ No encontrados: {len(no_encontrados)}")
 
-        #procesar_skus_odoo()
+        def detectar_y_crear_proveedores_vtac(is_ose = False, is_almai = False):
+            """
+            Detecta productos V-Tac sin proveedor V-Tac y/o OSE
+            y crea las líneas de proveedor correspondientes.
+            """
+            ose_id = 3438 if is_almai else 3711
+
+            PRODUCT_TEMPLATE = models.execute_kw(
+                db, uid, password,
+                'product.template', 'search_read',
+                [
+                    [
+                        ('default_code', '!=', False),
+                        ('product_brand_id.name', '=', 'V-Tac')
+                    ]
+                ],
+                {
+                    'fields': ['id', 'name', 'default_code', 'standard_price'],
+                }
+            )
+
+            print(f"🔍 Productos encontrados V-Tac: {len(PRODUCT_TEMPLATE)}")
+
+            creados_3276 = 0
+            creados_3438 = 0
+
+            for product in PRODUCT_TEMPLATE:
+                tmpl_id = product['id']
+                name = product['name']
+                default_code = product['default_code']
+                standard_price = product.get('standard_price', 0.0) or 0.0
+
+                supplierinfos = models.execute_kw(
+                    db, uid, password,
+                    'product.supplierinfo', 'search_read',
+                    [
+                        [('product_tmpl_id', '=', tmpl_id)]
+                    ],
+                    {
+                        'fields': ['partner_id'],
+                    }
+                )
+
+                proveedores = [s['partner_id'][0] for s in supplierinfos if s.get('partner_id')]
+
+                tiene_3276 = 3276 in proveedores
+                tiene_3438 = ose_id in proveedores if not is_ose else True
+
+                # 🔵 CREAR PROVEEDOR 3276
+                if not tiene_3276:
+                    models.execute_kw(
+                        db, uid, password,
+                        'product.supplierinfo', 'create',
+                        [{
+                            'partner_id': 3276,
+                            'product_tmpl_id': tmpl_id,
+                            'product_name': name,
+                            'product_code': default_code,
+                            'min_qty': 1,
+                            'price': standard_price,
+                        }]
+                    )
+                    creados_3276 += 1
+                    print(f"✅ Creado proveedor 3276 → {default_code}")
+
+                # 🔴 CREAR PROVEEDOR ose_id
+                if not tiene_3438:
+                    models.execute_kw(
+                        db, uid, password,
+                        'product.supplierinfo', 'create',
+                        [{
+                            'partner_id': ose_id,
+                            'product_tmpl_id': tmpl_id,
+                            'product_name': name,
+                            'product_code': default_code,
+                            'min_qty': 1,
+                            'price': 0,
+                        }]
+                    )
+                    creados_3438 += 1
+                    print(f"✅ Creado proveedor 3438 → {default_code}")
+
+            print("\n🎯 RESULTADO FINAL:")
+            print(f"➤ Proveedores 3276 creados: {creados_3276}")
+            print(f"➤ Proveedores 3438 creados: {creados_3438}")
+
+
 
         ruta = Utils.seleccionar_excel()
 
