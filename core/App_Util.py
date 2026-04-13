@@ -126,17 +126,7 @@ def update_comercial_stock(excel_path):
         if undel not in (None, "", "nan") and stock <= 0 and sku in odoo_low:
             proximamente.append(sku)
 
-    # --- ODOO ---
-    for _, row in df_odoo.iterrows():
-        sku = _coerce_sku(row["SKU"])
-        if not sku or sku not in sku_map:
-            continue
-
-        stock = _to_float(row["STOCK"])
-        old_val = sku_map[sku]["values"].get(FIELD_ODOO) or 0.0
-
-        if stock != old_val:
-            grouped[("product.product", FIELD_ODOO, stock)].append(sku_map[sku]["id"])
+    # --- SIN UPDATE ODOO: x_almacen_local ---
 
     # --- WRITE BATCH ---
     total_updates = 0
