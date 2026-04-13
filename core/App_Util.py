@@ -126,7 +126,17 @@ def update_comercial_stock(excel_path):
         if undel not in (None, "", "nan") and stock <= 0 and sku in odoo_low:
             proximamente.append(sku)
 
-    # --- SIN UPDATE ODOO: x_almacen_local ---
+    # --- ODOO combinado de ose y 16 ---
+    for _, row in df_odoo.iterrows():
+        sku = _coerce_sku(row["SKU"])
+        if not sku or sku not in sku_map:
+            continue
+
+        stock = _to_float(row["STOCK"])
+        old_val = sku_map[sku]["values"].get(FIELD_ODOO) or 0.0
+
+        if stock != old_val:
+            grouped[("product.product", FIELD_ODOO, stock)].append(sku_map[sku]["id"])
 
     # --- WRITE BATCH ---
     total_updates = 0
@@ -879,6 +889,26 @@ def import_comercial_stock():
         - Escribe a 'output_path' (xlsx) con hojas:
           Madrid, Bulgaria, VS, Odoo, VD, VN
         """
+
+        def odoo_vtac_multi(connections):
+            import pandas as pd
+
+            dfs = []
+
+            for models, uid, db, password in connections:
+                df = odoo_vtac(models, uid, db, password)
+                if not df.empty:
+                    dfs.append(df)
+
+            if not dfs:
+                return pd.DataFrame(columns=["SKU", "STOCK"])
+
+            # 🔥 CONCAT + SUMA POR SKU
+            df_total = pd.concat(dfs, ignore_index=True)
+            df_total = df_total.groupby("SKU", as_index=False)["STOCK"].sum()
+
+            return df_total
+
         print(">> Generando Excel Base...")
 
         # =========================
@@ -891,6 +921,13 @@ def import_comercial_stock():
             models = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/object")
 
             return models, uid
+
+        odoo_ose = {
+            'url': "https://b2b.optimaluz.com/",
+            'db': "odoo0",
+            'user': "admin",
+            'password': "1324",
+        }
 
         odoo16 = {
             'url': "http://37.59.66.189:8069/",
@@ -913,8 +950,15 @@ def import_comercial_stock():
         print(f"  VS: {len(vs)} filas")
 
         # 2) Odoo
-        odoo_df = odoo_vtac(models, uid, db, password)
-        print(f"  Odoo (V-Tac): {len(odoo_df)} filas")
+        models_16, uid_16 = conectar(odoo16)
+        models_ose, uid_ose = conectar(odoo_ose)
+
+        conn_16 = (models_16, uid_16, odoo16["db"], odoo16["password"])
+        conn_ose = (models_ose, uid_ose, odoo_ose["db"], odoo_ose["password"])
+
+        odoo_df = odoo_vtac_multi([conn_16, conn_ose])
+
+        print(f"  Odoo combinado: {len(odoo_df)} filas")
 
         # 3) Guardar
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
