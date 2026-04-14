@@ -4,137 +4,6 @@ from utils import Utils
 
 ruta = Utils.seleccionar_excel()
 
-def detectar_cambios_excel(ruta_excel):
-    """
-    Compara las hojas Odoo16 y Odoo18 y crea la hoja 'Cambios' con:
-      - default_code
-      - Solo las columnas que difieren (valores tomados de Odoo16)
-        Si el valor fue eliminado (vacío en 16 pero no en 18) se marca con '*'.
-    Las demás columnas quedan vacías.
-    """
-
-    # Leer las hojas
-    df16 = pd.read_excel(ruta_excel, sheet_name='OLD')
-    df18 = pd.read_excel(ruta_excel, sheet_name='NEW')
-
-    df18['list_price'] = df18['list_price'].fillna(0).astype(float).round(2)
-    df16['list_price'] = df16['list_price'].fillna(0).astype(float).round(2)
-
-    if 'default_code' not in df16.columns or 'default_code' not in df18.columns:
-        raise ValueError("Falta la columna 'default_code' en una o ambas hojas.")
-
-    # Limpiar duplicados y vacíos
-    df16 = df16.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
-    df18 = df18.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
-
-    # Indexar por default_code
-    df16 = df16.set_index('default_code')
-    df18 = df18.set_index('default_code')
-
-    comunes = df16.index.intersection(df18.index)
-    columnas_comunes = [col for col in df16.columns if col in df18.columns]
-
-    cambios = []
-
-    for code in comunes:
-        fila16 = df16.loc[code]
-        fila18 = df18.loc[code]
-
-        dif_cols = [
-            col for col in columnas_comunes
-            if str(fila16[col]).strip() != str(fila18[col]).strip()
-        ]
-
-        if dif_cols:
-            fila_resultado = {col: "" for col in columnas_comunes}  # vacío por defecto
-            fila_resultado['default_code'] = code
-
-            for col in dif_cols:
-                val16 = str(fila16[col]).strip()
-                val18 = str(fila18[col]).strip()
-
-                # Si el valor fue eliminado (antes existía y ahora está vacío)
-                if val16 in ["", "nan", "None"] and val18 not in ["", "nan", "None"]:
-                    fila_resultado[col] = "*"  # marca eliminación
-                else:
-                    fila_resultado[col] = fila16[col]  # valor normal de Odoo16
-
-            cambios.append(fila_resultado)
-
-    if not cambios:
-        print("✅ No se detectaron diferencias entre Odoo16 y Odoo18.")
-        return
-
-    # Crear DataFrame con las mismas columnas
-    df_cambios = pd.DataFrame(cambios)
-    columnas_finales = ['default_code'] + [c for c in columnas_comunes if c != 'default_code']
-    df_cambios = df_cambios[columnas_finales]
-
-    # Guardar resultados
-    with pd.ExcelWriter(ruta_excel, mode='a', engine='openpyxl', if_sheet_exists='replace') as writer:
-        df_cambios.to_excel(writer, sheet_name='CAMBIOS', index=False)
-
-    print(f"💾 {len(df_cambios)} productos con diferencias guardados en 'CAMBIOS'.")
-
-    from openpyxl import load_workbook
-    from openpyxl.styles import PatternFill
-
-    def resaltar_cambios_no_default_code(
-            ruta_excel,
-            hoja="CAMBIOS",
-            columna_default_code="default_code"
-    ):
-        wb = load_workbook(ruta_excel)
-        ws = wb[hoja]
-
-        # Estilo amarillo
-        amarillo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-
-        # ---------------------------------------
-        # 1️⃣ Detectar índice de columna default_code
-        # ---------------------------------------
-        headers = {cell.value: idx + 1 for idx, cell in enumerate(ws[1])}
-
-        if columna_default_code not in headers:
-            raise ValueError(f"No existe la columna '{columna_default_code}'")
-
-        col_default = headers[columna_default_code]
-
-        # ---------------------------------------
-        # 2️⃣ Obtener todos los valores default_code
-        # ---------------------------------------
-        default_codes = set()
-        for row in range(2, ws.max_row + 1):
-            val = ws.cell(row=row, column=col_default).value
-            if val not in (None, ""):
-                default_codes.add(str(val).strip())
-
-        # ---------------------------------------
-        # 3️⃣ Recorrer resto de columnas
-        # ---------------------------------------
-        for col_name, col_idx in headers.items():
-            if col_name == columna_default_code:
-                continue
-
-            for row in range(2, ws.max_row + 1):
-                cell = ws.cell(row=row, column=col_idx)
-                val = cell.value
-
-                if val in (None, ""):
-                    continue
-
-                if str(val).strip() not in default_codes:
-                    cell.fill = amarillo
-
-        # ---------------------------------------
-        # 4️⃣ Guardar cambios
-        # ---------------------------------------
-        wb.save(ruta_excel)
-
-        print("✅ Valores resaltados correctamente en amarillo")
-
-    resaltar_cambios_no_default_code(ruta_excel)
-
 origen = {
     'url': "https://optimaluz.soluntec.net",
     'db': "Test",#"Real",
@@ -1505,6 +1374,7 @@ def actualizar_odoos():
         from openpyxl import load_workbook
         from openpyxl.styles import PatternFill
         from datetime import datetime, timedelta
+        import re
         import os
         import pandas as pd
         import xmlrpc.client
@@ -1527,7 +1397,7 @@ def actualizar_odoos():
                 db, uid, password,
                 'product.template', 'search_read',
                 [domain],
-                {'fields': fields}
+                {'fields': fields, 'context': {'lang': 'es_ES'}}
             )
 
             if not products:
@@ -1541,7 +1411,7 @@ def actualizar_odoos():
 
             columns_order = [
                 'default_code', 'name', 'standard_price',
-                'list_price', 'categ_id', 'description', 'public_categ_ids'
+                'list_price', 'categ_id', 'description', 'public_categ_ids', 'x_almacen_local'
             ]
 
             return df[columns_order]
@@ -1567,7 +1437,8 @@ def actualizar_odoos():
                 'description',
                 'categ_id',
                 'public_categ_ids',
-                'is_published'
+                'is_published',
+                'x_almacen_local',
             ]
 
             # 📥 NEW → origen (filtrado)
@@ -1596,155 +1467,186 @@ def actualizar_odoos():
 
             return filename
 
-        def detectar_cambios_excel(ruta_excel):
-            """
-            Compara las hojas Odoo16 y Odoo18 y crea la hoja 'Cambios' con:
-              - default_code
-              - Solo las columnas que difieren (valores tomados de Odoo16)
-                Si el valor fue eliminado (vacío en 16 pero no en 18) se marca con '*'.
-            Las demás columnas quedan vacías.
-            """
+        def detectar_cambios_excel(ruta_excel, debug=False):
 
             def normalize(val):
-                if pd.isna(val):
+                # 🔹 Vacíos unificados
+                if pd.isna(val) or val in ["", "nan", "None"]:
                     return None
 
+                # 🔹 Strings
+                if isinstance(val, str):
+                    val = val.strip()
+
+                    # número con coma → float
+                    if re.match(r"^\d+,\d+$", val):
+                        return round(float(val.replace(",", ".")), 2)
+
+                    # lista en string
+                    if val.startswith("[") and val.endswith("]"):
+                        try:
+                            parsed = ast.literal_eval(val)
+                            if isinstance(parsed, list):
+                                return sorted(parsed)
+                        except:
+                            pass
+
+                    return val
+
+                # 🔹 float
                 if isinstance(val, float):
                     return round(val, 2)
 
+                # 🔹 lista real
                 if isinstance(val, list):
                     return sorted(val)
 
-                # 🔥 NUEVO: detectar listas en string
-                if isinstance(val, str) and val.startswith("[") and val.endswith("]"):
-                    try:
-                        parsed = ast.literal_eval(val)
-                        if isinstance(parsed, list):
-                            return sorted(parsed)
-                    except:
-                        pass
+                return val
 
-                return str(val).strip()
+            # -----------------------------
+            # 📥 Leer Excel
+            # -----------------------------
+            df_old = pd.read_excel(ruta_excel, sheet_name='OLD')
+            df_new = pd.read_excel(ruta_excel, sheet_name='NEW')
 
-            # Leer las hojas
-            df16 = pd.read_excel(ruta_excel, sheet_name='OLD')
-            df18 = pd.read_excel(ruta_excel, sheet_name='NEW')
+            # 🔧 Normalizar default_code (CLAVE)
+            df_old['default_code'] = df_old['default_code'].astype(str).str.strip()
+            df_new['default_code'] = df_new['default_code'].astype(str).str.strip()
 
-            df18['list_price'] = df18['list_price'].fillna(0).astype(float).round(2)
-            df16['list_price'] = df16['list_price'].fillna(0).astype(float).round(2)
+            if 'default_code' not in df_old.columns or 'default_code' not in df_new.columns:
+                raise ValueError("Falta la columna 'default_code'.")
 
-            if 'default_code' not in df16.columns or 'default_code' not in df18.columns:
-                raise ValueError("Falta la columna 'default_code' en una o ambas hojas.")
+            # -----------------------------
+            # 🔧 Normalización previa
+            # -----------------------------
+            for col in ['list_price', 'standard_price']:
+                if col in df_old.columns:
+                    df_old[col] = df_old[col].fillna(0).astype(float).round(2)
+                if col in df_new.columns:
+                    df_new[col] = df_new[col].fillna(0).astype(float).round(2)
 
-            # Limpiar duplicados y vacíos
-            df16 = df16.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
-            df18 = df18.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
+            # limpiar
+            df_old = df_old.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
+            df_new = df_new.dropna(subset=['default_code']).drop_duplicates(subset=['default_code'])
 
-            # Indexar por default_code
-            df16 = df16.set_index('default_code')
-            df18 = df18.set_index('default_code')
+            df_old = df_old.set_index('default_code')
+            df_new = df_new.set_index('default_code')
 
-            comunes = df16.index.intersection(df18.index)
-            columnas_comunes = [col for col in df16.columns if col in df18.columns]
+            comunes = df_old.index.intersection(df_new.index)
+            columnas = [c for c in df_old.columns if c in df_new.columns]
 
             cambios = []
 
+            # -----------------------------
+            # 🔍 Comparación
+            # -----------------------------
             for code in comunes:
-                fila16 = df16.loc[code]
-                fila18 = df18.loc[code]
+                fila_old = df_old.loc[code]
+                fila_new = df_new.loc[code]
 
-                dif_cols = [
-                    col for col in columnas_comunes
-                    if normalize(fila16[col]) != normalize(fila18[col])
-                ]
+                fila_resultado = {"default_code": code}
+                hay_cambios = False
 
-                if dif_cols:
-                    fila_resultado = {col: "" for col in columnas_comunes}  # vacío por defecto
-                    fila_resultado['default_code'] = code
+                if debug:
+                    print("\n" + "=" * 60)
+                    print(f"🔎 SKU: {code}")
+                    print("-" * 60)
 
-                    for col in dif_cols:
-                        val16 = str(fila16[col]).strip()
-                        val18 = str(fila18[col]).strip()
+                for col in columnas:
+                    val_old_raw = fila_old[col]
+                    val_new_raw = fila_new[col]
 
-                        # Si el valor fue eliminado (antes existía y ahora está vacío)
-                        if val16 in ["", "nan", "None"] and val18 not in ["", "nan", "None"]:
-                            fila_resultado[col] = "*"  # marca eliminación
+                    val_old = normalize(val_old_raw)
+                    val_new = normalize(val_new_raw)
+
+                    coincide = val_old == val_new
+
+                    if not coincide:
+                        hay_cambios = True
+
+                        # lógica de cambios
+                        if val_new is None and val_old is not None:
+                            fila_resultado[col] = "*"
                         else:
-                            fila_resultado[col] = fila16[col]  # valor normal de Odoo16
+                            fila_resultado[col] = val_new_raw
+                    else:
+                        fila_resultado[col] = ""
 
+                    # 🔥 DEBUG DETALLADO
+                    if debug:
+                        estado = "OK" if coincide else "DIFF"
+                        print(f"{col}:")
+                        print(f"   OLD → {val_old_raw}")
+                        print(f"   NEW → {val_new_raw}")
+                        print(f"   NORMALIZED → {val_old} | {val_new}")
+                        print(f"   RESULT → {estado}")
+                        print("-" * 40)
+
+                if debug:
+                    if hay_cambios:
+                        print(f"❌ RESULTADO FINAL SKU {code}: DIFERENCIAS")
+                    else:
+                        print(f"✅ RESULTADO FINAL SKU {code}: COINCIDE TOTAL")
+
+                if hay_cambios:
                     cambios.append(fila_resultado)
 
+            # -----------------------------
+            # ❌ Sin cambios
+            # -----------------------------
             if not cambios:
-                print("✅ No se detectaron diferencias entre Odoo origen y Odoo destino.")
+                print("✅ No hay diferencias.")
                 return False
 
-            # Crear DataFrame con las mismas columnas
+            # -----------------------------
+            # 📊 Crear DF resultado
+            # -----------------------------
             df_cambios = pd.DataFrame(cambios)
-            columnas_finales = ['default_code'] + [c for c in columnas_comunes if c != 'default_code']
+
+            columnas_finales = ['default_code'] + [c for c in columnas if c != 'default_code']
             df_cambios = df_cambios[columnas_finales]
 
-            # Guardar resultados
+            # -----------------------------
+            # 💾 Guardar Excel
+            # -----------------------------
             with pd.ExcelWriter(ruta_excel, mode='a', engine='openpyxl', if_sheet_exists='replace') as writer:
                 df_cambios.to_excel(writer, sheet_name='CAMBIOS', index=False)
 
-            print(f"💾 {len(df_cambios)} productos con diferencias guardados en 'CAMBIOS'.")
+            print(f"💾 {len(df_cambios)} productos con cambios.")
 
-            def resaltar_cambios_no_default_code(
-                    ruta_excel,
-                    hoja="CAMBIOS",
-                    columna_default_code="default_code"
-            ):
-                wb = load_workbook(ruta_excel)
-                ws = wb[hoja]
+            # -----------------------------
+            # 🎨 Resaltado visual
+            # -----------------------------
+            wb = load_workbook(ruta_excel)
+            ws = wb["CAMBIOS"]
 
-                # Estilo amarillo
-                amarillo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+            amarillo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
-                # ---------------------------------------
-                # 1️⃣ Detectar índice de columna default_code
-                # ---------------------------------------
-                headers = {cell.value: idx + 1 for idx, cell in enumerate(ws[1])}
+            headers = {cell.value: idx + 1 for idx, cell in enumerate(ws[1])}
+            col_default = headers["default_code"]
 
-                if columna_default_code not in headers:
-                    raise ValueError(f"No existe la columna '{columna_default_code}'")
+            default_codes = set(
+                str(ws.cell(row=r, column=col_default).value).strip()
+                for r in range(2, ws.max_row + 1)
+                if ws.cell(row=r, column=col_default).value
+            )
 
-                col_default = headers[columna_default_code]
+            for col_name, col_idx in headers.items():
+                if col_name == "default_code":
+                    continue
 
-                # ---------------------------------------
-                # 2️⃣ Obtener todos los valores default_code
-                # ---------------------------------------
-                default_codes = set()
                 for row in range(2, ws.max_row + 1):
-                    val = ws.cell(row=row, column=col_default).value
-                    if val not in (None, ""):
-                        default_codes.add(str(val).strip())
+                    cell = ws.cell(row=row, column=col_idx)
+                    val = cell.value
 
-                # ---------------------------------------
-                # 3️⃣ Recorrer resto de columnas
-                # ---------------------------------------
-                for col_name, col_idx in headers.items():
-                    if col_name == columna_default_code:
-                        continue
+                    if val not in (None, "") and str(val).strip() not in default_codes:
+                        cell.fill = amarillo
 
-                    for row in range(2, ws.max_row + 1):
-                        cell = ws.cell(row=row, column=col_idx)
-                        val = cell.value
+            wb.save(ruta_excel)
 
-                        if val in (None, ""):
-                            continue
+            print("🎨 Cambios resaltados.")
 
-                        if str(val).strip() not in default_codes:
-                            cell.fill = amarillo
-
-                # ---------------------------------------
-                # 4️⃣ Guardar cambios
-                # ---------------------------------------
-                wb.save(ruta_excel)
-                return ruta_excel
-
-                print("✅ Valores resaltados correctamente en amarillo")
-
-            return resaltar_cambios_no_default_code(ruta_excel)
+            return ruta_excel
 
         def aplicar_cambios_desde_excel(
                 models, db, uid, password,
@@ -1938,4 +1840,5 @@ def actualizar_odoos():
 
 
 #actualizar_odoos()
+
 
