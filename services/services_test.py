@@ -71,6 +71,7 @@ def transferencia_productos_por_sku():
             'out_of_stock_message',
             'public_categ_ids',
             'allow_out_of_stock_order',
+            'x_almacen_local',
         ]
 
         # -------------------------------------------------
@@ -142,7 +143,22 @@ def transferencia_productos_por_sku():
                     'show_availability': True,
                     'available_threshold': 100.000,
                     'allow_out_of_stock_order': product.get('allow_out_of_stock_order'),
+                    'x_almacen_local': product.get('x_almacen_local')
                 }
+
+                icon_fields = [f'x_icono{i}' for i in range(1, 9)]
+
+                icons_data = models_src.execute_kw(
+                    db_src, uid_src, pwd_src,
+                    'product.template', 'read',
+                    [[product['id']]],
+                    {'fields': icon_fields}
+                )[0]
+
+                # 🔥 Añadir iconos dinámicamente
+                for field in icon_fields:
+                    if icons_data.get(field):
+                        vals[field] = icons_data[field]
 
                 # -------------------------
                 # Categoría interna
@@ -1370,23 +1386,24 @@ def extraer_skus_pdf_catalogo_a_excel(pdf_path, excel_salida="skus_extraidos.xls
 
 
 def actualizar_odoos():
+    from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill
+    from datetime import datetime, timedelta
+    import re
+    import os
+    import pandas as pd
+    import xmlrpc.client
+    import ast
+
+    def conectar(config):
+        common = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/common")
+        uid = common.authenticate(config['db'], config['user'], config['password'], {})
+
+        models = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/object")
+
+        return models, uid
+
     def actualizar_prods_diariamente(origen, destino):
-        from openpyxl import load_workbook
-        from openpyxl.styles import PatternFill
-        from datetime import datetime, timedelta
-        import re
-        import os
-        import pandas as pd
-        import xmlrpc.client
-        import ast
-
-        def conectar(config):
-            common = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/common")
-            uid = common.authenticate(config['db'], config['user'], config['password'], {})
-
-            models = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/object")
-
-            return models, uid
 
         # 🔌 Conexiones
         models_o, uid_o = conectar(origen)
@@ -1838,7 +1855,460 @@ def actualizar_odoos():
         print(f"\n🚀 Actualizando destino: {destino['url']}")
         actualizar_prods_diariamente(origen, destino)
 
+    def obtener_skus_ultimo_mes(models, db, uid, password, user_id=33):
+        today = datetime.today()
+
+        start_date = today.replace(day=1, hour=0, minute=0, second=0)
+        next_month = (today.replace(day=28) + timedelta(days=5)).replace(day=1)
+
+        domain = [
+            ('create_uid', '=', user_id),
+            ('create_date', '>=', start_date.strftime('%Y-%m-%d %H:%M:%S')),
+            ('create_date', '<', next_month.strftime('%Y-%m-%d %H:%M:%S')),
+        ]
+
+        products = models.execute_kw(
+            db, uid, password,
+            'product.template', 'search_read',
+            [domain],
+            {'fields': ['default_code']}
+        )
+
+        skus = [
+            p['default_code']
+            for p in products
+            if p.get('default_code')
+        ]
+
+        print(f"🧾 SKUs último mes (user {user_id}): {len(skus)}")
+
+        return list(set(skus))
+
+    def migrate_products_by_sku(models_src, db_src, uid_src, pwd_src,
+                                models_dst, db_dst, uid_dst, pwd_dst,
+                                skus=None):
+        """
+        Migra productos filtrados por SKU (default_code).
+        SOLUCIÓN 1:
+        - NO se leen imágenes en el read masivo
+        - image_1920 se lee producto a producto
+        """
+
+        con_atributos = True
+
+        print(f"🧾 SKUs detectados: {len(skus)}")
+
+        # -------------------------------------------------
+        # 2️⃣ Campos (SIN image_1920)
+        # -------------------------------------------------
+        FIELDS = [
+            'id',
+            'active',
+            'name',
+            'default_code',
+            'invoice_policy',
+            'standard_price',
+            'categ_id',
+            'product_brand_id',
+            'x_url',
+            'description',
+            'out_of_stock_message',
+            'public_categ_ids',
+            'allow_out_of_stock_order',
+            'x_almacen_local',
+        ]
+
+        # -------------------------------------------------
+        # 3️⃣ Buscar productos por SKU
+        # -------------------------------------------------
+        domain = [('default_code', 'in', skus)]
+
+        product_ids = models_src.execute_kw(
+            db_src, uid_src, pwd_src,
+            'product.template', 'search',
+            [domain],
+            {'context': {'active_test': False}}
+        )
+
+        if not product_ids:
+            print("ℹ️ No se encontraron productos para esos SKUs")
+            return
+
+        products = models_src.execute_kw(
+            db_src, uid_src, pwd_src,
+            'product.template', 'read',
+            [product_ids],
+            {'fields': FIELDS}
+        )
+
+        print(f"📦 Productos a migrar: {len(products)}")
+
+        # -------------------------------------------------
+        # 4️⃣ Migración producto a producto
+        # -------------------------------------------------
+        for product in products:
+            try:
+                # -------------------------
+                # 🔎 Comprobar si ya existe en destino
+                # -------------------------
+                existing_ids = models_dst.execute_kw(
+                    db_dst, uid_dst, pwd_dst,
+                    'product.template', 'search',
+                    [[('default_code', '=', product.get('default_code'))]],
+                    {'limit': 1, 'context': {'active_test': False}}
+                )
+
+                if existing_ids:
+                    print(f"⏭ SKU {product.get('default_code')} ya existe en destino (ID {existing_ids[0]}) — se omite")
+                    continue
+
+                # ---------------------------------------------
+                # 🔹 Leer imagen SOLO de este producto
+                # ---------------------------------------------
+                image_data = models_src.execute_kw(
+                    db_src, uid_src, pwd_src,
+                    'product.template', 'read',
+                    [[product['id']]],
+                    {'fields': ['image_1920']}
+                )[0]['image_1920']
+
+                vals = {
+                    'active': product.get('active', True),
+                    'image_1920': image_data,
+                    'name': product.get('name'),
+                    'default_code': product.get('default_code'),
+                    'invoice_policy': product.get('invoice_policy'),
+                    'standard_price': product.get('standard_price') or 0.0,
+                    'x_url': product.get('x_url'),
+                    'description': product.get('description'),
+                    'out_of_stock_message': product.get('out_of_stock_message'),
+                    'list_price': 0.0,
+                    'is_storable': True,
+                    'show_availability': True,
+                    'available_threshold': 100.000,
+                    'allow_out_of_stock_order': product.get('allow_out_of_stock_order'),
+                    'x_almacen_local': product.get('x_almacen_local'),
+                }
+
+                icon_fields = [f'x_icono{i}' for i in range(1, 9)]
+
+                icons_data = models_src.execute_kw(
+                    db_src, uid_src, pwd_src,
+                    'product.template', 'read',
+                    [[product['id']]],
+                    {'fields': icon_fields}
+                )[0]
+
+                # 🔥 Añadir iconos dinámicamente
+                for field in icon_fields:
+                    if icons_data.get(field):
+                        vals[field] = icons_data[field]
+
+                # -------------------------
+                # Categoría interna
+                # -------------------------
+                if product.get('categ_id'):
+                    categ_name = product['categ_id'][1]
+                    categ_ids = models_dst.execute_kw(
+                        db_dst, uid_dst, pwd_dst,
+                        'product.category', 'search',
+                        [[('name', '=', categ_name)]],
+                        {'limit': 1}
+                    )
+                    if categ_ids:
+                        vals['categ_id'] = categ_ids[0]
+
+                # -------------------------
+                # Marca
+                # -------------------------
+                if product.get('product_brand_id'):
+                    brand_name = product['product_brand_id'][1]
+                    brand_ids = models_dst.execute_kw(
+                        db_dst, uid_dst, pwd_dst,
+                        'product.brand', 'search',
+                        [[('name', '=', brand_name)]],
+                        {'limit': 1}
+                    )
+                    if brand_ids:
+                        vals['product_brand_id'] = brand_ids[0]
+                    else:
+                        vals['product_brand_id'] = models_dst.execute_kw(
+                            db_dst, uid_dst, pwd_dst,
+                            'product.brand', 'create',
+                            [{'name': brand_name}]
+                        )
+
+                # -------------------------
+                # Categorías web
+                # -------------------------
+                if product.get('public_categ_ids'):
+                    web_categ_ids = []
+                    for wc in product['public_categ_ids']:
+                        wc_name = models_src.execute_kw(
+                            db_src, uid_src, pwd_src,
+                            'product.public.category', 'read',
+                            [[wc]],
+                            {'fields': ['name']}
+                        )[0]['name']
+
+                        dst_wc = models_dst.execute_kw(
+                            db_dst, uid_dst, pwd_dst,
+                            'product.public.category', 'search',
+                            [[('name', '=', wc_name)]],
+                            {'limit': 1}
+                        )
+
+                        if dst_wc:
+                            web_categ_ids.append(dst_wc[0])
+
+                    if web_categ_ids:
+                        vals['public_categ_ids'] = [(6, 0, web_categ_ids)]
+
+                # -------------------------
+                # Crear producto
+                # -------------------------
+                new_id = models_dst.execute_kw(
+                    db_dst, uid_dst, pwd_dst,
+                    'product.template', 'create',
+                    [vals]
+                )
+
+                print(f"➕ Creado {vals.get('default_code')} (ID {new_id})")
+
+                # -------------------------------------------------
+                # 5️⃣ Migrar atributos
+                # -------------------------------------------------
+                if con_atributos:
+                    attribute_lines = models_src.execute_kw(
+                        db_src, uid_src, pwd_src,
+                        'product.template.attribute.line', 'search_read',
+                        [[('product_tmpl_id', '=', product['id'])]],
+                        {'fields': ['attribute_id', 'value_ids']}
+                    )
+
+                    for line in attribute_lines:
+                        attribute_name = line['attribute_id'][1]
+
+                        attr_ids = models_dst.execute_kw(
+                            db_dst, uid_dst, pwd_dst,
+                            'product.attribute', 'search',
+                            [[('name', '=', attribute_name)]],
+                            {'limit': 1}
+                        )
+
+                        attr_id = attr_ids[0] if attr_ids else models_dst.execute_kw(
+                            db_dst, uid_dst, pwd_dst,
+                            'product.attribute', 'create',
+                            [{'name': attribute_name}]
+                        )
+
+                        value_ids_dst = []
+
+                        for value_id in line['value_ids']:
+                            value_name = models_src.execute_kw(
+                                db_src, uid_src, pwd_src,
+                                'product.attribute.value', 'read',
+                                [[value_id]],
+                                {'fields': ['name']}
+                            )[0]['name']
+
+                            val_ids = models_dst.execute_kw(
+                                db_dst, uid_dst, pwd_dst,
+                                'product.attribute.value', 'search',
+                                [[
+                                    ('name', '=', value_name),
+                                    ('attribute_id', '=', attr_id)
+                                ]],
+                                {'limit': 1}
+                            )
+                            val_id = val_ids[0] if val_ids else models_dst.execute_kw(
+                                db_dst, uid_dst, pwd_dst,
+                                'product.attribute.value', 'create',
+                                [{
+                                    'name': value_name,
+                                    'attribute_id': attr_id
+                                }]
+                            )
+
+                            value_ids_dst.append(val_id)
+
+                            models_dst.execute_kw(
+                                db_dst, uid_dst, pwd_dst,
+                                'product.template.attribute.line', 'create',
+                                [{
+                                    'product_tmpl_id': new_id,
+                                    'attribute_id': attr_id,
+                                    'value_ids': [(6, 0, value_ids_dst)]
+                                }]
+                            )
+
+                # -------------------------------------------------
+                # 6️⃣ Galería (ojo: sigue siendo pesada)
+                # -------------------------------------------------
+                images = models_src.execute_kw(
+                    db_src, uid_src, pwd_src,
+                    'product.image', 'search_read',
+                    [[('product_tmpl_id', '=', product['id'])]],
+                    {'fields': ['image_1920', 'name', 'video_url', 'sequence']}
+                )
+
+                for img in images:
+                    models_dst.execute_kw(
+                        db_dst, uid_dst, pwd_dst,
+                        'product.image', 'create',
+                        [{
+                            'product_tmpl_id': new_id,
+                            'image_1920': img.get('image_1920'),
+                            'name': img.get('name'),
+                            'video_url': img.get('video_url'),
+                            'sequence': img.get('sequence', 0)
+                        }]
+                    )
+
+                # -------------------------------------------------
+                # 7️⃣ Migrar proveedores (supplierinfo)
+                # -------------------------------------------------
+
+                supplierinfos = models_src.execute_kw(
+                    db_src, uid_src, pwd_src,
+                    'product.supplierinfo', 'search_read',
+                    [[('product_tmpl_id', '=', product['id'])]],
+                    {'fields': [
+                        'partner_id',
+                        'product_name',
+                        'product_code',
+                        'min_qty',
+                        'price'
+                    ]}
+                )
+
+                for supp in supplierinfos:
+                    try:
+                        partner_name = supp['partner_id'][1] if supp.get('partner_id') else None
+
+                        if not partner_name:
+                            continue
+
+                        # 🔎 Buscar partner en destino
+                        partner_ids = models_dst.execute_kw(
+                            db_dst, uid_dst, pwd_dst,
+                            'res.partner', 'search',
+                            [[('name', '=', partner_name)]],
+                            {'limit': 1}
+                        )
+
+                        if not partner_ids:
+                            print(f"⚠ Proveedor no encontrado en destino: {partner_name}")
+                            continue
+
+                        partner_id_dst = partner_ids[0]
+
+                        # 🚫 Evitar duplicados (MUY IMPORTANTE)
+                        existing_supplier = models_dst.execute_kw(
+                            db_dst, uid_dst, pwd_dst,
+                            'product.supplierinfo', 'search',
+                            [[
+                                ('product_tmpl_id', '=', new_id),
+                                ('partner_id', '=', partner_id_dst),
+                                ('min_qty', '=', supp.get('min_qty', 0)),
+                            ]],
+                            {'limit': 1}
+                        )
+
+                        if existing_supplier:
+                            print(f"⏭ Supplier ya existe: {partner_name}")
+                            continue
+
+                        # ➕ Crear supplierinfo
+                        models_dst.execute_kw(
+                            db_dst, uid_dst, pwd_dst,
+                            'product.supplierinfo', 'create',
+                            [{
+                                'product_tmpl_id': new_id,
+                                'partner_id': partner_id_dst,
+                                'product_name': supp.get('product_name'),
+                                'product_code': supp.get('product_code'),
+                                'min_qty': supp.get('min_qty', 0),
+                                'price': supp.get('price', 0.0),
+                            }]
+                        )
+
+                        print(f"📦 Supplier añadido: {partner_name}")
+
+                    except Exception as e:
+                        print(f"❌ Error supplierinfo ({product.get('default_code')}): {e}")
+
+            except Exception as e:
+                print(f"❌ Error en {product.get('default_code')}: {e}")
+
+            print("✅ Migración por SKU finalizada")
+
+    # -----------------------------------------
+    # 🔁 NUEVO PROCESO: transferencia automática
+    # -----------------------------------------
+
+    def ejecutar_transferencia_post_actualizacion():
+
+        origen = {
+            'url': "https://optimaluz.com/",
+            'db': "odoo1",
+            'user': "admin",
+            'password': "1324",
+        }
+
+        destinos = [
+            {
+                'url': "https://b2b.optimaluz.com/",
+                'db': "odoo0",
+                'user': "admin",
+                'password': "1324"
+            },
+            {
+                'url': "http://82.70.85.127:8069/",
+                'db': "odoo0",
+                'user': "admin",
+                'password': "1324"
+            }
+        ]
+
+        # 🔌 Conectar ORIGEN (UNA sola vez)
+        models_src, uid_src = conectar(origen)
+
+        # 🧠 Obtener SKUs dinámicos desde optimaluz.com
+        skus = obtener_skus_ultimo_mes(
+            models_src,
+            origen['db'],
+            uid_src,
+            origen['password'],
+            user_id=33
+        )
+
+        if not skus:
+            print("ℹ️ No hay SKUs para migrar")
+            return
+
+        # 🔁 Iterar destinos
+        for destino in destinos:
+            print(f"\n🚀 Ampliando destino: {destino['url']}")
+
+            # 🔌 Conectar DESTINO (en cada iteración)
+            models_dst, uid_dst = conectar(destino)
+
+            migrate_products_by_sku(
+                models_src=models_src,
+                db_src=origen['db'],
+                uid_src=uid_src,
+                pwd_src=origen['password'],
+
+                models_dst=models_dst,
+                db_dst=destino['db'],
+                uid_dst=uid_dst,
+                pwd_dst=destino['password'],
+
+                skus=skus  # 👈 ya no hay Excel
+            )
+
+    ejecutar_transferencia_post_actualizacion()
+
 
 #actualizar_odoos()
-
-

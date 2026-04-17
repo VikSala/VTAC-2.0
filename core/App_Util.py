@@ -935,9 +935,6 @@ def import_comercial_stock():
             'user': "jcoronado@optimaluz.com",
             'password': "AlAi4ever",
         }
-        models, uid = conectar(odoo16)
-        db = odoo16["db"]
-        password = odoo16["password"]
 
         # 1) Fuentes de ficheros
         madrid = parse_madrid_from_dir(excel_dir)
