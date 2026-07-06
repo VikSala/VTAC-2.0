@@ -6,6 +6,7 @@ import os
 """
 cd Scrap/Scrap/spiders
 scrapy crawl vtac -a region=vtac_es
+& "C:/Users/Quimi/AppData/Local/Python/bin/python.exe" -m scrapy crawl vtac -a region=vtac_es
 scrapy crawl vtac -a region=advance
 """
 

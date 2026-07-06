@@ -1,9 +1,149 @@
+from services.campos_odoo import ClavesExcel, excel_a_odoo, FISCAL_POSITION_MAP
+from App_Connection import models, db, uid, password
+from collections import defaultdict
 from services.utils import Utils
 import xmlrpc
 import os
 import math
 import pandas as pd
 import re
+
+url_src = 'https://odoo16.optimaluz.com/'#
+db_src = 'Real'
+username_src = 'jcoronado@optimaluz.com'
+password_src = 'AlAi4ever' #AlAi4ever@optimaluz.com
+uid_src = None
+models_src = None
+
+def migrar_adjuntos_modelo(modelo, usar_lotes=True, limitar_fecha=False):
+    """
+    Migra adjuntos (ir.attachment) desde cualquier modelo.
+
+    modelo: string del modelo (ej: 'project.task')
+    usar_lotes: bool → si True migra en lotes de x
+    """
+
+    import math
+
+    print(f"\n📎 Iniciando migración de adjuntos para modelo: {modelo}")
+
+    total_migrados = 0
+    total_existentes = 0
+    total_sin_destino = 0
+
+    domain = [("res_model", "=", modelo)] if not limitar_fecha \
+        else [("res_model", "=", modelo), ("create_date", ">=", "2026-01-01"), ("create_date", "<", "2027-01-01")]
+
+    # ---------------------------------------
+    # 🔹 1. Obtener IDs de adjuntos en origen
+    # ---------------------------------------
+    attach_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "ir.attachment", "search",
+        [domain]
+    )
+
+    total_adjuntos = len(attach_ids)
+    print(f"📤 Adjuntos encontrados en origen: {total_adjuntos}")
+
+    if total_adjuntos == 0:
+        return
+
+    # ---------------------------------------
+    # 🔹 2. Configuración de lotes
+    # ---------------------------------------
+    if usar_lotes:
+        lote = 30
+    else:
+        lote = total_adjuntos  # todo en uno
+
+    num_lotes = math.ceil(total_adjuntos / lote)
+
+    # ---------------------------------------
+    # 🔹 3. Migración
+    # ---------------------------------------
+    for i in range(num_lotes):
+
+        inicio = i * lote
+        fin = inicio + lote
+        lote_ids = attach_ids[inicio:fin]
+
+        # print(f"\n🔹 Procesando lote {i + 1}/{num_lotes} ({len(lote_ids)} adjuntos)")
+
+        # Leer SOLO el lote actual
+        adjuntos = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "ir.attachment", "read",
+            [lote_ids, ["name", "datas", "res_id", "mimetype"]]
+        )
+
+        for adj in adjuntos:
+
+            nombre = adj.get("name")
+            datos = adj.get("datas")
+            res_id_origen = adj.get("res_id")
+            mimetype = adj.get("mimetype")
+
+            if not datos:
+                continue
+
+            # Buscar registro equivalente en destino
+            registro_destino = models.execute_kw(
+                db, uid, password,
+                modelo, "search",
+                [[("x_id_interno", "=", res_id_origen)]],
+                {"limit": 1}
+            )
+
+            if not registro_destino:
+                total_sin_destino += 1
+                continue
+
+            res_id_destino = registro_destino[0]
+
+            # Verificar duplicado por nombre
+            existente = models.execute_kw(
+                db, uid, password,
+                "ir.attachment", "search",
+                [[
+                    ("res_model", "=", modelo),
+                    ("res_id", "=", res_id_destino),
+                    ("name", "=", nombre)
+                ]],
+                {"limit": 1}
+            )
+
+            if existente:
+                total_existentes += 1
+                continue
+
+            # Crear adjunto
+            vals = {
+                "name": nombre,
+                "datas": datos,
+                "res_model": modelo,
+                "res_id": res_id_destino,
+                "mimetype": mimetype,
+                "type": "binary",
+            }
+
+            try:
+                models.execute_kw(
+                    db, uid, password,
+                    "ir.attachment", "create",
+                    [vals]
+                )
+                total_migrados += 1
+            except Exception as e:
+                print(f"❌ Error creando adjunto {nombre}: {e}")
+
+    # ---------------------------------------
+    # 🔹 Resumen final
+    # ---------------------------------------
+    print("\n📊 MIGRACIÓN DE ADJUNTOS COMPLETADA")
+    print(f"   Migrados: {total_migrados}")
+    print(f"   Ya existentes: {total_existentes}")
+    print(f"   Sin registro destino: {total_sin_destino}")
 
 #region REGION INFORMACIÓN COMERCIAL
 '''
@@ -13,7 +153,7 @@ import_comercial_stock()
     │       ├── parse_madrid_from_dir()
     │       ├── parse_bulgaria_from_dir()
     │       ├── parse_vs_from_dir()
-    │       └── odoo_vtac()
+    │       └── actualizar_x_almacen_local_ose_desde_odoo16()
     ├── create_vs_vn()
     │       ├── vd_vn_spain()
     │       └── crear_hoja_resultado()
@@ -239,7 +379,7 @@ def update_names(excel_path):
         data = product_map[sku]
         old_name = data["name"]
 
-        if "**" in old_name or "VEE25" in old_name:
+        if "**" in old_name or "VQ226" in old_name:
             continue
 
         new_name = re.sub(r"^\[[A-Za-z]{2}([^\]]*)\]", rf"[{prefix}\1]", old_name)
@@ -700,24 +840,78 @@ def import_comercial_stock():
 
     # endregion
 
-    # 1) Madrid: ficheros que contienen "In Stock" ===============
+    def parse_medidas(res):
+        medidas = _list_excel_files(excel_dir, "ROLLOS")
+        if medidas:
+            file = medidas[0]  # IMPORTANTE: no files[0]
+
+            try:
+                df_medidas = pd.read_excel(file, dtype=str)
+
+                col_sku_medida = _find_col(df_medidas, "SKU")
+                col_medida = _find_col(df_medidas, "MEDIDA")
+
+                if not col_sku_medida or not col_medida:
+                    print(f"⚠ Saltando medidas (columnas SKU/MEDIDA no halladas): {file}")
+                else:
+                    df_medidas = pd.DataFrame({
+                        "SKU": df_medidas[col_sku_medida].astype(str).str.strip().str.removesuffix(".0"),
+                        "MEDIDA": df_medidas[col_medida].astype(str).str.strip(),
+                    })
+
+                    df_medidas = df_medidas[
+                        df_medidas["SKU"].astype(str).str.strip().ne("")
+                        & df_medidas["SKU"].notna()
+                    ]
+
+                    df_medidas = df_medidas.drop_duplicates(subset=["SKU"])
+
+                    res = res.merge(
+                        df_medidas,
+                        on="SKU",
+                        how="left"
+                    )
+
+                    res["STOCK"] = res.apply(
+                        lambda row: int(row["STOCK"] / 10)
+                        if row["MEDIDA"] == "(10 METER ROLL)"
+                        else int(row["STOCK"] / 5)
+                        if row["MEDIDA"] == "(5 METER ROLL)"
+                        else int(row["STOCK"] * 10)
+                        if row["MEDIDA"] == "10PCS/SET"
+                        else int(row["STOCK"] * 6)
+                        if row["MEDIDA"] == "6PCS/SET"
+                        else row["STOCK"],
+                        axis=1
+                    )
+
+                    res = res.drop(columns=["MEDIDA"])
+                    return res
+
+            except Exception as e:
+                print(f"❌ Error leyendo medidas ROLLOS '{file}': {e}")
+        else:
+            print("⚠ No se encontro archivo medidas")
+
+    # 1) Madrid: ficheros que contienen "ompleto" ===============
     def parse_madrid_from_dir(excel_dir: str) -> pd.DataFrame:
         """
-        Buscar ficheros cuyo nombre contenga 'In Stock'.
+        Buscar ficheros cuyo nombre contenga 'ompleto'.
         Tomar:
-          - 'Item No.' -> SKU
-          - 'In Stock' -> STOCK
+          - 'SKU' -> SKU
+          - 'Stock ES 🇪🇸' -> STOCK
         """
-        files = _list_excel_files(excel_dir, "In Stock")
-        out = []
-        for p in files:
+        files = _list_excel_files(excel_dir, "ompleto")
+        if files:
+            file = files[0]
+            out = []
             try:
-                df = pd.read_excel(p, dtype=str)  # primera hoja
-                col_sku = _find_col(df, "Item No.", "item no", "itemno", "sku")
-                col_stk = _find_col(df, "In Stock", "instock", "stock")
+                df = pd.read_excel(file, dtype=str, header=2)  # primera hoja
+                col_sku = _find_col(df, "SKU")
+                col_stk = _find_col(df, "Stock ES 🇪🇸")
                 if not col_sku or not col_stk:
-                    print(f"⚠ Saltando (columnas no halladas): {p}")
-                    continue
+                    print(f"⚠ Saltando (columnas no halladas): {file}")
+                    return
 
                 tmp = pd.DataFrame({
                     "SKU": df[col_sku].astype(str).str.strip().str.removesuffix(".0"),
@@ -726,11 +920,15 @@ def import_comercial_stock():
                 tmp = tmp[tmp["SKU"].astype(str).str.strip().ne("") & tmp["SKU"].notna()]
                 out.append(tmp)
             except Exception as e:
-                print(f"❌ Error leyendo Madrid '{p}': {e}")
+                print(f"❌ Error leyendo Madrid '{file}': {e}")
+        else:
+            print("⚠ No se encontro el stock de Madrid")
+            return
 
         res = _concat_clean(out, cols_keep=["SKU", "STOCK"])
         res = res.drop_duplicates(subset=["SKU"]).reset_index(drop=True)
-        return res
+
+        return parse_medidas(res)
 
     # 2) Bulgaria: ficheros que contienen "SPRAVKA" ===============
     def parse_bulgaria_from_dir(excel_dir: str) -> pd.DataFrame:
@@ -780,7 +978,9 @@ def import_comercial_stock():
         for c in ["STOCK", "UNDELIVERED ORDER"]:
             if c not in res.columns:
                 res[c] = 0
-        return res.drop_duplicates(subset=["SKU"]).reset_index(drop=True)
+        res = res.drop_duplicates(subset=["SKU"]).reset_index(drop=True)
+
+        return parse_medidas(res)
 
     # 3) VS: fichero que contiene "SKU_Page" ===============
     def parse_vs_from_dir(excel_dir: str) -> pd.DataFrame:
@@ -806,57 +1006,7 @@ def import_comercial_stock():
         res = _concat_clean(out, cols_keep=["SKU"]).drop_duplicates(subset=["SKU"]).reset_index(drop=True)
         return res
 
-    # 4) Odoo: productos V-Tac (SKU y STOCK) ===============
-    def odoo_vtac(models, uid, db, password) -> pd.DataFrame:
-        """
-        Extrae de Odoo todos los product.product cuya marca del template sea 'V-Tac',
-        devolviendo default_code -> SKU y qty_available -> STOCK.
-        """
-
-        ctx = {"active_test": False, "lang": "es_ES"}
-        # Variantes cuya plantilla tenga la marca V-Tac y que tengan código
-        v_ids = models.execute_kw(
-            db, uid, password, "product.product", "search",
-            [[
-                ["product_tmpl_id.product_brand_id.name", "=", "V-Tac"],
-                ["default_code", "!=", False],
-            ]],
-            {"context": ctx}
-        )
-        if not v_ids:
-            return pd.DataFrame(columns=["SKU", "STOCK"])
-
-        # leer por lotes para no saturar
-        def batched(lst, n=200):
-            for i in range(0, len(lst), n):
-                yield lst[i:i + n]
-
-        rows = []
-        for batch in batched(v_ids, 200):
-            recs = models.execute_kw(
-                db, uid, password, "product.product", "read",
-                [batch, ["default_code", "qty_available"]],
-                {"context": ctx}
-            )
-            for r in recs:
-                sku = str(r.get("default_code") or "").strip().removesuffix(".0")
-                if not sku:
-                    continue
-                qty = r.get("qty_available") or 0
-                try:
-                    qty = int(qty)
-                except Exception:
-                    qty = float(qty)
-                rows.append({"SKU": sku, "STOCK": qty})
-
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return pd.DataFrame(columns=["SKU", "STOCK"])
-        # combinar por SKU sumando stock si hay varias variantes con mismo código (raro, pero seguro)
-        df = df.groupby("SKU", as_index=False)["STOCK"].sum()
-        return df
-
-    # 5) VD / VN desde hoja "Products" externa ===============
+    # 4) VD / VN desde hoja "Products" externa ===============
     def vd_vn_spain(products_excel_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Lee hoja 'Products' del Excel pasado y separa:
@@ -880,7 +1030,7 @@ def import_comercial_stock():
 
         return vd.reset_index(drop=True), vn.reset_index(drop=True)
 
-    # 6) Constructor del Excel Base ===============
+    # 5) Constructor del Excel Base ===============
     def create_excel_base(excel_dir: str, output_path: str):
         """
         - Lee directorio 'excel_dir' para Madrid, Bulgaria, VS.
@@ -890,51 +1040,7 @@ def import_comercial_stock():
           Madrid, Bulgaria, VS, Odoo, VD, VN
         """
 
-        def odoo_vtac_multi(connections):
-            import pandas as pd
-
-            dfs = []
-
-            for models, uid, db, password in connections:
-                df = odoo_vtac(models, uid, db, password)
-                if not df.empty:
-                    dfs.append(df)
-
-            if not dfs:
-                return pd.DataFrame(columns=["SKU", "STOCK"])
-
-            # 🔥 CONCAT + SUMA POR SKU
-            df_total = pd.concat(dfs, ignore_index=True)
-            df_total = df_total.groupby("SKU", as_index=False)["STOCK"].sum()
-
-            return df_total
-
         print(">> Generando Excel Base...")
-
-        # =========================
-        # 🔌 Conexión
-        # =========================
-        def conectar(config):
-            common = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/common")
-            uid = common.authenticate(config['db'], config['user'], config['password'], {})
-
-            models = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/object")
-
-            return models, uid
-
-        odoo_ose = {
-            'url': "https://b2b.optimaluz.com/",
-            'db': "odoo0",
-            'user': "admin",
-            'password': "1324",
-        }
-
-        odoo16 = {
-            'url': "http://37.59.66.189:8069/",
-            'db': "Real",
-            'user': "jcoronado@optimaluz.com",
-            'password': "AlAi4ever",
-        }
 
         # 1) Fuentes de ficheros
         madrid = parse_madrid_from_dir(excel_dir)
@@ -947,13 +1053,218 @@ def import_comercial_stock():
         print(f"  VS: {len(vs)} filas")
 
         # 2) Odoo
-        models_16, uid_16 = conectar(odoo16)
-        models_ose, uid_ose = conectar(odoo_ose)
+        def actualizar_x_almacen_local_ose_desde_odoo16(batch_size=200):
+            """
+            Actualiza en OSE el campo custom x_almacen_local.
 
-        conn_16 = (models_16, uid_16, odoo16["db"], odoo16["password"])
-        conn_ose = (models_ose, uid_ose, odoo_ose["db"], odoo_ose["password"])
+            Lógica:
+                1. Busca todos los productos de OSE con default_code.
+                2. Pone x_almacen_local a 0.
+                3. Lee qty_available de OSE.
+                4. Busca el mismo default_code en Odoo16.
+                5. Lee qty_available de Odoo16 usando company_id = 2.
+                6. Escribe en OSE:
+                      x_almacen_local = qty_available_odoo16 + qty_available_ose
+                7. Devuelve un DataFrame con columnas:
+                      SKU, STOCK
+            """
 
-        odoo_df = odoo_vtac_multi([conn_16, conn_ose])
+            import xmlrpc.client
+            import pandas as pd
+
+            def conectar(config):
+                common = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/common")
+                uid = common.authenticate(config['db'], config['user'], config['password'], {})
+
+                if not uid:
+                    raise Exception(
+                        f"No se pudo autenticar en {config['url']} "
+                        f"con db={config['db']} user={config['user']}"
+                    )
+
+                models = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/object")
+                return models, uid
+
+            odoo_ose = {
+                "url": "https://b2b.optimaluz.com/",
+                "db": "odoo0",
+                "user": "admin",
+                "password": "1324",
+            }
+
+            odoo16 = {
+                "url": "https://odoo16.optimaluz.com/",
+                "db": "Real",
+                "user": "jcoronado@optimaluz.com",
+                "password": "AlAi4ever",
+            }
+
+            models_16, uid_16 = conectar(odoo16)
+            models_ose, uid_ose = conectar(odoo_ose)
+
+            conn_16 = (models_16, uid_16, odoo16["db"], odoo16["password"], 2)
+            conn_ose = (models_ose, uid_ose, odoo_ose["db"], odoo_ose["password"], None)
+
+            def chunks(lista, size):
+                for i in range(0, len(lista), size):
+                    yield lista[i:i + size]
+
+            def preparar_contexto(kwargs, company_id=None):
+                kwargs = kwargs or {}
+                context = kwargs.get("context", {}).copy()
+
+                context.setdefault("active_test", False)
+
+                if company_id is not None:
+                    context["allowed_company_ids"] = [company_id]
+                    context["force_company"] = company_id
+
+                kwargs["context"] = context
+                return kwargs
+
+            def execute(conn, model, method, args=None, kwargs=None):
+                models, uid, db, password, company_id = conn
+
+                args = args or []
+                kwargs = preparar_contexto(kwargs, company_id)
+
+                if method == "search" and company_id is not None:
+                    if args and isinstance(args[0], list):
+                        domain_original = args[0]
+
+                        domain_company = [
+                            "|",
+                            ("company_id", "=", False),
+                            ("company_id", "=", company_id),
+                        ]
+
+                        args[0] = ["&"] + domain_company + domain_original
+
+                return models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    model,
+                    method,
+                    args,
+                    kwargs
+                )
+
+            modelo = "product.product"
+            resultados_stock = []
+
+            ose_product_ids = execute(
+                conn_ose,
+                modelo,
+                "search",
+                [[("default_code", "!=", False)]],
+                {"context": {"active_test": False}}
+            )
+
+            if not ose_product_ids:
+                return pd.DataFrame(columns=["SKU", "STOCK"])
+
+            for lote_ids in chunks(ose_product_ids, batch_size):
+                execute(
+                    conn_ose,
+                    modelo,
+                    "write",
+                    [lote_ids, {"x_almacen_local": 0}],
+                    {"context": {"active_test": False}}
+                )
+
+            for lote_ids in chunks(ose_product_ids, batch_size):
+
+                productos_ose = execute(
+                    conn_ose,
+                    modelo,
+                    "read",
+                    [lote_ids, ["default_code", "qty_available"]],
+                    {"context": {"active_test": False}}
+                )
+
+                skus = [
+                    p["default_code"]
+                    for p in productos_ose
+                    if p.get("default_code")
+                ]
+
+                if not skus:
+                    continue
+
+                ids_16 = execute(
+                    conn_16,
+                    modelo,
+                    "search",
+                    [[("default_code", "in", skus)]],
+                    {
+                        "context": {
+                            "active_test": False,
+                            "allowed_company_ids": [2],
+                            "force_company": 2,
+                        }
+                    }
+                )
+
+                productos_16 = []
+
+                if ids_16:
+                    productos_16 = execute(
+                        conn_16,
+                        modelo,
+                        "read",
+                        [ids_16, ["default_code", "qty_available"]],
+                        {
+                            "context": {
+                                "active_test": False,
+                                "allowed_company_ids": [2],
+                                "force_company": 2,
+                            }
+                        }
+                    )
+
+                qty_16_por_sku = {}
+
+                for p16 in productos_16:
+                    sku = p16.get("default_code")
+                    if sku:
+                        qty_16_por_sku[sku] = p16.get("qty_available") or 0
+
+                valores_por_qty = {}
+
+                for p_ose in productos_ose:
+                    ose_id = p_ose["id"]
+                    sku = p_ose.get("default_code")
+
+                    if not sku:
+                        continue
+
+                    qty_ose = p_ose.get("qty_available") or 0
+                    qty_16 = qty_16_por_sku.get(sku, 0)
+
+                    nuevo_x_almacen_local = qty_16 + qty_ose
+
+                    valores_por_qty.setdefault(nuevo_x_almacen_local, []).append(ose_id)
+
+                    resultados_stock.append({
+                        "SKU": sku,
+                        "STOCK": nuevo_x_almacen_local,
+                    })
+
+                for valor, ids_a_actualizar in valores_por_qty.items():
+                    execute(
+                        conn_ose,
+                        modelo,
+                        "write",
+                        [ids_a_actualizar, {"x_almacen_local": valor}],
+                        {"context": {"active_test": False}}
+                    )
+
+            df_stock = pd.DataFrame(resultados_stock, columns=["SKU", "STOCK"])
+
+            return df_stock
+
+        odoo_df = actualizar_x_almacen_local_ose_desde_odoo16()
 
         print(f"  Odoo combinado: {len(odoo_df)} filas")
 
@@ -1116,8 +1427,63 @@ def import_comercial_stock():
             time.sleep(60)
             create_vs_vn()
 
+    def reset_custom_stock():
+        from App_Connection import db, uid, password, models
+
+        # 1. Buscar los IDs de los productos de la marca "V-Tac"
+        # Nota: Asumimos que product_brand_id es un Many2one y buscamos por el nombre de la marca.
+        # Si 'product_brand_id' fuera un campo de texto, cambia la condición a: [('product_brand_id', '=', 'V-Tac')]
+        domain = [('product_brand_id.name', '=', 'V-Tac')]
+
+        print("Buscando productos de la marca V-Tac...")
+        product_ids = models.execute_kw(
+            db, uid, password,
+            'product.template',  # Cambiar a 'product.product' si tus campos son a nivel de variante
+            'search',
+            [domain]
+        )
+
+        total_products = len(product_ids)
+        print(f"Se encontraron {total_products} productos para actualizar.")
+
+        if total_products == 0:
+            print("No se encontraron productos. Proceso finalizado.")
+            return
+
+        # 2. Definir los valores a resetear
+        values_to_update = {
+            'x_almacen_local': 0,
+            'x_transit_stock_custom': 0,
+            'x_almacen1_custom': 0
+        }
+
+        # 3. Procesar en lotes de 1000
+        batch_size = 1000
+        for i in range(0, total_products, batch_size):
+            # Cortamos la lista para obtener el lote actual
+            batch_ids = product_ids[i:i + batch_size]
+
+            print(
+                f"Actualizando lote {i // batch_size + 1} (Productos del {i + 1} al {min(i + batch_size, total_products)})...")
+
+            # Ejecutamos la actualización masiva para este lote de IDs
+            models.execute_kw(
+                db, uid, password,
+                'product.template',  # Debe coincidir con el modelo del 'search' de arriba
+                'write',
+                [batch_ids, values_to_update]
+            )
+
+        print("Stock V-Tac reseteado con éxito! 5%")
+
     # 7) Ejecucion:
-    abrir_vtac_gui()
+    try:
+        abrir_vtac_gui()
+    except:
+        print()
+
+    # Inicio
+    reset_custom_stock()
 
     # Directorio donde están los excels fuente (Madrid, SPRAVKA, SKU_Page)
     excel_dir = os.path.expanduser(r"~/Documents/SMI Files/Comercial")
@@ -1993,32 +2359,456 @@ def _none_to_false(vals):
 
 # endregion
 
-#region REGION VENTAS
+#region PICKINGS INVENTARIO
+def export_pickings_confirmed_assigned():
+    """
+    Exporta pickings en estado confirmed y assigned
+    junto con sus stock.moves.
+    """
 
-def export_sale_orders_by_state(state, company_name="ALMAITANA DE LUZ, S.L."):
+    print("📦 Exportando pickings (confirmed / assigned)")
+
+    # -------------------------------------------------
+    # 1️⃣ Buscar pickings válidos
+    # -------------------------------------------------
+    picking_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "stock.picking", "search",
+        [[("state", "in", ["confirmed", "assigned", "waiting"]), ('company_id', '=', 2)]]
+    )
+
+    if not picking_ids:
+        print("ℹ️ No hay pickings para exportar")
+        return []
+
+    pickings = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "stock.picking", "read",
+        [picking_ids],
+        {
+            "fields": [
+                "id",
+                "name",
+                "state",
+                "partner_id",
+                "scheduled_date",
+                "origin",
+                "company_id",
+                "picking_type_id",
+                "location_id",
+                "location_dest_id",
+            ]
+        }
+    )
+
+    print(f"📄 Pickings encontrados: {len(pickings)}")
+
+    resultado = []
+
+    # -------------------------------------------------
+    # 2️⃣ Para cada picking, obtener sus moves
+    # -------------------------------------------------
+    for p in pickings:
+        picking_id = p["id"]
+
+        move_ids = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "stock.move", "search",
+            [[("picking_id", "=", picking_id)]]
+        )
+
+        moves = []
+        if move_ids:
+            moves = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "stock.move", "read",
+                [move_ids],
+                {
+                    "fields": [
+                        "id",
+                        "product_id",
+                        "product_uom_qty",
+                        "quantity_done",
+                        "description_picking",
+                        "date",
+                        "date_deadline",
+                        "location_id",
+                        "location_dest_id",
+                    ]
+                }
+            )
+
+        resultado.append({
+            "picking": p,
+            "moves": moves,
+        })
+
+    print("✅ Exportación finalizada")
+    return resultado
+
+#pickings = export_pickings_confirmed_assigned()
+
+def import_pickings_confirmed_assigned(data):
+    def map_picking_type(picking_type_src):
+        # -------------------------------------------------
+        # 🧠 Obtener CODE desde ORIGEN
+        # -------------------------------------------------
+        picking_type_id_src = picking_type_src[0]
+
+        picking_type = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "stock.picking.type", "read",
+            [[picking_type_id_src]],
+            {"fields": ["code"]}
+        )[0]
+
+        code = picking_type["code"]
+
+        # -------------------------------------------------
+        # 🔗 Mapear por CODE en DESTINO
+        # -------------------------------------------------
+        ids = models.execute_kw(
+            db, uid, password,
+            "stock.picking.type", "search",
+            [[("code", "=", code)]],
+            {"limit": 1}
+        )
+
+        if not ids:
+            raise Exception(f"❌ No se encontró stock.picking.type en destino con code='{code}'")
+
+        return ids[0]
+
+    def map_product(product_src):
+        product_id_src = product_src[0]
+
+        prod = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "product.product", "read",
+            [[product_id_src]],
+            {"fields": ["default_code"]}
+        )[0]
+
+        default_code = prod["default_code"]
+
+        ids = models.execute_kw(
+            db, uid, password,
+            "product.product", "search",
+            [[("default_code", "=", default_code)]],
+            {"limit": 1}
+        )
+
+        if not ids:
+            raise Exception(f"Producto no encontrado en destino: {default_code}")
+
+        return ids[0]
+
+    def map_location(location_src):
+        loc_id_src = location_src[0]
+
+        loc = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "stock.location", "read",
+            [[loc_id_src]],
+            {"fields": ["complete_name"]}
+        )[0]
+
+        name = loc["complete_name"]
+
+        ids = models.execute_kw(
+            db, uid, password,
+            "stock.location", "search",
+            [[("complete_name", "=", name)]],
+            {"limit": 1}
+        )
+
+        if not ids:
+            raise Exception(f"Ubicación no encontrada: {name}")
+
+        return ids[0]
+
+    print("📥 Importando pickings (mapping mínimo)")
+
+    for item in data:
+        p = item["picking"]
+        moves = item["moves"]
+
+        print(f"\n🚚 {p['name']}")
+
+        existing = models.execute_kw(
+            db, uid, password,
+            "stock.picking", "search",
+            [[("name", "=", p["name"])]],
+            {"limit": 1}
+        )
+
+        if existing:
+            print(f"⚠️ Picking ya existe: {p['name']}")
+            continue
+
+        partner_id = Utils.get_by_x_id_interno("res.partner", p['partner_id'][0], db, uid, password, models)
+        company_id = 1  # o la que uses en destino
+        picking_type_id = map_picking_type(p["picking_type_id"])
+        location_id = map_location(p["location_id"])
+        location_dest_id = map_location(p["location_dest_id"])
+
+        picking_dest_id = models.execute_kw(
+            db, uid, password,
+            "stock.picking", "create",
+            [{
+                "name": p['name'],
+                "partner_id": partner_id,
+                "scheduled_date": p["scheduled_date"],
+                "origin": p["origin"],
+                "company_id": company_id,
+                "picking_type_id": picking_type_id,
+                "location_id": location_id,
+                "location_dest_id": location_dest_id,
+            }]
+        )
+
+        for m in moves:
+            product_id = map_product(m["product_id"])
+            loc_id = map_location(m["location_id"])
+            loc_dest_id = map_location(m["location_dest_id"])
+            move_name = (
+                    m.get("description_picking")
+                    or f"Movimiento de {m['product_id'][1]}"
+            )
+
+            move_id = models.execute_kw(
+                db, uid, password,
+                "stock.move", "create",
+                [{
+                    "name": move_name,
+                    "picking_id": picking_dest_id,
+                    "product_id": product_id,
+                    "product_uom_qty": m["product_uom_qty"],
+                    "description_picking": move_name,
+                    "date": m["date"],
+                    "date_deadline": m["date_deadline"],
+                    "location_id": loc_id,
+                    "location_dest_id": loc_dest_id,
+                }]
+            )
+
+        models.execute_kw(
+            db, uid, password,
+            "stock.picking", "action_confirm",
+            [[picking_dest_id]]
+        )
+
+        if p["state"] == "assigned":
+            models.execute_kw(
+                db, uid, password,
+                "stock.picking", "action_assign",
+                [[picking_dest_id]]
+            )
+
+        print("✅ Importado")
+
+    print("\n🎉 Importación finalizada")
+
+#import_pickings_confirmed_assigned(pickings)
+
+# STOCK FLOW
+def existe_picking_destino(name):
+    ids = models.execute_kw(
+        db, uid, password,
+        "stock.picking", "search",
+        [[("name", "=", name)]],
+        {"limit": 1}
+    )
+    return ids[0] if ids else None
+
+
+def mapear_picking_type(code):
+    ids = models.execute_kw(
+        db, uid, password,
+        "stock.picking.type", "search",
+        [[("code", "=", code)]],
+        {"limit": 1}
+    )
+    if not ids:
+        raise Exception(f"❌ No se encontró picking_type {code} en destino")
+    return ids[0]
+
+
+def mapear_location(origen_location_id):
+    loc = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "stock.location", "read",
+        [[origen_location_id]],
+        {"fields": ["complete_name", "usage"]}
+    )[0]
+
+    ids = models.execute_kw(
+        db, uid, password,
+        "stock.location", "search",
+        [[("complete_name", "=", loc["complete_name"])]],
+        {"limit": 1}
+    )
+
+    if not ids:
+        raise Exception(f"❌ Ubicación no encontrada: {loc['complete_name']}")
+
+    return ids[0]
+
+
+def migrar_picking(origen_id):
+    picking = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "stock.picking", "read",
+        [[origen_id]],
+        {
+            "fields": [
+                "name",
+                "origin",
+                "state",
+                "picking_type_id",
+                "location_id",
+                "location_dest_id",
+                "move_ids_without_package",
+            ]
+        }
+    )[0]
+
+    # 🔒 Evitar duplicados
+    if existe_picking_destino(picking["name"]):
+        print(f"⏭️ Picking ya existe: {picking['name']}")
+        return
+
+    # 🔎 Tipo
+    picking_type = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "stock.picking.type", "read",
+        [[picking["picking_type_id"][0]]],
+        {"fields": ["code"]}
+    )[0]
+
+    picking_type_dest = mapear_picking_type(picking_type["code"])
+
+    # 📍 Ubicaciones
+    loc_src = mapear_location(picking["location_id"][0])
+    loc_dest = mapear_location(picking["location_dest_id"][0])
+
+    # 🧱 Crear picking
+    picking_dest_id = models.execute_kw(
+        db, uid, password,
+        "stock.picking", "create",
+        [{
+            "name": picking["name"],
+            "origin": picking["origin"],
+            "picking_type_id": picking_type_dest,
+            "location_id": loc_src,
+            "location_dest_id": loc_dest,
+            "state": "draft",
+        }]
+    )
+
+    # 📦 Movimientos
+    moves = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "stock.move", "read",
+        [picking["move_ids_without_package"]],
+        {
+            "fields": [
+                "product_id",
+                "product_uom_qty",
+                "product_uom",
+                "location_id",
+                "location_dest_id",
+            ]
+        }
+    )
+
+    for m in moves:
+        product_dest = Utils.get_by_x_id_interno(
+            "product.product",
+            m["product_id"][0],
+            db, uid, password, models
+        )
+
+        models.execute_kw(
+            db, uid, password,
+            "stock.move", "create",
+            [{
+                "name": picking["name"],
+                "product_id": product_dest,
+                "product_uom_qty": m["product_uom_qty"],
+                "product_uom": m["product_uom"][0],
+                "location_id": loc_src,
+                "location_dest_id": loc_dest,
+                "picking_id": picking_dest_id,
+                "state": "confirmed",
+                "procure_method": "make_to_stock",
+            }]
+        )
+
+    # 🔐 Forzar estado seguro
+    models.execute_kw(
+        db, uid, password,
+        "stock.picking", "write",
+        [[picking_dest_id], {"state": "confirmed"}]
+    )
+
+    print(f"✅ Picking migrado: {picking['name']}")
+
+
+def migrar_pickings_abiertos():
+    print("🚀 Migrando stock.picking abiertos...")
+
+    picking_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "stock.picking", "search",
+        [[("state", "not in", ("done", "cancel"))]]
+    )
+
+    print(f"📦 Pickings a migrar: {len(picking_ids)}")
+
+    for pid in picking_ids:
+        try:
+            migrar_picking(pid)
+        except Exception as e:
+            print(f"❌ Error migrando picking {pid}: {e}")
+
+    print("✅ Migración finalizada")
+
+
+# migrar_pickings_abiertos()
+
+# END STOCK FLOW
+
+#endregion
+
+#region REGION VENTAS
+def export_sale_orders_by_state(state):
     """
     Exporta los pedidos de venta de Odoo 16 filtrados por estado.
     Optimizado para rendimiento: lee todas las líneas en bloque.
     """
-    import xmlrpc.client
-    from collections import defaultdict
+    company_id_src = 3  # OSE: 1 / ALM: 2 / PRUEBAS: 3
+    # ------------------------------------------------
+    # 1️⃣ Buscar pedidos de venta
+    # ------------------------------------------------
+    so_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "sale.order", "search",
+        [[
+            ('company_id', '=', company_id_src),
+            ('state', '=', state),
+            # ('date_order', '>=', '2026-03-30 00:00:00'),
+            # ('date_order', '<=', '2026-03-31 23:59:59')
+        ]],
+        {"order": "date_order asc"}
+    )
 
-    url = 'https://optimaluz.soluntec.net'  # 'http://79.72.55.217:8069'
-    db_old = 'Real'
-    username = 'jcoronado@optimaluz.com'
-    password_old = 'AlAi4ever'
-
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid_old = common.authenticate(db_old, username, password_old, {})
-
-    if not uid_old:
-        print("❌ No se pudo autenticar.")
-        return
-
-    print(f'🔌 Conectado como {username} (uid: {uid_old})')
-    models_old = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
+    if not so_ids:
+        print("ℹ️ No se encontraron pedidos de compra")
+        return []
 
     FIELDS = [
+        "id",
         "name",
         "partner_id",
         "date_order",
@@ -2033,26 +2823,28 @@ def export_sale_orders_by_state(state, company_name="ALMAITANA DE LUZ, S.L."):
         "origin",
         "company_id",
         "x_comentarios",
-        "client_order_ref"
+        "client_order_ref",
+        "fiscal_position_id",
+        "user_id",
+        "create_date"
     ]
 
     print(f"📤 Exportando pedidos de venta en estado '{state}'...")
 
-    company_id_src = models_old.execute_kw(
-        db_old, uid_old, password_old,
-        'res.company', 'search',
-        [[('name', '=', company_name)]],
-        {'limit': 1}
+    sale_orders = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "sale.order", "read",
+        [so_ids],
+        {"fields": FIELDS}
     )
-    company_id_src = company_id_src[0] if company_id_src else False
 
-    # 1️⃣ Exportar pedidos
-    sale_orders = models_old.execute_kw(
-        db_old, uid_old, password_old,
+    '''# 1️⃣ Exportar pedidos
+    sale_orders = models_src.execute_kw(
+        db_src, uid_src, password_src,
         "sale.order", "search_read",
         [[("state", "=", state), ('company_id', '=', company_id_src)]],
         {"fields": FIELDS}
-    )
+    )'''
 
     print(f"   → {len(sale_orders)} pedidos encontrados.")
 
@@ -2068,8 +2860,8 @@ def export_sale_orders_by_state(state, company_name="ALMAITANA DE LUZ, S.L."):
     print(f"   → {len(all_line_ids)} líneas totales detectadas. Leyendo en bloque...")
 
     # 3️⃣ Leer todas las líneas en bloque
-    lines = models_old.execute_kw(
-        db_old, uid_old, password_old,
+    lines = models_src.execute_kw(
+        db_src, uid_src, password_src,
         "sale.order.line", "read",
         [all_line_ids],
         {"fields": [
@@ -2081,14 +2873,16 @@ def export_sale_orders_by_state(state, company_name="ALMAITANA DE LUZ, S.L."):
             "price_subtotal",
             "price_total",
             "tax_id",
-            "discount"
+            "discount",
+            "x_nota_interna",
+            "display_type"
         ]}
     )
 
     # Leer SKUs de productos
     product_ids = {l["product_id"][0] for l in lines if l.get("product_id")}
-    products = models_old.execute_kw(
-        db_old, uid_old, password_old,
+    products = models_src.execute_kw(
+        db_src, uid_src, password_src,
         "product.product", "read",
         [list(product_ids)],
         {"fields": ["id", "default_code"]}
@@ -2099,28 +2893,6 @@ def export_sale_orders_by_state(state, company_name="ALMAITANA DE LUZ, S.L."):
     for line in lines:
         pid = line.get("product_id")
         line["default_code"] = sku_map.get(pid[0]) if pid else None
-
-    # 4️⃣ Reunir todos los IDs de impuestos de las líneas
-    all_tax_ids = set()
-    for line in lines:
-        for tax_id in line.get("tax_id", []):
-            all_tax_ids.add(tax_id)
-
-    tax_name_map = {}
-    if all_tax_ids:
-        print(f"   → Leyendo {len(all_tax_ids)} impuestos únicos en bloque...")
-        taxes = models_old.execute_kw(
-            db_old, uid_old, password_old,
-            "account.tax", "read",
-            [list(all_tax_ids)],
-            {"fields": ["id", "name"]}
-        )
-        for t in taxes:
-            tax_name_map[t["id"]] = t["name"]
-
-    # 5️⃣ Añadir nombres de impuestos a cada línea
-    for line in lines:
-        line["taxes_names"] = [tax_name_map[t] for t in line.get("tax_id", []) if t in tax_name_map]
 
     # 6️⃣ Agrupar las líneas por pedido
     grouped_lines = defaultdict(list)
@@ -2135,8 +2907,24 @@ def export_sale_orders_by_state(state, company_name="ALMAITANA DE LUZ, S.L."):
         so["lineas_detalle"] = grouped_lines.get(so_id, [])
 
     print("✅ Líneas asignadas correctamente a cada pedido.")
-    return sale_orders
+    '''# 8️⃣ Filtrar pedidos por name
+    names_filtrar = {
+        "PV-OPT/23/1950",#Draft
+        "PV-OPT/23/2145",
+        "PV-OPT/23/2148",
+        "PV-OPT/23/2249",
+        "PV-OPT/22/2407",#PV
+        "OPT/25/2007",#Cancel
+    }
 
+    sale_orders_filtrados = [
+        so for so in sale_orders
+        if so.get("name") in names_filtrar
+    ]
+
+    print(f"🎯 Pedidos filtrados por name: {len(sale_orders_filtrados)}")'''
+
+    return sale_orders
 
 def import_sale_orders_with_lines(sale_orders, state):
     """
@@ -2146,55 +2934,41 @@ def import_sale_orders_with_lines(sale_orders, state):
     import xmlrpc.client
     from App_Connection import db, uid, password, models
 
+    context = {
+        'mail_create_nosummary': True,
+        'mail_create_nolog': True,
+        'tracking_disable': True,
+        'no_reset_password': True
+    }
+
     total_creados = 0
     total_existentes = 0
 
+    is_from_16 = True
+
     for so in sale_orders:
         name = so["name"]
-        print(f"\n🧾 Procesando pedido: {name}")
 
         # Comprobar si ya existe
         existing = models.execute_kw(
             db, uid, password,
             "sale.order", "search",
-            [[("name", "=", name)]]
+            [[("x_id_interno", "=", so["id"])]]
         )
         if existing:
-            print(f"⚠️  Pedido ya existente: {name}")
             total_existentes += 1
             continue
 
-        # -------------------------------
-        # Buscar cliente
-        # -------------------------------
+        print(f"\n🧾 Procesando pedido: {name}")
+
         partner_id = None
-        if so["partner_id"]:
-            partner_name = so["partner_id"][1]
-            partners = models.execute_kw(
-                db, uid, password,
-                "res.partner", "search_read",
-                [[("name", "=", partner_name)]],
-                {"fields": ["id"], "limit": 1}
-            )
-            if partners:
-                partner_id = partners[0]["id"]
-            elif partner_name.startswith("(") and ")" in partner_name:
-                partner_name = partner_name.split(")", 1)[1].strip()
-                partners = models.execute_kw(
-                    db, uid, password,
-                    "res.partner", "search_read",
-                    [[("name", "=", partner_name)]],
-                    {"fields": ["id"], "limit": 1}
-                )
-                if partners:
-                    partner_id = partners[0]["id"]
-                else:
-                    print(f"⚠️  Partner no encontrado: {partner_name}")
+        currency_id = None
+        fiscal_position_id = None
+        user_id = None
 
         # -------------------------------
         # Buscar moneda
         # -------------------------------
-        currency_id = None
         if so["currency_id"]:
             currency_name = so["currency_id"][1]
             currencies = models.execute_kw(
@@ -2206,10 +2980,75 @@ def import_sale_orders_with_lines(sale_orders, state):
             if currencies:
                 currency_id = currencies[0]["id"]
 
+        if is_from_16:
+            # -------------------------------
+            # Buscar cliente
+            # -------------------------------
+            if so.get('partner_id'):
+                partner_id_origen = so['partner_id'][0]
+                partner_id = Utils.get_by_x_id_interno("res.partner", partner_id_origen, db, uid, password, models)
+                if not partner_id:
+                    print("Debug")
+
+            # -------------------------------
+            # Buscar posición fiscal (con mapa ES → EN)
+            # -------------------------------
+            if so.get("fiscal_position_id"):
+                try:
+                    fiscal_position_id_origen = so['fiscal_position_id'][0] if so['fiscal_position_id'][
+                                                                                   0] != 27 else 26
+                    fiscal_position_id = Utils.get_by_x_id_interno("account.fiscal.position",
+                                                                   fiscal_position_id_origen, db, uid, password,
+                                                                   models)
+                except Exception as e:
+                    fp_es = so["fiscal_position_id"][1]
+                    fp_en = FISCAL_POSITION_MAP.get(fp_es)
+
+                    if not fp_en:
+                        print(f"⚠️ Posición fiscal sin mapear: '{fp_es}'")
+                    else:
+                        fps = models.execute_kw(
+                            db, uid, password,
+                            "account.fiscal.position", "search_read",
+                            [[("name", "=", fp_en)]],
+                            {"fields": ["id"], "limit": 1}
+                        )
+                        if fps:
+                            fiscal_position_id = fps[0]["id"]
+                        else:
+                            print(f"⚠️ Posición fiscal destino no encontrada: '{fp_en}'")
+
+            # -------------------------------
+            # Buscar comercial (user_id)
+            # -------------------------------
+            if so.get("user_id"):
+                user_id_origen = so.get("user_id")[0]
+                # user_id = Utils.get_by_x_id_interno("res.users", user_id_origen, db, uid, password, models)
+                user_name = models_src.execute_kw(
+                    db_src, uid_src, password_src,
+                    "res.users", "read",
+                    [[user_id_origen]],
+                    {"fields": ["name"]}
+                )[0]["name"]
+                try:
+                    user_id = models.execute_kw(
+                        db, uid, password,
+                        "res.users", "search",
+                        [[("name", "=", user_name)]],
+                        {"limit": 1}
+                    )[0]
+                except:
+                    user_id = 43
+        else:
+            partner_id = so.get("partner_id")[0]
+            fiscal_position_id = so.get("fiscal_position_id")[0]
+            user_id = so.get("user_id")[0]
+
         # -------------------------------
         # Crear pedido base
         # -------------------------------
         vals_so = {
+            "x_id_interno": so.get("id"),
             "name": name,
             "partner_id": partner_id,
             "date_order": so.get("date_order"),
@@ -2219,12 +3058,17 @@ def import_sale_orders_with_lines(sale_orders, state):
             "x_comentarios": so.get("x_comentarios"),
             "client_order_ref": so.get("client_order_ref"),
             "state": state,
+            # "fiscal_position_id": fiscal_position_id,
+            "user_id": 43,  # user_id,
+            "create_date": so.get("create_date"),
         }
 
         try:
             new_so_id = models.execute_kw(
                 db, uid, password,
-                "sale.order", "create", [vals_so]
+                "sale.order", "create",
+                [vals_so],
+                {'context': context}
             )
             print(f"✅ Pedido creado: {name} (ID {new_so_id})")
             total_creados += 1
@@ -2236,8 +3080,31 @@ def import_sale_orders_with_lines(sale_orders, state):
         # Crear líneas
         # -------------------------------
         for linea in so.get("lineas_detalle", []):
+            display_type = linea.get("display_type")
+
             # -------------------------------
-            # Producto (por SKU)
+            # 📝 NOTA o SECCIÓN
+            # -------------------------------
+            if display_type in ("line_note", "line_section"):
+                vals_line = {
+                    "order_id": new_so_id,
+                    "name": linea.get("name"),
+                    "display_type": display_type,
+                    "x_nota_interna": linea.get("x_nota_interna"),
+                }
+
+                try:
+                    models.execute_kw(
+                        db, uid, password,
+                        "sale.order.line", "create", [vals_line], {'context': context}
+                    )
+                    print(f"   📝 {display_type} creada: {linea.get('name')}")
+                except Exception as e:
+                    print(f"   ⚠️ Error creando nota/sección: {e}")
+
+                continue
+            # -------------------------------
+            # 📦 Producto (por SKU)
             # -------------------------------
             product_id = None
             sku = linea.get("default_code")
@@ -2251,125 +3118,97 @@ def import_sale_orders_with_lines(sale_orders, state):
                 )
                 product_id = productos[0] if productos else None
 
-            # Buscar impuestos por nombre
-            impuestos_ids = []
-            for tax_name in linea.get("taxes_names", []):
-                try:
-                    # Extraer número antes del símbolo %
-                    match = re.search(r"(\d+(?:\.\d+)?)\s*%", tax_name)
-                    porcentaje = match.group(1) if match else None
-
-                    if porcentaje:
-                        print(f"🔍 Buscando impuesto con porcentaje exacto: {porcentaje}%")
-
-                        # Obtener todos los impuestos (solo una vez podrías cachearlo fuera del bucle)
-                        all_taxes = models.execute_kw(
-                            db, uid, password,
-                            "account.tax", "search_read",
-                            [[], ["id", "name", "description"]],
-                            {"limit": 200}  # puedes quitar el limit si tienes pocos
-                        )
-
-                        # Buscar coincidencia exacta del número antes del %
-                        pattern = rf"(?<!\d){porcentaje}\s*%(\D|$)"  # evita 10 dentro de 210 o 100
-
-                        coincidencias = [
-                            t for t in all_taxes
-                            if
-                            (re.search(pattern, t["name"] or "") or re.search(pattern, t["description"] or ""))
-                        ]
-
-                        if coincidencias:
-                            impuestos_ids.append(coincidencias[0]["id"])
-                            print(f"✅ Impuesto asignado ({porcentaje}%): {coincidencias[0]['name']}")
-                        else:
-                            print(f"⚠️ No se encontró impuesto exacto con {porcentaje}%")
-
-                    else:
-                        print(f"⚠️ No se detectó porcentaje en '{tax_name}'")
-
-                except Exception as e:
-                    print(f"❌ Error procesando '{tax_name}': {e}")
+            tax_ids = []
+            if linea.get("tax_id"):
+                tax_origen = linea.get("tax_id")[0]
+                tax_id = Utils.get_by_x_id_interno("account.tax", tax_origen, db, uid, password,
+                                                   models) if is_from_16 else tax_origen
+                tax_ids = [tax_id] if tax_id else []
 
             vals_line = {
                 "order_id": new_so_id,
                 "name": linea.get("name"),
                 "product_id": product_id,
-                "product_uom_qty": linea.get("product_uom_qty") or 1.0,
+                "product_uom_qty": linea.get("product_uom_qty") or 0.0,
                 "price_unit": linea.get("price_unit") or 0.0,
                 "discount": linea.get("discount", 0.0),
-                "tax_id": [(6, 0, impuestos_ids)],
+                "tax_id": [(6, 0, [])],  # [(6, 0, [tax_ids])],#
+                "x_nota_interna": linea.get("x_nota_interna"),
             }
 
             try:
                 models.execute_kw(
                     db, uid, password,
-                    "sale.order.line", "create", [vals_line]
+                    "sale.order.line", "create",
+                    [vals_line],
+                    {'context': context}
                 )
                 print(f"   ➕ Línea creada: {linea.get('name')}")
             except Exception as e:
                 print(f"   ⚠️ Error creando línea: {e}")
 
+    # migrar_adjuntos_modelo("sale.order")
+
     print("\n📊 MIGRACIÓN COMPLETADA")
     print(f"   Total creados: {total_creados}")
     print(f"   Ya existentes: {total_existentes}")
-
-
-# ----------------------------------------------------------------------
-# Funciones por estado
-# ----------------------------------------------------------------------
 
 def migrar_pedidos_venta_draft():
     orders = export_sale_orders_by_state("draft")
     import_sale_orders_with_lines(orders, "draft")
 
-
 def migrar_pedidos_venta_sale():
     orders = export_sale_orders_by_state("sale")
     import_sale_orders_with_lines(orders, "sale")
 
-
 def migrar_pedidos_venta_cancel():
     orders = export_sale_orders_by_state("cancel")
     import_sale_orders_with_lines(orders, "cancel")
-
 
 # ----------------------------------------------------------------------
 # Función principal opcional
 # ----------------------------------------------------------------------
 
 def migrar_pedidos_venta():
-    migrar_pedidos_venta_draft()
     migrar_pedidos_venta_sale()
+    migrar_pedidos_venta_draft()
     migrar_pedidos_venta_cancel()
 
+# migrar_pedidos_venta()#ARCHIVAR: 1, dede, Desconocido, "Invergestión Levante, SL"
 #endregion
 
 #region REGION COMPRAS
-def export_purchase_orders_by_state(state, company_name="ALMAITANA DE LUZ, S.L."):
+def export_purchase_orders_by_state(state):
     """
-    Exporta los pedidos de compra de Odoo 16 filtrados por estado.
-    Optimizado para rendimiento: lee las líneas y los impuestos en bloque.
+    Exporta pedidos de compra por estado, incluyendo:
+    - fiscal_position_id
+    - payment_term_id
+    - líneas de producto / nota / sección
+    - SKU (default_code) de productos
     """
-    import xmlrpc.client
-    from collections import defaultdict
+    company_id_src = 2  # OSE: 1 / ALM: 2
 
-    url = 'https://optimaluz.soluntec.net'
-    db_old = 'Real'
-    username = 'jcoronado@optimaluz.com'
-    password_old = 'AlAi4ever'
+    print(f"📤 Exportando pedidos de compra con estado: {state}")
 
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid_old = common.authenticate(db_old, username, password_old, {})
+    # ------------------------------------------------
+    # 1️⃣ Buscar pedidos de compra
+    # ------------------------------------------------
+    po_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "purchase.order", "search",
+        [[("state", "=", state), ('company_id', '=', company_id_src), ]],
+        {"order": "create_date asc"}
+    )
 
-    if not uid_old:
-        print("❌ No se pudo autenticar.")
-        return
+    if not po_ids:
+        print("ℹ️ No se encontraron pedidos de compra")
+        return []
 
-    print(f'🔌 Conectado como {username} (uid: {uid_old})')
-    models_old = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-
-    FIELDS = [
+    # ------------------------------------------------
+    # 2️⃣ Leer pedidos
+    # ------------------------------------------------
+    po_fields = [
+        "id",
         "name",
         "partner_id",
         "partner_ref",
@@ -2384,270 +3223,463 @@ def export_purchase_orders_by_state(state, company_name="ALMAITANA DE LUZ, S.L."
         "notes",
         "origin",
         "company_id",
-        "x_comentarios"
+        "x_comentarios",
+        "fiscal_position_id",
+        "payment_term_id",
+        "priority",
+        "create_date",
     ]
 
-    print(f"📤 Exportando pedidos de compra en estado '{state}'...")
-
-    company_id_src = models_old.execute_kw(
-        db_old, uid_old, password_old,
-        'res.company', 'search',
-        [[('name', '=', company_name)]],
-        {'limit': 1}
-    )
-    company_id_src = company_id_src[0] if company_id_src else False
-
-    # 1️⃣ Exportar pedidos
-    purchase_orders = models_old.execute_kw(
-        db_old, uid_old, password_old,
-        "purchase.order", "search_read",
-        [[("state", "=", state), ('company_id', '=', company_id_src)]],
-        {"fields": FIELDS}
+    purchase_orders = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "purchase.order", "read",
+        [po_ids],
+        {"fields": po_fields}
     )
 
-    print(f"   → {len(purchase_orders)} pedidos encontrados.")
-
-    # 2️⃣ Reunir todos los IDs de líneas
-    all_line_ids = []
+    # ------------------------------------------------
+    # 3️⃣ Leer todas las líneas de compra
+    # ------------------------------------------------
+    line_ids = []
     for po in purchase_orders:
-        all_line_ids.extend(po.get("order_line", []))
+        line_ids.extend(po.get("order_line", []))
 
-    if not all_line_ids:
-        print("⚠️  No se encontraron líneas de pedido.")
-        return purchase_orders
+    line_fields = [
+        "order_id",
+        "name",
+        "display_type",
+        "product_id",
+        "product_qty",
+        "price_unit",
+        "price_subtotal",
+        "price_total",
+        "taxes_id",
+        "date_planned",
+        "sequence",
+        "x_nota_interna",
+        "analytic_distribution"
+    ]
 
-    print(f"   → {len(all_line_ids)} líneas totales detectadas. Leyendo en bloque...")
-
-    # 3️⃣ Leer todas las líneas en bloque
-    lines = models_old.execute_kw(
-        db_old, uid_old, password_old,
+    lines = models_src.execute_kw(
+        db_src, uid_src, password_src,
         "purchase.order.line", "read",
-        [all_line_ids],
-        {"fields": [
-            "order_id",
-            "name",
-            "product_id",
-            "product_qty",
-            "price_unit",
-            "price_subtotal",
-            "price_total",
-            "taxes_id",
-            "date_planned"
-        ]}
+        [line_ids],
+        {"fields": line_fields}
     )
 
-    # 4️⃣ Reunir todos los IDs de impuestos únicos
-    all_tax_ids = set()
-    for line in lines:
-        for tax_id in line.get("taxes_id", []):
-            all_tax_ids.add(tax_id)
+    # ------------------------------------------------
+    # 4️⃣ Resolver SKUs de productos
+    # ------------------------------------------------
+    product_ids = {
+        l["product_id"][0]
+        for l in lines
+        if l.get("product_id")
+    }
 
-    tax_name_map = {}
-    if all_tax_ids:
-        print(f"   → Leyendo {len(all_tax_ids)} impuestos únicos en bloque...")
-        taxes = models_old.execute_kw(
-            db_old, uid_old, password_old,
-            "account.tax", "read",
-            [list(all_tax_ids)],
-            {"fields": ["id", "name"]}
+    sku_map = {}
+    if product_ids:
+        products = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "product.product", "read",
+            [list(product_ids)],
+            {"fields": ["id", "default_code"]}
         )
-        for t in taxes:
-            tax_name_map[t["id"]] = t["name"]
+        sku_map = {p["id"]: p["default_code"] for p in products}
 
-    # 5️⃣ Añadir nombres de impuestos a cada línea
+    # ------------------------------------------------
+    # 5️⃣ Agrupar líneas por pedido
+    # ------------------------------------------------
+    lines_by_order = {}
     for line in lines:
-        line["taxes_names"] = [tax_name_map[t] for t in line.get("taxes_id", []) if t in tax_name_map]
+        order_id = line["order_id"][0]
+        line["default_code"] = (
+            sku_map.get(line["product_id"][0])
+            if line.get("product_id")
+            else None
+        )
+        lines_by_order.setdefault(order_id, []).append(line)
 
-    # 6️⃣ Agrupar las líneas por pedido
-    grouped_lines = defaultdict(list)
-    for line in lines:
-        order = line.get("order_id")
-        if order:
-            grouped_lines[order[0]].append(line)
+    # ------------------------------------------------
+    # 6️⃣ Construir estructura final
+    # ------------------------------------------------
+    result = []
 
-    # 7️⃣ Asignar líneas a cada pedido
     for po in purchase_orders:
         po_id = po["id"]
-        po["lineas_detalle"] = grouped_lines.get(po_id, [])
 
-    print("✅ Líneas asignadas correctamente a cada pedido.")
-    return purchase_orders
+        po_data = {
+            "id": po["id"],
+            "name": po["name"],
+            "partner_id": po["partner_id"],
+            "partner_ref": po.get("partner_ref"),
+            "date_order": po.get("date_order"),
+            "currency_id": po.get("currency_id"),
+            "state": po.get("state"),
+            "amount_untaxed": po.get("amount_untaxed"),
+            "amount_tax": po.get("amount_tax"),
+            "amount_total": po.get("amount_total"),
+            "user_id": po.get("user_id"),
+            "notes": po.get("notes"),
+            "origin": po.get("origin"),
+            "company_id": po.get("company_id"),
+            "x_comentarios": po.get("x_comentarios"),
+            "fiscal_position_id": po.get("fiscal_position_id"),
+            "payment_term_id": po.get("payment_term_id"),
+            "lineas_detalle": [],
+        }
+
+        for line in sorted(
+                lines_by_order.get(po_id, []),
+                key=lambda l: l.get("sequence", 0)
+        ):
+            po_data["lineas_detalle"].append({
+                "name": line.get("name"),
+                "display_type": line.get("display_type"),
+                "default_code": line.get("default_code"),
+                "product_qty": line.get("product_qty"),
+                "price_unit": line.get("price_unit"),
+                "price_subtotal": line.get("price_subtotal"),
+                "price_total": line.get("price_total"),
+                "taxes_id": line.get("taxes_id"),
+                "date_planned": line.get("date_planned"),
+                "sequence": line.get("sequence"),
+                "analytic_distribution": line.get("analytic_distribution"),
+            })
+
+        result.append(po_data)
+
+    print(f"✅ Exportados {len(result)} pedidos de compra")
+    return result
+
 
 def import_purchase_orders_with_lines(purchase_orders, state):
     """
-    Importa pedidos de compra en Odoo 18 junto con sus líneas.
-    Incluye los impuestos (buscados por nombre).
+    Importa pedidos de compra con:
+    - líneas de producto / nota / sección
+    - productos por SKU
+    - posición fiscal mapeada
+    - condiciones de pago
+    - restauración correcta del state
     """
-    from App_Connection import db, uid, password, models
 
-    total_creados = 0
-    total_existentes = 0
+    print(f"📥 Importando {len(purchase_orders)} pedidos de compra")
 
     for po in purchase_orders:
-        name = po["name"]
-        print(f"\n📦 Procesando pedido: {name}")
-
-        # Comprobar si ya existe
-        existing = models.execute_kw(
-            db, uid, password,
-            "purchase.order", "search",
-            [[("name", "=", name)]]
-        )
-        if existing:
-            print(f"⚠️  Pedido ya existente: {name}")
-            total_existentes += 1
-            continue
-
-        # -------------------------------
-        # Buscar proveedor
-        # -------------------------------
-        partner_id = None
-        if po["partner_id"]:
-            partner_name = po["partner_id"][1]
-            partners = models.execute_kw(
-                db, uid, password,
-                "res.partner", "search_read",
-                [[("name", "=", partner_name)]],
-                {"fields": ["id"], "limit": 1}
-            )
-            if partners:
-                partner_id = partners[0]["id"]
-            elif partner_name.startswith("(") and ")" in partner_name:
-                partner_name = partner_name.split(")", 1)[1].strip()
-                partners = models.execute_kw(
-                    db, uid, password,
-                    "res.partner", "search_read",
-                    [[("name", "=", partner_name)]],
-                    {"fields": ["id"], "limit": 1}
-                )
-                if partners:
-                    partner_id = partners[0]["id"]
-                else:
-                    print(f"⚠️  Partner no encontrado: {partner_name}")
-
-        # -------------------------------
-        # Buscar moneda
-        # -------------------------------
-        currency_id = None
-        if po["currency_id"]:
-            currency_name = po["currency_id"][1]
-            currencies = models.execute_kw(
-                db, uid, password,
-                "res.currency", "search_read",
-                [[("name", "=", currency_name)]],
-                {"fields": ["id"], "limit": 1}
-            )
-            if currencies:
-                currency_id = currencies[0]["id"]
-
-        # -------------------------------
-        # Crear pedido base
-        # -------------------------------
-        vals_po = {
-            "name": name,
-            "partner_id": partner_id,
-            "partner_ref": po.get("partner_ref"),
-            "date_order": po.get("date_order"),
-            "currency_id": currency_id,
-            "origin": po.get("origin"),
-            "notes": po.get("notes"),
-            "state": state,
-            "x_comentarios": po.get("x_comentarios"),
-        }
-
         try:
-            new_po_id = models.execute_kw(
-                db, uid, password,
-                "purchase.order", "create", [vals_po]
-            )
-            print(f"✅ Pedido creado: {name} (ID {new_po_id})")
-            total_creados += 1
-        except Exception as e:
-            print(f"❌ Error creando pedido {name}: {e}")
-            continue
+            name = po.get("name")
+            # state = po.get("state")
+            # ------------------------------------------------
+            # 1️⃣ PROVEEDOR
+            # ------------------------------------------------
+            partner_id = None
+            if po.get("partner_id"):
+                partner_id_origen = po['partner_id'][0]
+                partner_id = Utils.get_by_x_id_interno("res.partner", partner_id_origen, db, uid, password, models)
 
-        # -------------------------------
-        # Crear líneas
-        # -------------------------------
-        for linea in po.get("lineas_detalle", []):
-            product_id = None
-            if linea.get("product_id"):
-                prod_name = linea["product_id"][1]
-                productos = models.execute_kw(
+            domain = [
+                ("x_id_interno", "=", po.get("id")),
+            ]
+
+            if partner_id:
+                domain.append(("partner_id", "=", partner_id))
+
+            existing_po = models.execute_kw(
+                db, uid, password,
+                "purchase.order", "search",
+                [[domain]],
+                {"limit": 1}
+            )
+
+            if existing_po:
+                continue
+
+            # ------------------------------------------------
+            # 2️⃣ POSICIÓN FISCAL
+            # ------------------------------------------------
+            fiscal_position_id = None
+            if po.get("fiscal_position_id"):
+                fiscal_position_id_origen = po['fiscal_position_id'][0] if po['fiscal_position_id'][0] != 27 else 26
+                fiscal_position_id = Utils.get_by_x_id_interno("account.fiscal.position", fiscal_position_id_origen, db,
+                                                               uid, password, models)
+
+            # ------------------------------------------------
+            # 3️⃣ CONDICIÓN DE PAGO
+            # ------------------------------------------------
+            payment_term_id = None
+            if po.get("payment_term_id"):
+                pt_name = po["payment_term_id"][1]
+                pts = models.execute_kw(
                     db, uid, password,
-                    "product.product", "search_read",
-                    [[("name", "=", prod_name)]],
+                    "account.payment.term", "search",
+                    [[("name", "=", pt_name)]],
+                    {"limit": 1}
+                )
+                if pts:
+                    payment_term_id = pts[0]
+                else:
+                    print(f"⚠️ Condición de pago no encontrada: {pt_name}")
+
+            # -------------------------------
+            # Buscar comercial (user_id)
+            # -------------------------------
+            user_id_origen = None
+            if po.get("user_id"):
+                user_id_origen = po.get("user_id")[0]
+            # user_id = Utils.get_by_x_id_interno("res.users", user_id_origen, db, uid, password, models)
+            user_name = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "res.users", "read",
+                [[user_id_origen]],
+                {"fields": ["name"]}
+            )[0]["name"]
+            try:
+                user_id = models.execute_kw(
+                    db, uid, password,
+                    "res.users", "search",
+                    [[("name", "=", user_name)]],
+                    {"limit": 1}
+                )[0]
+            except:
+                user_id = 43
+
+            project_id = None
+            lineas = po.get("lineas_detalle", [])[0].get("analytic_distribution") if po.get("lineas_detalle",
+                                                                                            []) else False
+            analytic_distribution = lineas
+            if analytic_distribution:
+                analytic_id = int(list(analytic_distribution.keys())[0])
+
+                project = models_src.execute_kw(
+                    db_src, uid_src, password_src,
+                    "project.project", "search_read",
+                    [[("analytic_account_id", "=", analytic_id)]],
+                    {"fields": ["id"], "limit": 1, "context": {"active_test": False}}
+                )
+
+                project_id_src = project[0]["id"] if project else None
+
+                project_dest = models.execute_kw(
+                    db, uid, password,
+                    "project.project", "search_read",
+                    [[("x_id_interno", "=", project_id_src)]],
                     {"fields": ["id"], "limit": 1}
                 )
-                if productos:
-                    product_id = productos[0]["id"]
 
-            # Buscar impuestos por nombre
-            impuestos_ids = []
-            for tax_name in linea.get("taxes_names", []):
-                try:
-                    # Extraer número antes del símbolo %
-                    match = re.search(r"(\d+(?:\.\d+)?)\s*%", tax_name)
-                    porcentaje = match.group(1) if match else None
+                project_id = project_dest[0]["id"] if project_dest else None
 
-                    if porcentaje:
-                        print(f"🔍 Buscando impuesto con porcentaje exacto: {porcentaje}%")
-
-                        # Obtener todos los impuestos (solo una vez podrías cachearlo fuera del bucle)
-                        all_taxes = models.execute_kw(
-                            db, uid, password,
-                            "account.tax", "search_read",
-                            [[], ["id", "name", "description"]],
-                            {"limit": 200}  # puedes quitar el limit si tienes pocos
-                        )
-
-                        # Buscar coincidencia exacta del número antes del %
-                        pattern = rf"(?<!\d){porcentaje}\s*%(\D|$)"  # evita 10 dentro de 210 o 100
-
-                        coincidencias = [
-                            t for t in all_taxes
-                            if
-                            (re.search(pattern, t["name"] or "") or re.search(pattern, t["description"] or ""))
-                        ]
-
-                        if coincidencias:
-                            impuestos_ids.append(coincidencias[0]["id"])
-                            print(f"✅ Impuesto asignado ({porcentaje}%): {coincidencias[0]['name']}")
-                        else:
-                            print(f"⚠️ No se encontró impuesto exacto con {porcentaje}%")
-
-                    else:
-                        print(f"⚠️ No se detectó porcentaje en '{tax_name}'")
-
-                except Exception as e:
-                    print(f"❌ Error procesando '{tax_name}': {e}")
-
-            vals_line = {
-                "order_id": new_po_id,
-                "name": linea.get("name"),
-                "product_id": product_id,
-                "product_qty": linea.get("product_qty") or 1.0,
-                "price_unit": linea.get("price_unit") or 0.0,
-                "date_planned": linea.get("date_planned"),
-                "taxes_id": [(6, 0, impuestos_ids)],
+            # ------------------------------------------------
+            # 4️⃣ CREAR PEDIDO (SIEMPRE EN DRAFT)
+            # ------------------------------------------------
+            vals_po = {
+                "x_id_interno": po.get("id"),
+                "name": name,
+                "partner_id": partner_id,
+                "partner_ref": po.get("partner_ref"),
+                "date_order": po.get("date_order"),
+                "origin": po.get("origin"),
+                "notes": po.get("notes"),
+                "x_comentarios": po.get("x_comentarios"),
+                "fiscal_position_id": fiscal_position_id,
+                "payment_term_id": payment_term_id,
+                "user_id": user_id,
+                "create_date": po.get("create_date"),
+                "priority": po.get("priority"),
+                "project_id": project_id,
             }
 
             try:
-                models.execute_kw(
+                new_po_id = models.execute_kw(
                     db, uid, password,
-                    "purchase.order.line", "create", [vals_line]
+                    "purchase.order", "create", [vals_po]
                 )
-                print(f"   ➕ Línea creada: {linea.get('name')}")
+                print(f"🧾 Pedido creado (draft): {name}")
             except Exception as e:
-                print(f"   ⚠️ Error creando línea: {e}")
+                print(f"❌ Error creando pedido {name} con id {po.get("id")}: {e}")
+                continue
 
-    print("\n📊 MIGRACIÓN COMPLETADA")
-    print(f"   Total creados: {total_creados}")
-    print(f"   Ya existentes: {total_existentes}")
+            # ------------------------------------------------
+            # 5️⃣ CREAR LÍNEAS
+            # ------------------------------------------------
+            for line in po.get("lineas_detalle", []):
+                display_type = line.get("display_type")
 
-# ----------------------------------------------------------------------
-# Funciones por estado
-# ----------------------------------------------------------------------
+                # -------------------------------
+                # 📝 NOTA / SECCIÓN
+                # -------------------------------
+                if display_type in ("line_note", "line_section"):
+                    vals_line = {
+                        "order_id": new_po_id,
+                        "name": line.get("name"),
+                        "display_type": display_type,
+                        "product_qty": 0.0,  # OBLIGATORIO en Compras
+                        "sequence": line.get("sequence"),
+                    }
+
+                    try:
+                        models.execute_kw(
+                            db, uid, password,
+                            "purchase.order.line", "create", [vals_line]
+                        )
+                    except Exception as e:
+                        print(f"⚠️ Error creando nota/sección: {e}")
+                    continue
+
+                # -------------------------------
+                # 📦 PRODUCTO
+                # -------------------------------
+                product_id = None
+                sku = line.get("default_code")
+
+                if sku:
+                    productos = models.execute_kw(
+                        db, uid, password,
+                        "product.product", "search",
+                        [[("default_code", "=", sku)]],
+                        {"limit": 1}
+                    )
+                    if productos:
+                        product_id = productos[0]
+                    else:
+                        productos = models.execute_kw(
+                            db, uid, password,
+                            "product.product", "search",
+                            [[("default_code", "ilike", sku)]],
+                            {"limit": 1, "context": {"active_test": False}}
+                        )
+                        if productos:
+                            product_id = productos[0]
+                        else:
+                            print(f"⚠️ Producto no encontrado (SKU={sku})")
+
+                # -------------------------------
+                # Buscar impuestos por nombre
+                # -------------------------------
+
+                tax_ids = []
+                if line.get("taxes_id"):
+                    tax_origen = line.get("taxes_id")[0]
+                    tax_id = Utils.get_by_x_id_interno("account.tax", tax_origen, db, uid, password, models)
+                    tax_ids = [tax_id] if tax_id else []
+
+                vals_line = {
+                    "order_id": new_po_id,
+                    "name": line.get("name"),
+                    "product_id": product_id,
+                    "product_qty": line.get("product_qty") or 0.0,
+                    "price_unit": line.get("price_unit") or 0.0,
+                    "date_planned": line.get("date_planned"),
+                    "sequence": line.get("sequence"),
+                    "taxes_id": [(6, 0, tax_ids)],
+                }
+
+                try:
+                    models.execute_kw(
+                        db, uid, password,
+                        "purchase.order.line", "create", [vals_line]
+                    )
+                except Exception as e:
+                    print(f"⚠️ Error creando línea de producto: {e}")
+
+            # ------------------------------------------------
+            # 6️⃣ RESTAURAR STATE ORIGINAL
+            # ------------------------------------------------
+            try:
+                if state == "purchase":
+                    models.execute_kw(
+                        db, uid, password,
+                        "purchase.order", "button_confirm", [[new_po_id]]
+                    )
+                    print(f"✔ Pedido confirmado: {name}")
+
+                elif state == "cancel":
+                    # confirmar primero (Odoo no cancela desde draft)
+                    models.execute_kw(
+                        db, uid, password,
+                        "purchase.order", "button_confirm", [[new_po_id]]
+                    )
+                    models.execute_kw(
+                        db, uid, password,
+                        "purchase.order", "button_cancel", [[new_po_id]]
+                    )
+                    print(f"⛔ Pedido cancelado: {name}")
+
+                def sync_picking_estado(pedido_destino_id, pedido_origen_id):
+                    """
+                    Sincroniza el estado del picking según tu lógica:
+
+                    if estado_origen in ["waiting", "confirmed"]:
+                        forzar_estado_correspondiente()
+                    elif estado_origen != "assigned":
+                        cancelar_y_eliminar_picking()
+                    """
+
+                    # -------------------------------------------------
+                    # 1️⃣ Obtener picking en origen
+                    # -------------------------------------------------
+                    picking_origen = models_src.execute_kw(
+                        db_src, uid_src, password_src,
+                        "stock.picking", "search_read",
+                        [[("origin", "!=", False), ("origin", "=", pedido_origen_id)]],
+                        {"fields": ["state"], "limit": 1}
+                    )
+
+                    if not picking_origen:
+                        return
+
+                    estado_origen = picking_origen[0]["state"]
+
+                    # -------------------------------------------------
+                    # 2️⃣ Obtener picking destino
+                    # -------------------------------------------------
+                    picking_destino_ids = models.execute_kw(
+                        db, uid, password,
+                        "stock.picking", "search",
+                        [[("origin", "=", pedido_destino_id)]]
+                    )
+
+                    if not picking_destino_ids:
+                        return
+
+                    # -------------------------------------------------
+                    # 3️⃣ Aplicar TU lógica exacta
+                    # -------------------------------------------------
+                    for picking_id in picking_destino_ids:
+
+                        if estado_origen in ["waiting", "confirmed"]:
+
+                            models.execute_kw(
+                                db, uid, password,
+                                "stock.picking", "write",
+                                [[picking_id], {"state": estado_origen}]
+                            )
+
+                        elif estado_origen != "assigned":
+
+                            # Cancelar
+                            models.execute_kw(
+                                db, uid, password,
+                                "stock.picking", "action_cancel",
+                                [[picking_id]]
+                            )
+
+                            # Eliminar
+                            models.execute_kw(
+                                db, uid, password,
+                                "stock.picking", "unlink",
+                                [[picking_id]]
+                            )
+
+                sync_picking_estado(new_po_id, po.get("id"))
+
+            except Exception as e:
+                print(f"⚠️ Error restaurando estado ({state}) para {name}: {e}")
+        except Exception as e:
+            print(f"📥 Importando Fallo: {e} ID: {po.get("id")}")
+
+    migrar_adjuntos_modelo("purchase.order")
+
+    print("✅ Importación de pedidos de compra finalizada")
+
 
 def migrar_pedidos_compra_draft():
     orders = export_purchase_orders_by_state("draft")
@@ -2665,365 +3697,31 @@ def migrar_pedidos_compra_cancel():
 
 
 def migrar_pedidos_compra():
-    migrar_pedidos_compra_draft()
     migrar_pedidos_compra_purchase()
+    migrar_pedidos_compra_draft()
     migrar_pedidos_compra_cancel()
 
+
+# migrar_pedidos_compra()
 #endregion
 
 #region REGION FACTURACION
-# ----------------------------------------------------------------------
-# Funciones pre-migracion
-# ----------------------------------------------------------------------
-def export_plan_contable(company_name="ALMAITANA DE LUZ, S.L."):
-    import xmlrpc.client
-
-    url = 'https://optimaluz.soluntec.net'
-    db = 'Real'
-    username = 'jcoronado@optimaluz.com'
-    password = 'AlAi4ever'
-
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid = common.authenticate(db, username, password, {})
-    if not uid:
-        print("❌ Error autenticación")
-        return []
-
-    models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-
-    company_id = models.execute_kw(
-        db, uid, password,
-        'res.company', 'search',
-        [[('name', '=', company_name)]],
-        {'limit': 1}
-    )[0]
-
-    accounts = models.execute_kw(
-        db, uid, password,
-        'account.account', 'search_read',
-        [[('company_id', '=', company_id)]],
-        {
-            'fields': [
-                'code',
-                'name',
-                'account_type',
-                'reconcile',
-                'deprecated'
-            ],
-            'order': 'code'
-        }
-    )
-
-    print(f"📤 Exportadas {len(accounts)} cuentas contables")
-    return accounts
-
-def import_plan_contable(accounts):
-    from App_Connection import db, uid, password, models
-
-    creadas = 0
-    existentes = 0
-
-    # Mapeo de tipos (normalizado)
-    TYPE_MAP = {
-        'asset_receivable': 'asset_receivable',
-        'liability_payable': 'liability_payable',
-        'asset_cash': 'asset_cash',
-        'income': 'income',
-        'expense': 'expense',
-        'equity': 'equity',
-        'asset_current': 'asset_receivable',
-        'liability_current': 'liability_payable',
-        'asset_current': 'asset_current',
-        'asset_fixed': 'asset_current',
-        'liability_current': 'liability_payable',
-        'liability_non_current': 'liability_payable',
-    }
-
-    for acc in accounts:
-        code = acc['code']
-        name = acc['name']
-        acc_type_src = acc['account_type']
-        reconcile = acc['reconcile']
-        deprecated = acc['deprecated']
-
-        print(f"\n📘 Cuenta {code} – {name}")
-
-        # ¿Existe ya?
-        existing = models.execute_kw(
-            db, uid, password,
-            'account.account', 'search',
-            [[('code', '=', code)]]
-        )
-
-        if existing:
-            print("⚠️ Ya existe")
-            existentes += 1
-            continue
-
-        acc_type = TYPE_MAP.get(acc_type_src)
-        if not acc_type:
-            print(f"❌ Tipo no mapeado: {acc_type_src}")
-            continue
-
-        # 🔥 Regla obligatoria en Odoo 18
-        if acc_type in ('asset_receivable', 'liability_payable'):
-            reconcile = True
-
-        vals = {
-            'code': code,
-            'name': name,
-            'account_type': acc_type,
-            'reconcile': reconcile,
-            'deprecated': deprecated,
-        }
-
-        try:
-            models.execute_kw(
-                db, uid, password,
-                'account.account', 'create',
-                [vals]
-            )
-            print("✅ Cuenta creada")
-            creadas += 1
-        except Exception as e:
-            print(f"❌ Error creando cuenta {code}: {e}")
-
-    print("\n📊 PLAN CONTABLE IMPORTADO")
-    print(f"   Creadas: {creadas}")
-    print(f"   Existentes: {existentes}")
-
-# accounts = export_plan_contable()
-# import_plan_contable(accounts)
-
-def limpiar_asientos_automaticos():
-    from App_Connection import db, uid, password, models
-
-    print("🧹 Limpiando asientos contables automáticos...")
-
-    # Buscar asientos que NO sean facturas ni pagos
-    move_ids = models.execute_kw(
-        db, uid, password,
-        "account.move", "search",
-        [[
-            ("state", "=", "posted"),
-            ("move_type", "=", "entry"),
-        ]]
-    )
-
-    print(f"🔎 Asientos encontrados: {len(move_ids)}")
-
-    if not move_ids:
-        print("✔️ No hay asientos a borrar")
-        return
-
-    try:
-        # 1️⃣ Pasar a borrador
-        models.execute_kw(
-            db, uid, password,
-            "account.move", "button_draft",
-            [move_ids]
-        )
-    except Exception as e:
-        print("↩️ Asientos pasados a borrador")
-
-    try:
-        # 2️⃣ Borrar
-        models.execute_kw(
-            db, uid, password,
-            "account.move", "unlink",
-            [move_ids]
-        )
-    except Exception as e:
-        print("🗑️ Asientos eliminados correctamente")
-
-# limpiar_asientos_automaticos()
-
-def export_account_moves_entries(company_name="ALMAITANA DE LUZ, S.L.", limit=None):
-    import xmlrpc.client
-
-    url = 'https://optimaluz.soluntec.net'
-    db = 'Real'
-    username = 'jcoronado@optimaluz.com'
-    password = 'AlAi4ever'
-
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid = common.authenticate(db, username, password, {})
-    if not uid:
-        print("❌ Error autenticación")
-        return []
-
-    models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-
-    # Buscar compañía
-    company_id = models.execute_kw(
-        db, uid, password,
-        'res.company', 'search',
-        [[('name', '=', company_name)]],
-        {'limit': 1}
-    )[0]
-
-    domain = [
-        ('company_id', '=', company_id),
-        ('move_type', '=', 'entry'),
-        ('state', '=', 'posted'),
-    ]
-
-    moves = models.execute_kw(
-        db, uid, password,
-        'account.move', 'search_read',
-        [domain],
-        {
-            'fields': [
-                'id', 'name', 'date', 'ref',
-                'journal_id', 'line_ids'
-            ],
-            'limit': limit
-        }
-    )
-
-    print(f"📤 Exportados {len(moves)} asientos contables")
-
-    # Leer líneas en bloque
-    line_ids = [lid for m in moves for lid in m['line_ids']]
-    lines = models.execute_kw(
-        db, uid, password,
-        'account.move.line', 'read',
-        [line_ids],
-        {
-            'fields': [
-                'move_id', 'name',
-                'account_id', 'partner_id',
-                'debit', 'credit'
-            ]
-        }
-    )
-
-    lines_by_move = {}
-    for l in lines:
-        lines_by_move.setdefault(l['move_id'][0], []).append(l)
-
-    for m in moves:
-        m['lines'] = lines_by_move.get(m['id'], [])
-
-    return moves
-
-def import_account_moves_entries(moves):
-    from App_Connection import db, uid, password, models
-
-    creados = 0
-    saltados = 0
-
-    for m in moves:
-        name = m['name']
-        print(f"\n📘 Asiento {name}")
-
-        # Evitar duplicados
-        if models.execute_kw(db, uid, password, 'account.move', 'search', [[('name', '=', name)]]):
-            print("⚠️ Ya existe, saltando")
-            saltados += 1
-            continue
-
-        # Buscar diario
-        journal_name = m['journal_id'][1]
-        journal = models.execute_kw(
-            db, uid, password,
-            'account.journal', 'search_read',
-            [[('name', '=', journal_name)]],
-            {'fields': ['id'], 'limit': 1}
-        )
-        if not journal:
-            print(f"❌ Diario no encontrado: {journal_name}")
-            continue
-
-        move_vals = {
-            'name': name,
-            'move_type': 'entry',
-            'journal_id': journal[0]['id'],
-            'date': m['date'],
-            'ref': m['ref'],
-            'line_ids': [],
-        }
-
-        for l in m['lines']:
-            # Buscar cuenta contable
-            account_full_name = l['account_id'][1]
-            account_code = l['account_id'][1].split(' ')[0]
-            account = models.execute_kw(
-                db, uid, password,
-                'account.account', 'search_read',
-                [[('code', '=', account_code)]],
-                {'fields': ['id'], 'limit': 1}
-            )
-            if not account:
-                print(f"❌ Cuenta no encontrada: {account_full_name}")
-                continue
-
-            partner_id = None
-            if l['partner_id']:
-                partner = models.execute_kw(
-                    db, uid, password,
-                    'res.partner', 'search_read',
-                    [[('name', '=', l['partner_id'][1])]],
-                    {'fields': ['id'], 'limit': 1}
-                )
-                partner_id = partner[0]['id'] if partner else None
-
-            move_vals['line_ids'].append((0, 0, {
-                'name': l['name'],
-                'account_id': account[0]['id'],
-                'partner_id': partner_id,
-                'debit': l['debit'],
-                'credit': l['credit'],
-            }))
-
-        try:
-            new_id = models.execute_kw(db, uid, password, 'account.move', 'create', [move_vals])
-            models.execute_kw(db, uid, password, 'account.move', 'action_post', [[new_id]])
-            print(f"✅ Asiento creado y publicado ({new_id})")
-            creados += 1
-        except Exception as e:
-            print(f"❌ Error creando asiento {name}: {e}")
-
-    print("\n📊 RESULTADO")
-    print(f"   Creados: {creados}")
-    print(f"   Saltados: {saltados}")
-
-# moves = export_account_moves_entries()
-# import_account_moves_entries(moves)
-
-# ----------------------------------------------------------------------
-# Migrar Invoices
-# ----------------------------------------------------------------------
-
-def export_invoices_by_state(state, cliente_T_proveedor_F = True, company_name="ALMAITANA DE LUZ, S.L."):
+def export_invoices_by_state(state):
     """
     Exporta facturas de Odoo 16 filtradas por estado, optimizado para rendimiento.
     Lee las líneas en bloque para evitar miles de llamadas RPC.
     """
     import xmlrpc.client
-    from collections import defaultdict
 
-    url = 'https://optimaluz.soluntec.net'  # 'http://79.72.55.217:8069'
-    db_old = 'Real'  # 'odoo1'
-    username = 'jcoronado@optimaluz.com'  # 'admin'
-    password_old = 'AlAi4ever'  # 'admin'
-
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid_old = common.authenticate(db_old, username, password_old, {})
-
-    if not uid_old:
-        print("❌ No se pudo autenticar.")
-        return
-
-    print(f'🔌 Conectado como {username} (uid: {uid_old})')
-    models_old = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-
-    tipo_factura = "out_invoice" if cliente_T_proveedor_F else "in_invoice"
+    # tipo_factura = "out_invoice" if cliente_T_proveedor_F else "in_invoice"
+    # if is_rectificativa: tipo_factura = "out_refund" if cliente_T_proveedor_F else "in_refund"
 
     FIELDS = [
+        "id",
         "name",
         "partner_id",
         "ref",
+        "date",
         "invoice_date",
         "invoice_date_due",
         "move_type",
@@ -3038,30 +3736,66 @@ def export_invoices_by_state(state, cliente_T_proveedor_F = True, company_name="
         "invoice_origin",
         "narration",
         "company_id",
+        "invoice_user_id",
+        "journal_id",
     ]
 
     print(f"📤 Exportando facturas en estado '{state}'...")
 
-    company_id_src = models_old.execute_kw(
-        db_old, uid_old, password_old,
-        'res.company', 'search',
-        [[('name', '=', company_name)]],
-        {'limit': 1}
-    )
-    company_id_src = company_id_src[0] if company_id_src else False
+    # Define aquí el texto que escribe el usuario
+    termino_busqueda = "FC1OP/25/"  # "FV1OP/25/"#
+
+    # Este es el domain dinámico que debes usar:
+    domain = [
+        ("move_type", "in", ["out_invoice", "in_invoice", "out_refund", "in_refund"]),
+        ("state", "=", state),
+        ('company_id', '=', 2),  # OSE: 1 / ALM: 2
+        '|', '|', '|', '|',
+        ('name', 'ilike', termino_busqueda),
+        ('invoice_origin', 'ilike', termino_busqueda),
+        ('ref', 'ilike', termino_busqueda),
+        ('payment_reference', 'ilike', termino_busqueda),
+        ('partner_id', 'child_of', termino_busqueda)
+    ]
 
     # 1️⃣ Exportar facturas
-    invoices = models_old.execute_kw(
-        db_old, uid_old, password_old,
+    invoices = models_src.execute_kw(
+        db_src, uid_src, password_src,
         "account.move", "search_read",
-        [[
-            ("move_type", "in", [tipo_factura]),
-            ("state", "=", state), ('company_id', '=', company_id_src),
-        ]],
+        [domain],
         {"fields": FIELDS}
     )
 
     print(f"   → {len(invoices)} facturas encontradas.")
+
+    journal_ids = {
+        inv["journal_id"][0]
+        for inv in invoices
+        if inv.get("journal_id")
+    }
+
+    journal_code_map = {}
+
+    if journal_ids:
+        journals = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.journal", "read",
+            [list(journal_ids)],
+            {"fields": ["id", "code"], "context": {"active_test": False}}
+        )
+
+        journal_code_map = {
+            j["id"]: j["code"]
+            for j in journals
+        }
+    # -------------------------------
+    # Añadir journal_code a cada factura
+    # -------------------------------
+    for inv in invoices:
+        if inv.get("journal_id"):
+            inv["journal_code"] = journal_code_map.get(inv["journal_id"][0])
+        else:
+            inv["journal_code"] = None
 
     # 2️⃣ Reunir todos los IDs de líneas
     all_line_ids = []
@@ -3075,45 +3809,54 @@ def export_invoices_by_state(state, cliente_T_proveedor_F = True, company_name="
     print(f"   → {len(all_line_ids)} líneas totales detectadas. Leyendo en bloque...")
 
     # 3️⃣ Leer todas las líneas en bloque
-    lines = models_old.execute_kw(
-        db_old, uid_old, password_old,
+    lines = models_src.execute_kw(
+        db_src, uid_src, password_src,
         "account.move.line", "read",
         [all_line_ids],
         {"fields": [
+            "id",
             "move_id",
             "name",
             "product_id",
             "quantity",
             "price_unit",
+            "discount",
             "price_subtotal",
             "tax_ids",
             "account_id",
+            "display_type",
         ]}
     )
 
-    all_tax_ids = set()
-    for line in lines:
-        for tax_id in line.get("tax_ids", []):
-            all_tax_ids.add(tax_id)
+    # ------------------------------------------------
+    # 4️⃣ Resolver SKUs de productos
+    # ------------------------------------------------
+    product_ids = {
+        l["product_id"][0]
+        for l in lines
+        if l.get("product_id")
+    }
 
-    taxes_data = {}
-    if all_tax_ids:
-        taxes_read = models_old.execute_kw(
-            db_old, uid_old, password_old,
-            "account.tax", "read",
-            [list(all_tax_ids)],
-            {"fields": ["id", "name"]}
+    sku_map = {}
+    if product_ids:
+        products = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "product.product", "read",
+            [list(product_ids)],
+            {"fields": ["id", "default_code"]}
         )
-        taxes_data = {t["id"]: t["name"] for t in taxes_read}
-
-    for line in lines:
-        line["taxes_names"] = [taxes_data.get(tid) for tid in line.get("tax_ids", []) if tid in taxes_data]
+        sku_map = {p["id"]: p["default_code"] for p in products}
 
     # 4️⃣ Agrupar las líneas por factura
     grouped_lines = defaultdict(list)
     for line in lines:
         move = line.get("move_id")
         if move:
+            line["default_code"] = (
+                sku_map.get(line["product_id"][0])
+                if line.get("product_id")
+                else None
+            )
             grouped_lines[move[0]].append(line)
 
     # 5️⃣ Asignar líneas a cada factura
@@ -3124,7 +3867,6 @@ def export_invoices_by_state(state, cliente_T_proveedor_F = True, company_name="
     print("✅ Líneas asignadas correctamente a cada factura.")
     return invoices
 
-
 def import_invoices_with_lines(invoices, state):
     """
     Importa facturas en Odoo 18 junto con sus líneas y mapeo de impuestos.
@@ -3133,6 +3875,7 @@ def import_invoices_with_lines(invoices, state):
     import xmlrpc.client
     from App_Connection import db, uid, password, models
 
+    test = False
     total_creadas = 0
     total_existentes = 0
 
@@ -3163,45 +3906,26 @@ def import_invoices_with_lines(invoices, state):
 
     for inv in invoices:
         name = inv.get("name") or inv.get("payment_reference") or "SIN_NOMBRE"
+        x_id_interno = inv.get("id")
         print(f"\n🧾 Procesando factura: {name}")
 
         # Comprobar si ya existe
         existing = models.execute_kw(
             db, uid, password,
             "account.move", "search",
-            [[("name", "=", name)]]
+            [[("x_id_interno", "=", x_id_interno)]]
         )
         if existing:
-            print(f"⚠️  Factura ya existente: {name}")
-            total_existentes += 1
+            print(f"⚠️  Factura ya existente: {total_existentes}")
             continue
 
         # -------------------------------
         # Buscar cliente/proveedor
         # -------------------------------
         partner_id = None
-        if inv["partner_id"]:
-            partner_name = inv["partner_id"][1]
-            partners = models.execute_kw(
-                db, uid, password,
-                "res.partner", "search_read",
-                [[("name", "=", partner_name)]],
-                {"fields": ["id"], "limit": 1}
-            )
-            if partners:
-                partner_id = partners[0]["id"]
-            elif partner_name.startswith("(") and ")" in partner_name:
-                partner_name = partner_name.split(")", 1)[1].strip()
-                partners = models.execute_kw(
-                    db, uid, password,
-                    "res.partner", "search_read",
-                    [[("name", "=", partner_name)]],
-                    {"fields": ["id"], "limit": 1}
-                )
-                if partners:
-                    partner_id = partners[0]["id"]
-                else:
-                    print(f"⚠️  Partner no encontrado: {partner_name}")
+        if inv.get("partner_id"):
+            partner_id_origen = inv.get("partner_id")[0]
+            partner_id = Utils.get_by_x_id_interno("res.partner", partner_id_origen, db, uid, password, models)
 
         # -------------------------------
         # Buscar moneda
@@ -3219,20 +3943,56 @@ def import_invoices_with_lines(invoices, state):
                 currency_id = currencies[0]["id"]
 
         # -------------------------------
+        # Buscar usuario de factura
+        # -------------------------------
+        user_id_origen = None
+        if inv.get("invoice_user_id"):
+            user_id_origen = inv.get("invoice_user_id")[0]
+        invoice_user_id = Utils.get_by_x_id_interno("res.users", user_id_origen, db, uid, password, models)
+
+        # -------------------------------
+        # Buscar diario contable (por code)
+        # -------------------------------
+        journal_id = None
+        if inv.get("journal_code"):
+            journal_code = inv["journal_code"]
+
+            journals = models.execute_kw(
+                db, uid, password,
+                "account.journal", "search_read",
+                [[("code", "=", journal_code)]],
+                {
+                    "fields": ["id"],
+                    "limit": 1,
+                    "context": {"active_test": False},
+                }
+            )
+
+            if journals:
+                journal_id = journals[0]["id"]
+            else:
+                print(f"⚠️ Diario no encontrado: code={journal_code}")
+
+        # -------------------------------
         # Crear factura en borrador siempre
         # -------------------------------
         vals_inv = {
+            "x_id_interno": inv.get("id"),
             "name": name,
             "move_type": inv.get("move_type") or "out_invoice",
             "partner_id": partner_id,
             "ref": inv.get("ref"),
             "payment_reference": inv.get("payment_reference"),
+            "date": inv.get("date"),
             "invoice_date": inv.get("invoice_date"),
             "invoice_date_due": inv.get("invoice_date_due"),
             "currency_id": currency_id,
             "invoice_origin": inv.get("invoice_origin"),
             "narration": inv.get("narration"),
+            "invoice_user_id": invoice_user_id,
+            "journal_id": journal_id,
             "state": "draft",
+            "partner_bank_id": "",
         }
 
         try:
@@ -3250,67 +4010,139 @@ def import_invoices_with_lines(invoices, state):
         # Crear líneas
         # -------------------------------
         for linea in inv.get("lineas_detalle", []):
-            print(f"Linea: {linea}")
+            display_type = linea.get("display_type")
+
+            # -------------------------------
+            # 📝 NOTA / SECCIÓN
+            # -------------------------------
+            if display_type in ("line_note", "line_section"):
+                vals_line = {
+                    "x_id_interno": linea.get("id"),
+                    "move_id": new_inv_id,
+                    "name": linea.get("name"),
+                    "display_type": display_type,
+                    "quantity": 0.0,
+                    "sequence": linea.get("sequence"),
+                }
+
+                result = safe_execute_line(
+                    "account.move.line", "create", [vals_line]
+                )
+                if not result:
+                    print(f"⚠️ Error creando nota/sección: {linea.get('name')}")
+                continue
+
+            # -------------------------------
+            # 📦 LÍNEA NORMAL (PRODUCTO O CONCEPTO)
+            # -------------------------------
             product_id = None
-            if linea.get("product_id"):
-                prod_name = linea["product_id"][1]
+            account_id = None
+
+            sku = linea.get("default_code")
+
+            # 🔹 Intentar resolver producto por SKU
+            if sku:
                 productos = models.execute_kw(
                     db, uid, password,
-                    "product.product", "search_read",
-                    [[("name", "=", prod_name)]],
-                    {"fields": ["id"], "limit": 1}
+                    "product.product", "search",
+                    [[("default_code", "=", sku)]],
+                    {"limit": 1}
                 )
                 if productos:
-                    product_id = productos[0]["id"]
-
-            # Buscar impuestos por número de porcentaje (%)
-            impuestos_ids = []
-            for tax_name in linea.get("taxes_names", []):
-                try:
-                    # Extraer número antes del símbolo %
-                    match = re.search(r"(\d+(?:\.\d+)?)\s*%", tax_name)
-                    porcentaje = match.group(1) if match else None
-
-                    if porcentaje:
-                        print(f"🔍 Buscando impuesto con porcentaje exacto: {porcentaje}%")
-
-                        # Obtener todos los impuestos (solo una vez podrías cachearlo fuera del bucle)
-                        all_taxes = models.execute_kw(
-                            db, uid, password,
-                            "account.tax", "search_read",
-                            [[], ["id", "name", "description"]],
-                            {"limit": 200}  # puedes quitar el limit si tienes pocos
-                        )
-
-                        # Buscar coincidencia exacta del número antes del %
-                        pattern = rf"(?<!\d){porcentaje}\s*%(\D|$)"  # evita 10 dentro de 210 o 100
-
-                        coincidencias = [
-                            t for t in all_taxes
-                            if
-                            (re.search(pattern, t["name"] or "") or re.search(pattern, t["description"] or ""))
-                        ]
-
-                        if coincidencias:
-                            impuestos_ids.append(coincidencias[0]["id"])
-                            print(f"✅ Impuesto asignado ({porcentaje}%): {coincidencias[0]['name']}")
-                        else:
-                            print(f"⚠️ No se encontró impuesto exacto con {porcentaje}%")
-
+                    product_id = productos[0]
+                else:
+                    productos = models.execute_kw(
+                        db, uid, password,
+                        "product.product", "search",
+                        [[("default_code", "ilike", sku)]],
+                        {"limit": 1, "context": {"active_test": False}}
+                    )
+                    if productos:
+                        product_id = productos[0]
                     else:
-                        print(f"⚠️ No se detectó porcentaje en '{tax_name}'")
+                        print(f"⚠️ Producto no encontrado (SKU={sku})")
 
-                except Exception as e:
-                    print(f"❌ Error procesando '{tax_name}': {e}")
+            # 🔹 Si NO hay producto → resolver cuenta contable
+            if not product_id:
+                if inv.get("move_type") in ("out_invoice", "out_refund"):
+                    accounts = models.execute_kw(
+                        db, uid, password,
+                        "account.account", "search",
+                        [[
+                            ("account_type", "=", "income"),
+                        ]],
+                        {"limit": 1}
+                    )
+                else:
+                    accounts = models.execute_kw(
+                        db, uid, password,
+                        "account.account", "search",
+                        [[
+                            ("account_type", "=", "expense"),
+                        ]],
+                        {"limit": 1}
+                    )
 
+                if accounts:
+                    account_id = accounts[0]
+                else:
+                    raise Exception("❌ No se encontró cuenta contable por defecto")
+            cuenta_dest = None
+            try:
+                account_id_origen = linea.get("account_id")
+                if account_id_origen:
+                    account_id_origen = account_id_origen[0]
+
+                # Obtener código cuenta origen
+                acc_origen = models_src.execute_kw(
+                    db_src, uid_src, password_src,
+                    "account.account", "read",
+                    [[account_id_origen]],
+                    {"fields": ["code"]}
+                )[0]
+
+                account_code = acc_origen["code"]
+
+                # Buscar cuenta destino
+                cuenta_dest = models.execute_kw(
+                    db, uid, password,
+                    "account.account", "search",
+                    [[("code", "=", account_code)]],
+                    {"limit": 1}
+                )
+            except:
+                pass
+
+            # -------------------------------
+            # 🔹 Impuestos
+            # -------------------------------
+            tax_ids = []
+            if linea.get("tax_ids"):
+                for tax_origen in linea.get("tax_ids"):
+                    tax_id = Utils.get_by_x_id_interno("account.tax", tax_origen, db, uid, password, models)
+                    if tax_id:
+                        tax_ids.append(tax_id)
+
+            # -------------------------------
+            # 🔹 Crear línea
+            # -------------------------------
             vals_line = {
+                "x_id_interno": linea.get("id"),
                 "move_id": new_inv_id,
                 "name": linea.get("name"),
                 "product_id": product_id,
+                "display_type": display_type,
                 "quantity": linea.get("quantity") or 1.0,
                 "price_unit": linea.get("price_unit") or 0.0,
-                "tax_ids": [(6, 0, impuestos_ids)],
+                "discount": linea.get("discount") or 0.0,
+                "tax_ids": [(6, 0, tax_ids)],
+                "sequence": linea.get("sequence"),
             }
+
+            if cuenta_dest:
+                vals_line["account_id"] = cuenta_dest[0]
+            elif account_id:
+                vals_line["account_id"] = account_id
 
             result = safe_execute_line(
                 "account.move.line", "create", [vals_line],
@@ -3325,427 +4157,5377 @@ def import_invoices_with_lines(invoices, state):
         # -------------------------------
         # Publicar si corresponde
         # -------------------------------
-        if state == "posted":
-            try:
-                models.execute_kw(
-                    db, uid, password,
-                    "account.move", "action_post",
-                    [[new_inv_id]]
-                )
-                print(f"   📤 Factura publicada correctamente.")
-            except Exception as e:
-                print(f"   ⚠️ Error al publicar factura {name}: {e}")
+        if not test:
+            if state == "posted":
+                try:
+                    models.execute_kw(
+                        db, uid, password,
+                        "account.move", "action_post",
+                        [[new_inv_id]]
+                    )
+                    print(f"   📤 Factura publicada correctamente.")
+                except Exception as e:
+                    print(f"   ⚠️ Error al publicar factura {name}: {e}")
 
-        elif state == "cancel":
-            try:
-                models.execute_kw(
-                    db, uid, password,
-                    "account.move", "button_cancel",
-                    [[new_inv_id]]
-                )
-                print(f"   🚫 Factura cancelada correctamente.")
-            except Exception as e:
-                print(f"   ⚠️ Error cancelando factura {name}: {e}")
+            elif state == "cancel":
+                try:
+                    models.execute_kw(
+                        db, uid, password,
+                        "account.move", "button_cancel",
+                        [[new_inv_id]]
+                    )
+                    print(f"   🚫 Factura cancelada correctamente.")
+                except Exception as e:
+                    print(f"   ⚠️ Error cancelando factura {name}: {e}")
 
     print("\n📊 MIGRACIÓN COMPLETADA")
     print(f"   Total creadas: {total_creadas}")
     print(f"   Ya existentes: {total_existentes}")
 
-
 # ----------------------------------------------------------------------
-# Funciones por estado
-# ----------------------------------------------------------------------
-
-def migrar_facturas_draft(tipo):
-    invoices = export_invoices_by_state("draft", tipo)
-    import_invoices_with_lines(invoices, "draft")
-
-
-def migrar_facturas_posted(tipo):
-    invoices = export_invoices_by_state("posted", tipo)
-    import_invoices_with_lines(invoices, "posted")
-
-
-# ----------------------------------------------------------------------
-# Principal
+# Funcion core
 # ----------------------------------------------------------------------
 
-def migrar_facturas(tipo):
-    migrar_facturas_draft(tipo)
-    migrar_facturas_posted(tipo)
+def migrar_facturas(termino):
+    from collections import defaultdict
+    import re
 
-#endregion
+    TERMINO_BUSQUEDA = termino
+    COMPANY_ID_ORIGEN = 2
+    AJUSTAR_TAX_TOTALS_PROVEEDOR = True
+    TOLERANCIA_IVA = 1.00
+    MIGRAR_ANALITICA = True
+    VINCULAR_PEDIDO_COMPRA = True
+    CREAR_ANALITICA_SI_NO_EXISTE = True
+    TEST = False
 
-#region FACTURACION/PAGOS
-# ---------------------------------------------------------------
-# 🔹 MIGRACIÓN DE PAGOS (Clientes y Proveedores)
-# ---------------------------------------------------------------
+    def safe_execute(models, db, uid, password, model, method, args, kwargs=None, retries=3, wait=5,
+                     timeout=90):
+        import time
+        import socket
+        kwargs = kwargs or {}
+        for intento in range(1, retries + 1):
+            try:
+                socket.setdefaulttimeout(timeout)
+                result = models.execute_kw(db, uid, password, model, method, args, kwargs)
+                socket.setdefaulttimeout(None)
+                return result
+            except Exception as e:
+                print(f"⚠️ Error ({model}.{method}) intento {intento}/{retries}: {e}")
+                if intento < retries:
+                    print(f"   ↪ Reintentando en {wait} segundos...")
+                    time.sleep(wait)
+                else:
+                    print("   ❌ Operación fallida tras varios intentos.")
+                    return None
 
-def export_payments(tipo, company_name="ALMAITANA DE LUZ, S.L."):
-    """
-    Exporta pagos (account.payment) de Odoo 16.
-    tipo puede ser: "clientes", "proveedores" o "todos".
-    """
-    import xmlrpc.client
+    def campo_existe(models, db, uid, password, model_name, field_name):
+        try:
+            res = models.execute_kw(
+                db, uid, password,
+                "ir.model.fields", "search",
+                [[("model", "=", model_name), ("name", "=", field_name)]],
+                {"limit": 1},
+            )
+            return bool(res)
+        except Exception:
+            return False
 
-    url = 'https://optimaluz.soluntec.net'
-    db_old = 'Real'
-    username = 'jcoronado@optimaluz.com'
-    password_old = 'AlAi4ever'
+    def fields_get_safe(models, db, uid, password, model_name):
+        try:
+            return models.execute_kw(
+                db, uid, password,
+                model_name, "fields_get",
+                [],
+                {"attributes": ["string", "required", "type"]},
+            ) or {}
+        except Exception:
+            return {}
 
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid_old = common.authenticate(db_old, username, password_old, {})
-    if not uid_old:
-        print("❌ No se pudo autenticar en origen.")
-        return []
+    def normalizar_texto(txt):
+        return " ".join(str(txt or "").replace("\n", " ").split()).strip().lower()
 
-    models_old = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-    print(f'🔌 Conectado a Odoo 16 como {username}')
+    def extraer_codigo_pedido(texto):
+        """
+        Extrae únicamente el formato bloque1/bloque2/bloque3.
+        Ejemplos:
+            'PC-OPT/25/02798: producto' -> 'PC-OPT/25/02798'
+            'PC-OPT / 25 / 02798 cualquier cosa' -> 'PC-OPT/25/02798'
+        """
+        if not texto:
+            return False
+        texto = str(texto)
+        m = re.search(r"([A-Za-z0-9._-]+)\s*/\s*([A-Za-z0-9._-]+)\s*/\s*([A-Za-z0-9._-]+)", texto)
+        if not m:
+            return False
+        return f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
 
-    # Buscar compañía
-    company_id_src = models_old.execute_kw(
-        db_old, uid_old, password_old,
-        'res.company', 'search',
-        [[('name', '=', company_name)]],
-        {'limit': 1}
-    )
-    company_id_src = company_id_src[0] if company_id_src else False
+    def ajustar_tax_totals_a_importe_origen(move_id, iva_origen, tolerancia_maxima=1.00):
+        from App_Connection import db, uid, password, models
+        import copy
 
-    # Campos a exportar
-    FIELDS = [
-        "name",
-        "partner_id",
-        "amount",
-        "payment_type",
-        "partner_type",
-        "journal_id",
-        "ref",
-        "state",
-        "company_id",
-        "currency_id",
-        "date"
-    ]
+        move = models.execute_kw(
+            db, uid, password,
+            "account.move", "read",
+            [[move_id]],
+            {"fields": ["name", "state", "amount_tax", "tax_totals"]},
+        )[0]
 
-    # Construir dominio según tipo
-    domain = [("company_id", "=", company_id_src)]
-    if tipo == "clientes":
-        domain += [("partner_type", "=", "customer")]
-    elif tipo == "proveedores":
-        domain += [("partner_type", "=", "supplier")]
+        if move["state"] != "draft":
+            raise Exception(f"La factura {move['name']} no está en borrador")
 
-    # Buscar pagos
-    payments = models_old.execute_kw(
-        db_old, uid_old, password_old,
-        "account.payment", "search_read",
-        [domain],
-        {"fields": FIELDS}
-    )
+        iva_origen = round(float(iva_origen or 0.0), 2)
+        iva_destino = round(float(move.get("amount_tax") or 0.0), 2)
+        diferencia = round(iva_destino - iva_origen, 2)
 
-    # 🔹 Sustituir journal_id por journal_name
-    for pay in payments:
-        journal = pay.get("journal_id")
-        if isinstance(journal, list) and len(journal) == 2:
-            pay["journal_name"] = journal[1]
+        if abs(diferencia) < 0.01:
+            print(f"   ✅ IVA ya coincide: {iva_destino}")
+            return False
+
+        if abs(diferencia) > tolerancia_maxima:
+            raise Exception(
+                f"Diferencia IVA demasiado grande en {move['name']}: "
+                f"destino={iva_destino}, origen={iva_origen}, diff={diferencia}"
+            )
+
+        tax_totals = copy.deepcopy(move.get("tax_totals") or {})
+        grupos = []
+
+        for subtotal in tax_totals.get("subtotals", []):
+            for group in subtotal.get("tax_groups", []):
+                if "tax_amount_currency" in group:
+                    grupos.append(("v18", group))
+
+        for subtotal, lineas in tax_totals.get("groups_by_subtotal", {}).items():
+            for group in lineas:
+                if "tax_group_amount" in group:
+                    grupos.append(("old", group))
+
+        if not grupos:
+            print("   ❌ tax_totals recibido:")
+            print(tax_totals)
+            raise Exception(f"No se encontraron grupos de impuesto en {move['name']}")
+
+        tipo, grupo = max(
+            grupos,
+            key=lambda x: abs(float(
+                x[1].get("tax_amount_currency")
+                or x[1].get("tax_group_amount")
+                or 0.0
+            )),
+        )
+
+        if tipo == "v18":
+            iva_grupo_antes = round(float(grupo.get("tax_amount_currency") or 0.0), 2)
+            iva_grupo_despues = round(iva_grupo_antes - diferencia, 2)
+            grupo["tax_amount_currency"] = iva_grupo_despues
+            grupo["tax_amount"] = iva_grupo_despues
         else:
-            pay["journal_name"] = None
-        del pay["journal_id"]  # eliminar el ID, ya no sirve
+            iva_grupo_antes = round(float(grupo.get("tax_group_amount") or 0.0), 2)
+            iva_grupo_despues = round(iva_grupo_antes - diferencia, 2)
+            grupo["tax_group_amount"] = iva_grupo_despues
 
-    print(f"📤 {len(payments)} pagos exportados ({tipo}).")
-    return payments
-
-def import_payments(payments):
-    """
-    Importa los pagos exportados desde Odoo 16 a Odoo 18.
-    Compatible con clientes (inbound/customer) y proveedores (outbound/supplier).
-    """
-    import xmlrpc.client
-    from App_Connection import db, uid, password, models
-
-    total_creados = 0
-    total_existentes = 0
-
-    def find_partner_id(partner_name):
-        partners = models.execute_kw(
+        models.execute_kw(
             db, uid, password,
-            "res.partner", "search_read",
-            [[("name", "=", partner_name)]],
-            {"fields": ["id"], "limit": 1}
+            "account.move", "write",
+            [[move_id], {"tax_totals": tax_totals}],
         )
-        return partners[0]["id"] if partners else None
 
-    def find_journal_id(journal_name):
-        journals_dic = {
-            "Facturas de cliente": "Customer Invoices",
-            "Vendor Bills": "Facturas de proveedores",
-            "Bank": "Banco",
-            "Operaciones varias": "Miscellaneous Operations",
-            "Efectivo": "Cash",
-            "Impuestos de base de Efectivo": "Cash Basis Taxes",
-            "Diferencia de cambio": "Exchange Difference",
-            "Valoración de inventario": "Inventory Valuation",
+        check = models.execute_kw(
+            db, uid, password,
+            "account.move", "read",
+            [[move_id]],
+            {"fields": ["amount_tax", "amount_total"]},
+        )[0]
+
+        print(
+            f"   🧮 IVA ajustado a origen: "
+            f"origen={iva_origen} | destino antes={iva_destino} | "
+            f"destino ahora={check['amount_tax']}"
+        )
+        return True
+
+    def buscar_producto_destino_por_sku(sku):
+        from App_Connection import db, uid, password, models
+        if not sku:
+            return False
+        productos = models.execute_kw(
+            db, uid, password,
+            "product.product", "search",
+            [[("default_code", "=", sku)]],
+            {"limit": 1, "context": {"active_test": False}},
+        )
+        if productos:
+            return productos[0]
+        productos = models.execute_kw(
+            db, uid, password,
+            "product.product", "search",
+            [[("default_code", "ilike", sku)]],
+            {"limit": 1, "context": {"active_test": False}},
+        )
+        return productos[0] if productos else False
+
+    def buscar_purchase_line_destino(linea):
+        from App_Connection import db, uid, password, models
+
+        data = linea.get("purchase_line_data") or {}
+        order_name = extraer_codigo_pedido(data.get("order_name"))
+        if not order_name:
+            order_name = extraer_codigo_pedido(linea.get("name"))
+        if not order_name:
+            order_name = extraer_codigo_pedido(linea.get("invoice_origin"))
+        if not order_name:
+            order_name = extraer_codigo_pedido(linea.get("ref"))
+
+        if not order_name:
+            print(
+                f"   ⚠️ No se pudo extraer pedido con formato bloque1/bloque2/bloque3 de: {linea.get('name')}")
+            return False
+
+        orders = models.execute_kw(
+            db, uid, password,
+            "purchase.order", "search",
+            [[("name", "=", order_name)]],
+            {"limit": 2, "context": {"active_test": False}},
+        )
+
+        if not orders:
+            print(f"   ⚠️ Pedido destino no encontrado: {order_name}")
+            return False
+        if len(orders) > 1:
+            print(f"   ⚠️ Pedido destino duplicado: {order_name} -> {orders}")
+            return False
+
+        order_id = orders[0]
+        pol_fields = ["id", "product_id", "name", "price_unit", "product_qty"]
+        if campo_existe(models, db, uid, password, "purchase.order.line", "analytic_distribution"):
+            pol_fields.append("analytic_distribution")
+
+        pols = models.execute_kw(
+            db, uid, password,
+            "purchase.order.line", "search_read",
+            [[("order_id", "=", order_id)]],
+            {"fields": pol_fields, "context": {"active_test": False}},
+        )
+
+        if not pols:
+            print(f"   ⚠️ Pedido destino sin líneas: {order_name}")
+            return False
+
+        sku = data.get("default_code") or linea.get("default_code")
+        price_unit = round(float(
+            data.get("price_unit") if data.get("price_unit") is not None else linea.get("price_unit") or 0.0),
+            4)
+        nombre_origen = normalizar_texto(data.get("name") or linea.get("name"))
+        nombre_sin_pedido = normalizar_texto(str(linea.get("name") or "").replace(order_name + ":", ""))
+
+        candidatos = pols
+
+        if sku:
+            product_ids = [pol["product_id"][0] for pol in pols if pol.get("product_id")]
+            products = models.execute_kw(
+                db, uid, password,
+                "product.product", "read",
+                [product_ids],
+                {"fields": ["id", "default_code"], "context": {"active_test": False}},
+            ) if product_ids else []
+            sku_map = {p["id"]: p.get("default_code") for p in products}
+            candidatos_sku = [pol for pol in pols if
+                              pol.get("product_id") and sku_map.get(pol["product_id"][0]) == sku]
+            if candidatos_sku:
+                candidatos = candidatos_sku
+
+        candidatos_precio = [
+            pol for pol in candidatos
+            if round(float(pol.get("price_unit") or 0.0), 4) == price_unit
+        ]
+        if candidatos_precio:
+            candidatos = candidatos_precio
+
+        if nombre_origen:
+            candidatos_nombre_exact = [
+                pol for pol in candidatos
+                if normalizar_texto(pol.get("name")) == nombre_origen
+            ]
+            if candidatos_nombre_exact:
+                candidatos = candidatos_nombre_exact
+            elif nombre_sin_pedido:
+                candidatos_nombre_contiene = [
+                    pol for pol in candidatos
+                    if nombre_sin_pedido and nombre_sin_pedido in normalizar_texto(pol.get("name"))
+                ]
+                if candidatos_nombre_contiene:
+                    candidatos = candidatos_nombre_contiene
+
+        if len(candidatos) == 1:
+            print(f"   🔎 Pedido detectado: {order_name} | POL destino={candidatos[0]['id']}")
+            return candidatos[0]["id"]
+
+        print(
+            f"   ⚠️ No se pudo resolver purchase.order.line único para pedido={order_name}, "
+            f"sku={sku}, precio={price_unit}, candidatos={len(candidatos)}"
+        )
+        return False
+
+    def analytic_from_purchase_line_destino(purchase_line_id):
+        from App_Connection import db, uid, password, models
+        if not purchase_line_id:
+            return False
+        if not campo_existe(models, db, uid, password, "purchase.order.line", "analytic_distribution"):
+            return False
+        pol = models.execute_kw(
+            db, uid, password,
+            "purchase.order.line", "read",
+            [[purchase_line_id]],
+            {"fields": ["analytic_distribution"], "context": {"active_test": False}},
+        )
+        if pol and pol[0].get("analytic_distribution"):
+            return pol[0]["analytic_distribution"]
+        return False
+
+    def get_default_analytic_plan_id():
+        from App_Connection import db, uid, password, models
+        if not campo_existe(models, db, uid, password, "account.analytic.account", "plan_id"):
+            return False
+        plans = models.execute_kw(
+            db, uid, password,
+            "account.analytic.plan", "search",
+            [[]],
+            {"limit": 1, "context": {"active_test": False}},
+        )
+        return plans[0] if plans else False
+
+    def crear_o_buscar_analitica_destino(data):
+        from App_Connection import db, uid, password, models
+
+        data = data or {}
+        name = data.get("name")
+        code = data.get("code")
+        if not name:
+            return False
+
+        fields_dest = fields_get_safe(models, db, uid, password, "account.analytic.account")
+        tiene_code = "code" in fields_dest
+
+        domains = []
+        if tiene_code and code:
+            domains.append([("code", "=", code)])
+        domains.append([("name", "=", name)])
+
+        for domain in domains:
+            encontrados = models.execute_kw(
+                db, uid, password,
+                "account.analytic.account", "search",
+                [domain],
+                {"limit": 2, "context": {"active_test": False}},
+            )
+            if len(encontrados) == 1:
+                return encontrados[0]
+            if len(encontrados) > 1:
+                print(f"   ⚠️ Analítica duplicada en destino domain={domain}: {encontrados}")
+                return False
+
+        if not CREAR_ANALITICA_SI_NO_EXISTE:
+            return False
+
+        vals = {"name": name}
+        if tiene_code and code:
+            vals["code"] = code
+
+        if "plan_id" in fields_dest:
+            plan_id = get_default_analytic_plan_id()
+            if plan_id:
+                vals["plan_id"] = plan_id
+            elif fields_dest["plan_id"].get("required"):
+                print(f"   ⚠️ No se puede crear analítica '{name}': falta plan_id")
+                return False
+
+        try:
+            analytic_id = models.execute_kw(
+                db, uid, password,
+                "account.analytic.account", "create",
+                [vals],
+            )
+            print(f"   🆕 Analítica creada en destino: {name} | id={analytic_id}")
+            return analytic_id
+        except Exception as e:
+            print(f"   ⚠️ Error creando analítica '{name}': {e}")
+            return False
+
+    def remapear_analytic_distribution(linea):
+        dist = linea.get("analytic_distribution") or {}
+        dist_data = linea.get("analytic_distribution_data") or {}
+        if not dist:
+            return False
+
+        nueva = {}
+        for analytic_id_origen, porcentaje in dist.items():
+            data = dist_data.get(str(analytic_id_origen)) or {}
+            analytic_id_destino = crear_o_buscar_analitica_destino(data)
+            if analytic_id_destino:
+                nueva[str(analytic_id_destino)] = porcentaje
+            else:
+                print(f"   ⚠️ No se pudo migrar/encontrar analítica origen={analytic_id_origen} data={data}")
+        return nueva or False
+
+    def export_invoices_by_state(state, termino_busqueda=TERMINO_BUSQUEDA):
+        FIELDS = [
+            "id", "name", "partner_id", "ref", "date", "invoice_date", "invoice_date_due",
+            "move_type", "state", "invoice_line_ids", "amount_untaxed", "amount_tax",
+            "amount_total", "currency_id", "payment_reference", "invoice_payment_term_id",
+            "invoice_origin", "narration", "company_id", "invoice_user_id", "journal_id",
+        ]
+
+        print(f"📤 Exportando facturas estado='{state}' término='{termino_busqueda}'...")
+
+        domain = [
+            ("move_type", "in", ["out_invoice", "in_invoice", "out_refund", "in_refund"]),
+            ("state", "=", state),
+            ("company_id", "=", COMPANY_ID_ORIGEN),
+            "|", "|", "|",
+            ("name", "ilike", termino_busqueda),
+            ("invoice_origin", "ilike", termino_busqueda),
+            ("ref", "ilike", termino_busqueda),
+            ("payment_reference", "ilike", termino_busqueda),
+        ]
+
+        invoices = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move", "search_read",
+            [domain],
+            {"fields": FIELDS, "context": {"active_test": False}},
+        )
+
+        print(f"   → {len(invoices)} facturas encontradas.")
+        if not invoices:
+            return []
+
+        journal_ids = {inv["journal_id"][0] for inv in invoices if inv.get("journal_id")}
+        journal_code_map = {}
+
+        if journal_ids:
+            journals = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.journal", "read",
+                [list(journal_ids)],
+                {"fields": ["id", "code"], "context": {"active_test": False}},
+            )
+            journal_code_map = {j["id"]: j["code"] for j in journals}
+
+        for inv in invoices:
+            inv["journal_code"] = journal_code_map.get(inv["journal_id"][0]) if inv.get("journal_id") else None
+
+        all_line_ids = []
+        for inv in invoices:
+            all_line_ids.extend(inv.get("invoice_line_ids", []))
+
+        if not all_line_ids:
+            print("⚠️ No se encontraron líneas de factura.")
+            for inv in invoices:
+                inv["lineas_detalle"] = []
+            return invoices
+
+        print(f"   → {len(all_line_ids)} líneas totales detectadas. Leyendo en bloque...")
+
+        line_fields = [
+            "id", "move_id", "name", "product_id", "quantity", "price_unit", "discount",
+            "price_subtotal", "tax_ids", "account_id", "display_type", "sequence",
+        ]
+
+        aml_fields_src = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move.line", "fields_get",
+            [],
+            {"attributes": ["string"]},
+        )
+        for field in ["purchase_line_id", "sale_line_ids", "analytic_distribution"]:
+            if field in aml_fields_src:
+                line_fields.append(field)
+
+        lines = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move.line", "read",
+            [all_line_ids],
+            {"fields": line_fields, "context": {"active_test": False}},
+        )
+
+        product_ids = {l["product_id"][0] for l in lines if l.get("product_id")}
+        sku_map = {}
+        if product_ids:
+            products = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "product.product", "read",
+                [list(product_ids)],
+                {"fields": ["id", "default_code"], "context": {"active_test": False}},
+            )
+            sku_map = {p["id"]: p.get("default_code") for p in products}
+
+        purchase_line_ids = {l["purchase_line_id"][0] for l in lines if l.get("purchase_line_id")}
+        purchase_line_map = {}
+        if purchase_line_ids:
+            pol_fields_src = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "purchase.order.line", "fields_get",
+                [],
+                {"attributes": ["string"]},
+            )
+            pol_fields = ["id", "order_id", "product_id", "name", "price_unit", "product_qty"]
+            if "analytic_distribution" in pol_fields_src:
+                pol_fields.append("analytic_distribution")
+
+            purchase_lines = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "purchase.order.line", "read",
+                [list(purchase_line_ids)],
+                {"fields": pol_fields, "context": {"active_test": False}},
+            )
+
+            product_ids_pol = {pl["product_id"][0] for pl in purchase_lines if pl.get("product_id")}
+            sku_pol_map = {}
+            if product_ids_pol:
+                products_pol = models_src.execute_kw(
+                    db_src, uid_src, password_src,
+                    "product.product", "read",
+                    [list(product_ids_pol)],
+                    {"fields": ["id", "default_code"], "context": {"active_test": False}},
+                )
+                sku_pol_map = {p["id"]: p.get("default_code") for p in products_pol}
+
+            for pl in purchase_lines:
+                order_name_raw = pl["order_id"][1] if pl.get("order_id") else None
+                purchase_line_map[pl["id"]] = {
+                    "origin_purchase_line_id": pl["id"],
+                    "order_name": extraer_codigo_pedido(order_name_raw) or order_name_raw,
+                    "product_name": pl["product_id"][1] if pl.get("product_id") else None,
+                    "default_code": sku_pol_map.get(pl["product_id"][0]) if pl.get("product_id") else None,
+                    "name": pl.get("name"),
+                    "price_unit": pl.get("price_unit"),
+                    "product_qty": pl.get("product_qty"),
+                    "analytic_distribution": pl.get(
+                        "analytic_distribution") if "analytic_distribution" in pol_fields else False,
+                }
+
+        analytic_ids = set()
+        for l in lines:
+            dist = l.get("analytic_distribution") or {}
+            for analytic_id in dist.keys():
+                try:
+                    analytic_ids.add(int(analytic_id))
+                except Exception:
+                    pass
+
+        analytic_map = {}
+        if analytic_ids:
+            analytic_fields_src = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.analytic.account", "fields_get",
+                [],
+                {"attributes": ["string"]},
+            )
+            analytic_fields = ["id", "name", "company_id"]
+            if "code" in analytic_fields_src:
+                analytic_fields.append("code")
+
+            analytics = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.analytic.account", "read",
+                [list(analytic_ids)],
+                {"fields": analytic_fields, "context": {"active_test": False}},
+            )
+            for a in analytics:
+                analytic_map[a["id"]] = {
+                    "name": a.get("name"),
+                    "code": a.get("code"),
+                    "company_name": a["company_id"][1] if a.get("company_id") else None,
+                }
+
+        inv_map = {inv["id"]: inv for inv in invoices}
+        grouped_lines = defaultdict(list)
+        for line in lines:
+            move = line.get("move_id")
+            if not move:
+                continue
+
+            inv = inv_map.get(move[0], {})
+            line["default_code"] = sku_map.get(line["product_id"][0]) if line.get("product_id") else None
+            line["invoice_origin"] = inv.get("invoice_origin")
+            line["ref"] = inv.get("ref")
+            line["move_name"] = inv.get("name")
+
+            if line.get("purchase_line_id"):
+                line["purchase_line_data"] = purchase_line_map.get(line["purchase_line_id"][0])
+            else:
+                line["purchase_line_data"] = None
+
+            dist = line.get("analytic_distribution") or {}
+            line["analytic_distribution_data"] = {
+                str(k): analytic_map.get(int(k))
+                for k in dist.keys()
+                if str(k).isdigit() and analytic_map.get(int(k))
+            }
+
+            grouped_lines[move[0]].append(line)
+
+        for inv in invoices:
+            inv["lineas_detalle"] = grouped_lines.get(inv["id"], [])
+
+        print("✅ Líneas asignadas correctamente a cada factura.")
+        return invoices
+
+    def import_invoices_with_lines(invoices, state):
+        from App_Connection import db, uid, password, models
+
+        total_creadas = 0
+        total_existentes = 0
+        total_errores = 0
+
+        tiene_analytic_distribution = campo_existe(models, db, uid, password, "account.move.line",
+                                                   "analytic_distribution")
+        tiene_purchase_line_id = campo_existe(models, db, uid, password, "account.move.line",
+                                              "purchase_line_id")
+        tiene_x_id_move = campo_existe(models, db, uid, password, "account.move", "x_id_interno")
+        tiene_x_id_line = campo_existe(models, db, uid, password, "account.move.line", "x_id_interno")
+
+        for inv in invoices:
+            name = inv.get("name") or inv.get("payment_reference") or "SIN_NOMBRE"
+            x_id_interno = inv.get("id")
+            move_type = inv.get("move_type") or "out_invoice"
+
+            print("\n" + "=" * 90)
+            print(f"🧾 Procesando factura: {name} | origen_id={x_id_interno} | tipo={move_type}")
+            print("=" * 90)
+
+            if tiene_x_id_move:
+                existing_domain = [("x_id_interno", "=", x_id_interno)]
+            else:
+                existing_domain = [("name", "=", name), ("move_type", "=", move_type)]
+
+            existing = models.execute_kw(
+                db, uid, password,
+                "account.move", "search",
+                [existing_domain],
+                {"limit": 1, "context": {"active_test": False}},
+            )
+
+            if existing:
+                total_existentes += 1
+                print(f"⚠️ Factura ya existente en destino: {name} | id={existing[0]}")
+                continue
+
+            partner_id = None
+            if inv.get("partner_id"):
+                partner_id = Utils.get_by_x_id_interno("res.partner", inv["partner_id"][0], db, uid, password,
+                                                       models)
+
+            currency_id = None
+            if inv.get("currency_id"):
+                currency_name = inv["currency_id"][1]
+                currencies = models.execute_kw(
+                    db, uid, password,
+                    "res.currency", "search_read",
+                    [[("name", "=", currency_name)]],
+                    {"fields": ["id"], "limit": 1},
+                )
+                if currencies:
+                    currency_id = currencies[0]["id"]
+
+            user_id_origen = inv["invoice_user_id"][0] if inv.get("invoice_user_id") else None
+            invoice_user_id = Utils.get_by_x_id_interno("res.users", user_id_origen, db, uid, password,
+                                                        models) if user_id_origen else False
+
+            journal_id = None
+            if inv.get("journal_code"):
+                journals = models.execute_kw(
+                    db, uid, password,
+                    "account.journal", "search_read",
+                    [[("code", "=", inv["journal_code"])]],
+                    {"fields": ["id"], "limit": 1, "context": {"active_test": False}},
+                )
+                if journals:
+                    journal_id = journals[0]["id"]
+                else:
+                    print(f"⚠️ Diario no encontrado: code={inv['journal_code']}")
+
+            vals_inv = {
+                "name": name,
+                "move_type": move_type,
+                "partner_id": partner_id,
+                "ref": inv.get("ref"),
+                "payment_reference": inv.get("payment_reference"),
+                "date": inv.get("date"),
+                "invoice_date": inv.get("invoice_date"),
+                "invoice_date_due": inv.get("invoice_date_due"),
+                "currency_id": currency_id,
+                "invoice_origin": inv.get("invoice_origin"),
+                "narration": inv.get("narration"),
+                "invoice_user_id": invoice_user_id,
+                "journal_id": journal_id,
+                "state": "draft",
+                "partner_bank_id": False,
+            }
+            if tiene_x_id_move:
+                vals_inv["x_id_interno"] = x_id_interno
+
+            try:
+                new_inv_id = models.execute_kw(db, uid, password, "account.move", "create", [vals_inv])
+                total_creadas += 1
+                print(f"✅ Factura creada: {name} | ID={new_inv_id}")
+            except Exception as e:
+                total_errores += 1
+                print(f"❌ Error creando factura {name}: {e}")
+                continue
+
+            for linea in inv.get("lineas_detalle", []):
+                display_type = linea.get("display_type")
+
+                if display_type in ("line_note", "line_section"):
+                    vals_line = {
+                        "move_id": new_inv_id,
+                        "name": linea.get("name"),
+                        "display_type": display_type,
+                        "quantity": 0.0,
+                        "sequence": linea.get("sequence"),
+                    }
+                    if tiene_x_id_line:
+                        vals_line["x_id_interno"] = linea.get("id")
+                    result = safe_execute(models, db, uid, password, "account.move.line", "create", [vals_line])
+                    if result:
+                        print(f"   📝 Nota/sección creada: {linea.get('name')}")
+                    else:
+                        print(f"   ⚠️ Error creando nota/sección: {linea.get('name')}")
+                    continue
+
+                product_id = None
+                account_id = None
+                cuenta_dest = None
+                sku = linea.get("default_code")
+
+                if sku:
+                    product_id = buscar_producto_destino_por_sku(sku)
+                    if not product_id:
+                        print(f"⚠️ Producto no encontrado: SKU={sku}")
+
+                if not product_id:
+                    if move_type in ("out_invoice", "out_refund"):
+                        accounts = models.execute_kw(db, uid, password, "account.account", "search",
+                                                     [[("account_type", "=", "income")]], {"limit": 1})
+                    else:
+                        accounts = models.execute_kw(db, uid, password, "account.account", "search",
+                                                     [[("account_type", "=", "expense")]], {"limit": 1})
+                    if accounts:
+                        account_id = accounts[0]
+                    else:
+                        raise Exception("❌ No se encontró cuenta contable por defecto")
+
+                try:
+                    account_id_origen = linea.get("account_id")
+                    if account_id_origen:
+                        acc_origen = models_src.execute_kw(
+                            db_src, uid_src, password_src,
+                            "account.account", "read",
+                            [[account_id_origen[0]]],
+                            {"fields": ["code"]},
+                        )[0]
+                        cuenta_dest = models.execute_kw(
+                            db, uid, password,
+                            "account.account", "search",
+                            [[("code", "=", acc_origen["code"])]],
+                            {"limit": 1},
+                        )
+                except Exception:
+                    cuenta_dest = None
+
+                tax_ids = []
+                if linea.get("tax_ids"):
+                    for tax_origen in linea.get("tax_ids"):
+                        tax_id = Utils.get_by_x_id_interno("account.tax", tax_origen, db, uid, password, models)
+                        if tax_id:
+                            tax_ids.append(tax_id)
+
+                vals_line = {
+                    "move_id": new_inv_id,
+                    "name": linea.get("name"),
+                    "product_id": product_id,
+                    "display_type": display_type,
+                    "quantity": linea.get("quantity") or 1.0,
+                    "price_unit": linea.get("price_unit") or 0.0,
+                    "discount": linea.get("discount") or 0.0,
+                    "tax_ids": [(6, 0, tax_ids)],
+                    "sequence": linea.get("sequence"),
+                }
+                if tiene_x_id_line:
+                    vals_line["x_id_interno"] = linea.get("id")
+
+                if cuenta_dest:
+                    vals_line["account_id"] = cuenta_dest[0]
+                elif account_id:
+                    vals_line["account_id"] = account_id
+
+                purchase_line_id_destino = False
+                if VINCULAR_PEDIDO_COMPRA and tiene_purchase_line_id:
+                    purchase_line_id_destino = buscar_purchase_line_destino(linea)
+                    if purchase_line_id_destino:
+                        vals_line["purchase_line_id"] = purchase_line_id_destino
+                        print(f"   🔗 Línea vinculada a purchase.order.line destino: {purchase_line_id_destino}")
+                    elif linea.get("purchase_line_id"):
+                        print(
+                            f"   ⚠️ No se encontró purchase.order.line destino para origen={linea.get('purchase_line_id')}")
+
+                if MIGRAR_ANALITICA and tiene_analytic_distribution:
+                    analitica = False
+                    if purchase_line_id_destino:
+                        analitica = analytic_from_purchase_line_destino(purchase_line_id_destino)
+                        if analitica:
+                            print(f"   📊 Analítica tomada de purchase.order.line destino: {analitica}")
+
+                    if not analitica and linea.get("analytic_distribution"):
+                        analitica = remapear_analytic_distribution(linea)
+                        if analitica:
+                            print(f"   📊 Analítica migrada/remapeada: {analitica}")
+
+                    if analitica:
+                        vals_line["analytic_distribution"] = analitica
+
+                result = safe_execute(
+                    models, db, uid, password,
+                    "account.move.line", "create", [vals_line],
+                    retries=3, wait=5, timeout=90,
+                )
+                if result:
+                    print(f"   ➕ Línea creada: {linea.get('name')}")
+                else:
+                    print(f"   ⚠️ No se pudo crear línea: {linea.get('name')}")
+
+            es_factura_proveedor = move_type in ("in_invoice", "in_refund")
+            es_fc1op_25 = str(name or "").startswith("FC1OP/25/")
+
+            if AJUSTAR_TAX_TOTALS_PROVEEDOR and es_factura_proveedor and es_fc1op_25:
+                try:
+                    ajustar_tax_totals_a_importe_origen(new_inv_id, inv.get("amount_tax"), TOLERANCIA_IVA)
+                except Exception as e:
+                    total_errores += 1
+                    print(f"   ❌ Error ajustando tax_totals en {name}: {e}")
+                    continue
+
+            if not TEST:
+                if state == "posted":
+                    try:
+                        models.execute_kw(db, uid, password, "account.move", "action_post", [[new_inv_id]])
+                        print("   📤 Factura publicada correctamente.")
+                    except Exception as e:
+                        total_errores += 1
+                        print(f"   ⚠️ Error al publicar factura {name}: {e}")
+                elif state == "cancel":
+                    try:
+                        models.execute_kw(db, uid, password, "account.move", "button_cancel", [[new_inv_id]])
+                        print("   🚫 Factura cancelada correctamente.")
+                    except Exception as e:
+                        total_errores += 1
+                        print(f"   ⚠️ Error cancelando factura {name}: {e}")
+
+        print("\n📊 MIGRACIÓN COMPLETADA")
+        print(f"   Total creadas: {total_creadas}")
+        print(f"   Ya existentes: {total_existentes}")
+        print(f"   Errores: {total_errores}")
+
+    def migrar_facturas_2025_proveedor_fc1op(state="posted"):
+        invoices = export_invoices_by_state(state=state, termino_busqueda=TERMINO_BUSQUEDA)
+        import_invoices_with_lines(invoices=invoices, state=state)
+        return invoices
+
+    migrar_facturas_2025_proveedor_fc1op()
+
+# migrar_facturas("FV1OP/25/")#"FC1OP/25/"  # "FV1OP/25/"
+# migrar_facturas("FC1OP/25/")# Corregir las que estan en borrador
+
+# region NOMINAS
+def obtener_nominas_origen(journal_nominas_id=85):
+    """
+    Devuelve las nóminas (account.move) en ORIGEN
+    correspondientes al diario Nóminas.
+    """
+
+    nominas = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "search_read",
+        [[
+            ("journal_id", "=", journal_nominas_id),
+            ("state", "=", "posted"),
+            #("company_id", "=", 2),
+            ("date", ">=", "2026-01-01"),
+            ("date", "<",  "2027-01-01"),
+        ]],
+        {
+            "fields": [
+                "id",
+                "name",
+                "ref",
+                "date",
+            ]
         }
+    )
 
-        if journals_dic[journal_name]: journal_name = journals_dic[journal_name]
+    return nominas
 
-        journals = models.execute_kw(
-            db, uid, password,
-            "account.journal", "search_read",
-            [[("name", "=", journal_name)]],
-            {"fields": ["id"], "limit": 1}
-        )
-        return journals[0]["id"] if journals else None
+def obtener_linea_payable_nomina_origen(nomina_move_id):
+    """
+    Devuelve la línea PAYABLE principal de una nómina en ORIGEN.
+    Es la línea equivalente a la 'línea de factura'.
+    """
 
-    def find_currency_id(currency_name):
-        currencies = models.execute_kw(
-            db, uid, password,
-            "res.currency", "search_read",
-            [[("name", "=", currency_name)]],
-            {"fields": ["id"], "limit": 1}
-        )
-        return currencies[0]["id"] if currencies else None
+    lines = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "search_read",
+        [[("move_id", "=", nomina_move_id)]],
+        {
+            "fields": [
+                "id",
+                "account_id",
+                "matched_debit_ids",
+                "matched_credit_ids",
+            ]
+        }
+    )
 
-    print("📥 Iniciando importación de pagos...")
-
-    for pay in payments:
-        name = pay.get("name") or pay.get("ref") or "SIN_REF"
-        print(f"\n💳 Procesando pago: {name}")
-
-        # Evitar duplicados
-        existing = models.execute_kw(
-            db, uid, password,
-            "account.payment", "search",
-            [[("name", "=", name)]]
-        )
-        if existing:
-            print(f"⚠️  Pago ya existente: {name}")
-            total_existentes += 1
+    for l in lines:
+        if not l.get("account_id"):
             continue
 
-        partner_id = None
-        if pay.get("partner_id"):
-            partner_name = pay["partner_id"][1]
-            partner_id = find_partner_id(partner_name)
+        acc = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.account", "read",
+            [[l["account_id"][0]]],
+            {"fields": ["account_type"]}
+        )[0]
 
-        journal_name = pay.get("journal_name")
-        journal_id=0
-        if journal_name:
-            journal_id = find_journal_id(journal_name)
+        if acc["account_type"] == "liability_payable":
+            return l
 
-        currency_id = None
-        if pay.get("currency_id"):
-            currency_name = pay["currency_id"][1]
-            currency_id = find_currency_id(currency_name)
+    return None
 
-        vals = {
-            "name": name,
-            "payment_type": pay.get("payment_type"),  # inbound / outbound
-            "partner_type": pay.get("partner_type"),  # customer / supplier
-            "partner_id": partner_id,
-            "journal_id": journal_id,
-            "amount": pay.get("amount"),
-            "memo": pay.get("ref"),
-            "currency_id": currency_id,
-            "date": pay.get("date")
+def detectar_pagos_nomina_origen(nomina_move_id):
+    """
+    Devuelve las líneas de pago conciliadas con una nómina en ORIGEN.
+    Cada elemento identifica exactamente QUÉ línea de pago hay que mapear.
+    """
+
+    resultados = []
+
+    # 1️⃣ Línea payable principal de la nómina
+    linea_nomina = obtener_linea_payable_nomina_origen(nomina_move_id)
+    if not linea_nomina:
+        return resultados
+
+    matched_ids = set(
+        linea_nomina["matched_debit_ids"] + linea_nomina["matched_credit_ids"]
+    )
+
+    if not matched_ids:
+        return resultados
+
+    # 2️⃣ Leer partial reconciles
+    partials = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.partial.reconcile", "read",
+        [list(matched_ids)],
+        {
+            "fields": [
+                "debit_move_id",
+                "credit_move_id",
+                "amount",
+            ]
         }
-        new_id = 0
-        try:
-            new_id = models.execute_kw(db, uid, password, "account.payment", "create", [vals])
-            print(f"✅ Pago creado correctamente (ID {new_id})")
-            total_creados += 1
+    )
 
-            # Si el pago estaba validado en origen, validar también en destino
-            if pay.get("state") == "posted":
-                # 1️⃣ Validar el pago
-                models.execute_kw(db, uid, password, "account.payment", "action_validate", [[new_id]])
-                print("   📤 Pago validado/publicado.")
-            elif pay.get("state") == "cancel":
-                models.execute_kw(db, uid, password, "account.payment", "action_cancel", [[new_id]])
-                print("   📤 Pago cancelado.")
+    for pr in partials:
+        # 3️⃣ Determinar cuál es la línea de pago
+        if pr["debit_move_id"][0] == linea_nomina["id"]:
+            pago_line_id = pr["credit_move_id"][0]
+        elif pr["credit_move_id"][0] == linea_nomina["id"]:
+            pago_line_id = pr["debit_move_id"][0]
+        else:
+            continue
 
-        except Exception as e:
-            # 2️⃣ Restaurar nombre original (ya que Odoo reasigna la secuencia)
-            try:
-                models.execute_kw(db, uid, password,
-                                  "account.payment", "write",
-                                  [[new_id], {"name": name}])
-            except Exception as e:
-                print(f"   ⚠️ No se pudo restaurar el nombre del pago: {e}")
-            print(f"❌ Error creando pago {name}: {e}")
+        # 4️⃣ Obtener el asiento del pago
+        pago_line = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move.line", "read",
+            [[pago_line_id]],
+            {"fields": ["move_id"]}
+        )[0]
 
-    print("\n📊 MIGRACIÓN DE PAGOS COMPLETADA")
-    print(f"   Total creados: {total_creados}")
-    print(f"   Ya existentes: {total_existentes}")
+        resultados.append({
+            "pago_move_id": pago_line["move_id"][0],
+            "pago_line_id": pago_line_id,
+            "amount": pr["amount"],
+        })
 
-# ---------------------------------------------------------------
-# 🔸 Función principal
-# ---------------------------------------------------------------
+    return resultados
 
-def migrar_pagos(tipo):
-    pagos = export_payments(tipo)
-    import_payments(pagos)
+def migrar_nomina_origen_a_destino(nomina_origen_id):
+    """
+    Migra un asiento de nómina (account.move) desde ORIGEN a DESTINO.
+    Usa x_id_interno en account.move.line para trazabilidad perfecta.
+    """
 
-# Llamada principal
-#migrar_pagos()
-#endregion
-
-# region REGION PROYECTOS
-# 🔹 PRE PROYECTOS: Cuentas analíticas
-def export_cuentas_analiticas(company_name="ALMAITANA DE LUZ, S.L."):
-    import xmlrpc.client
-
-    url = 'https://optimaluz.soluntec.net'
-    db = 'Real'
-    username = 'jcoronado@optimaluz.com'
-    password = 'AlAi4ever'
-
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid = common.authenticate(db, username, password, {})
-    if not uid:
-        print("❌ Error de autenticación")
-        return []
-
-    models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-
-    company_id = models.execute_kw(
-        db, uid, password,
-        'res.company', 'search',
-        [[('name', '=', company_name)]],
-        {'limit': 1}
+    # 1️⃣ Leer nómina ORIGEN
+    move = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "read",
+        [[nomina_origen_id]],
+        {
+            "fields": [
+                "name",
+                "ref",
+                "date",
+                "journal_id",
+                "line_ids",
+            ]
+        }
     )[0]
 
-    accounts = models.execute_kw(
+    # 2️⃣ Mapear diario Nóminas en DESTINO (por x_id_interno)
+    journal_dest_ids = models.execute_kw(
         db, uid, password,
-        'account.analytic.account', 'search_read',
-        [[('company_id', '=', company_id)]],
+        "account.journal", "search",
+        [[("x_id_interno", "=", move["journal_id"][0])]],
+        {"limit": 1}
+    )
+
+    if not journal_dest_ids:
+        raise Exception(
+            f"Diario Nóminas no encontrado en destino "
+            f"(x_id_interno={move['journal_id'][0]})"
+        )
+
+    journal_dest_id = journal_dest_ids[0]
+
+    # 3️⃣ Crear account.move DESTINO
+    nomina_dest_id = models.execute_kw(
+        db, uid, password,
+        "account.move", "create",
+        [{
+            "name": move["name"],
+            "ref": move["ref"],
+            "date": move["date"],
+            "journal_id": journal_dest_id,
+            "move_type": "entry",
+        }]
+    )
+
+    # 4️⃣ Leer líneas ORIGEN
+    lines = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "read",
+        [move["line_ids"]],
         {
-            'fields': [
-                'name',
-                'code',
-                'active',
-                'partner_id',
-            ],
-            'order': 'name'
+            "fields": [
+                "id",
+                "name",
+                "account_id",
+                "debit",
+                "credit",
+                "partner_id",
+            ]
         }
     )
 
-    print(f"📤 Exportadas {len(accounts)} cuentas analíticas")
-    return accounts
+    # 5️⃣ Crear líneas DESTINO (1 a 1)
+    for l in lines:
+        if not l.get("account_id"):
+            continue
 
-def import_cuentas_analiticas(accounts):
-    from App_Connection import db, uid, password, models
-
-    creadas = 0
-    actualizadas = 0
-
-    # 🔹 company_id fijo
-    company = models.execute_kw(
-        db, uid, password,
-        'res.company', 'search_read',
-        [[('name', '=', "ALMAITANA DE LUZ, S.L.")]],
-        {'fields': ['id'], 'limit': 1}
-    )
-    if not company:
-        print("❌ Compañía no encontrada")
-        return
-    company_id = company[0]['id']
-
-    PLAN_ID = 1  # definido por ti
-
-    for acc in accounts:
-        name = acc['name']
-        code = acc.get('code')
-
-        print(f"\n📊 Cuenta analítica: {name}")
-
-        # Buscar por name + company
-        existing = models.execute_kw(
-            db, uid, password,
-            'account.analytic.account', 'search',
-            [[('name', '=', name), ('company_id', '=', company_id)]],
-            {'limit': 1}
+        account_dest_id = mapear_cuenta_origen_destino(
+            l["account_id"][0]
         )
 
-        partner_id = None
-        if acc.get('partner_id'):
-            partner_name = acc['partner_id'][1]
-            partner = models.execute_kw(
-                db, uid, password,
-                'res.partner', 'search_read',
-                [[('name', '=', partner_name)]],
-                {'fields': ['id'], 'limit': 1}
-            )
-            if partner:
-                partner_id = partner[0]['id']
-
         vals = {
-            'name': name,
-            'code': code,
-            'active': acc.get('active', True),
-            'partner_id': partner_id,
-            'plan_id': PLAN_ID,
-            'company_id': company_id,
+            "move_id": nomina_dest_id,
+            "name": l["name"],
+            "account_id": account_dest_id,
+            "debit": l["debit"],
+            "credit": l["credit"],
+            "x_id_interno": l["id"],
+        }
+
+        if l.get("partner_id"):
+            vals["partner_id"] = Utils.get_by_x_id_interno(
+                "res.partner",
+                l["partner_id"][0],
+                db,
+                uid,
+                password,
+                models,
+            )
+
+        models.execute_kw(
+            db,
+            uid,
+            password,
+            "account.move.line",
+            "create",
+            [vals],
+            {"context": {"check_move_validity": False}},
+        )
+
+    # 6️⃣ Publicar nómina en DESTINO
+    models.execute_kw(
+        db,
+        uid,
+        password,
+        "account.move",
+        "action_post",
+        [[nomina_dest_id]],
+        {"context": {"check_move_validity": False}},
+    )
+
+    return nomina_dest_id
+
+def migrar_y_conciliar_una_nomina(nomina_origen):
+    """
+    Orquesta la migración y conciliación de UNA nómina.
+    Reutiliza el motor de conciliación de facturas.
+    """
+
+    nomina_name = nomina_origen["name"]
+    nomina_origen_id = nomina_origen["id"]
+
+    print(f"\n🧾 Procesando nómina {nomina_name}")
+
+    # 1️⃣ Buscar nómina en DESTINO (por name)
+    nomina_dest_ids = models.execute_kw(
+        db, uid, password,
+        "account.move", "search",
+        [[("name", "=", nomina_name)]],
+        {"limit": 1}
+    )
+
+    if nomina_dest_ids:
+        nomina_dest_id = nomina_dest_ids[0]
+        print(f"ℹ️ Nómina ya existe en destino (ID {nomina_dest_id})")
+    else:
+        # 2️⃣ Migrar nómina
+        nomina_dest_id = migrar_nomina_origen_a_destino(nomina_origen_id)
+        print(f"✅ Nómina migrada a destino (ID {nomina_dest_id})")
+
+    # 3️⃣ Detectar pagos conciliados en ORIGEN
+    pagos_origen = detectar_pagos_nomina_origen(nomina_origen_id)
+
+    if not pagos_origen:
+        print("ℹ️ Nómina sin pagos conciliados en origen")
+        return
+
+    # 4️⃣ Preparar pagos DESTINO (mapping exacto por x_id_interno)
+    pagos_dest = defaultdict(list)
+
+    for p in pagos_origen:
+        pago_origen_move_id = p["pago_move_id"]
+        pago_origen_line_id = p["pago_line_id"]
+
+        # 4.1 Buscar pago en DESTINO (por name)
+        pago_move = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move", "read",
+            [[pago_origen_move_id]],
+            {"fields": ["name"]}
+        )[0]
+
+        pago_name = pago_move["name"]
+
+        pago_dest_ids = models.execute_kw(
+            db, uid, password,
+            "account.move", "search",
+            [[("name", "=", pago_name)]],
+            {"limit": 1}
+        )
+
+        if pago_dest_ids:
+            pago_dest_id = pago_dest_ids[0]
+        else: pago_dest_id = migrar_pago_origen_a_destino(pago_origen_move_id)
+
+        # 4.3 Guardar línea ORIGEN exacta (se resolverá por x_id_interno)
+        pagos_dest[pago_dest_id].append(pago_origen_line_id)
+
+    # 5️⃣ Conciliar usando el MISMO motor que facturas
+    conciliar_factura_con_pagos_destino(
+        nomina_dest_id,
+        pagos_dest,
+        nomina_name,
+        payment_state="paid"
+    )
+
+    print(f"🔗 Nómina conciliada: {nomina_name}")
+
+# nomina = { "id": 251556, "name": "NOMIN/2025/12/0012", }; migrar_y_conciliar_una_nomina(nomina)#Un caso
+#nominas = obtener_nominas_origen()#Todos
+#for n in nominas: migrar_y_conciliar_una_nomina(n)
+
+# endregion
+
+#region ANALISIS
+def analizar_asientos_faltantes():
+    """
+    Analiza los asientos que faltan en DESTINO
+    clasificándolos por journal y tipo.
+    """
+
+    # Buscar todos en origen
+    origen_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "search",
+        [[("state", "=", "posted"), ("company_id", "=", 2),
+          ("date", ">=", "2025-01-01"),
+          ("date", "<", "2027-01-01"), ]]
+    )
+
+    origen_moves = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "read",
+        [origen_ids],
+        {"fields": ["name", "journal_id", "date", "move_type"]}
+    )
+
+    destino_ids = models.execute_kw(
+        db, uid, password,
+        "account.move", "search",
+        [[("state", "=", "posted")]]
+    )
+
+    destino_moves = models.execute_kw(
+        db, uid, password,
+        "account.move", "read",
+        [destino_ids],
+        {"fields": ["name"]}
+    )
+
+    destino_names = {m["name"] for m in destino_moves}
+
+    faltantes = [m for m in origen_moves if m["name"] not in destino_names]
+
+    print(f"\n🔴 Total faltantes: {len(faltantes)}")
+
+    # Clasificar por journal
+    resumen = {}
+
+    for m in faltantes:
+        journal = m["journal_id"][1] if m["journal_id"] else "SIN JOURNAL"
+
+        if journal not in resumen:
+            resumen[journal] = 0
+
+        resumen[journal] += 1
+
+    print("\n📊 Faltantes por journal:")
+    for journal, cantidad in sorted(resumen.items(), key=lambda x: x[1], reverse=True):
+        print(f"   {journal}: {cantidad}")
+
+
+def export_asientos_banco_faltantes():
+    """
+    Exporta asientos de banco/caja que existen en ORIGEN
+    pero no en DESTINO.
+    """
+
+    print("🏦 Exportando asientos de banco/caja faltantes")
+
+    # -------------------------------------------------
+    # 1️⃣ Domain base
+    # -------------------------------------------------
+    domain_src = [
+        ("state", "=", "posted"),  # draft#posted
+        ("company_id", "=", 2),
+        ("date", ">=", "2025-01-01"),
+        ("date", "<", "2027-01-01"),
+        # "|",
+        # ("journal_id.type", "in", ["bank", "cash"]),
+        # ("journal_id.code", "=", "VAR"),
+    ]
+
+    domain_dest = [
+        ("state", "=", "posted"),
+        ("date", ">=", "2025-01-01"),
+        ("date", "<", "2027-01-01"),
+        # "|",
+        # ("journal_id.type", "in", ["bank", "cash"]),
+        # ("journal_id.code", "=", "VAR"),
+    ]
+
+    # -------------------------------------------------
+    # 2️⃣ Obtener ORIGEN
+    # -------------------------------------------------
+    origen_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "search",
+        [domain_src]
+    )
+
+    if not origen_ids:
+        print("ℹ️ No hay asientos de banco en ORIGEN")
+        return []
+
+    origen_moves = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "read",
+        [origen_ids],
+        {
+            "fields": [
+                "id",
+                "name",
+                "date",
+                "journal_id",
+                "ref",
+                "company_id",
+                "partner_id",
+                "state",
+            ]
+        }
+    )
+
+    print(f"📄 Asientos banco en ORIGEN: {len(origen_moves)}")
+
+    # -------------------------------------------------
+    # 3️⃣ Obtener DESTINO para comparar
+    # -------------------------------------------------
+    destino_ids = models.execute_kw(
+        db, uid, password,
+        "account.move", "search",
+        [domain_dest]
+    )
+
+    destino_moves = models.execute_kw(
+        db, uid, password,
+        "account.move", "read",
+        [destino_ids],
+        {"fields": ["name"]}
+    )
+
+    destino_names = {m["name"] for m in destino_moves}
+
+    # -------------------------------------------------
+    # 4️⃣ Filtrar faltantes
+    # -------------------------------------------------
+    faltantes = [m for m in origen_moves if m["name"] not in destino_names]
+
+    print(f"❗ Asientos banco faltantes en DESTINO: {len(faltantes)}")
+
+    resultado = []
+
+    # -------------------------------------------------
+    # 5️⃣ Exportar cada asiento con sus líneas
+    # -------------------------------------------------
+    for move in faltantes:  # faltantes_test:#
+        move_id = move["id"]
+
+        line_ids = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move.line", "search",
+            [[("move_id", "=", move_id)]]
+        )
+
+        lines = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move.line", "read",
+            [line_ids],
+            {
+                "fields": [
+                    "id",
+                    "account_id",
+                    "partner_id",
+                    "name",
+                    "debit",
+                    "credit",
+                    "currency_id",
+                    "amount_currency",
+                ]
+            }
+        )
+
+        resultado.append({
+            "move": move,
+            "lines": lines,
+        })
+
+    print("✅ Exportación completada")
+
+    return resultado
+
+
+def import_asientos_banco_faltantes(data):
+    """
+    Importa asientos de banco/caja faltantes en DESTINO.
+    No realiza conciliación.
+    Crea el asiento con todas las líneas juntas para evitar
+    errores de desbalanceo.
+    """
+
+    print("📥 Importando asientos banco faltantes")
+
+    for item in data:
+        move_src = item["move"]
+        lines_src = item["lines"]
+
+        test = False  # En la segunda ejecucion: True y comentar la linea de abajo
+        if move_src['name'] == "CB472/22/1140" or move_src['name'] == "VAR/25/0120" or move_src[
+            'name'] == "VAR/24/0127": continue
+
+        print(f"\n🏦 Importando asiento {move_src['name']}")
+
+        # -------------------------------------------------
+        # 1️⃣ Mapear JOURNAL por código
+        # -------------------------------------------------
+        journal_src_id = move_src["journal_id"][0]
+
+        journal_src = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.journal", "read",
+            [[journal_src_id]],
+            {"fields": ["code"]}
+        )[0]
+
+        journal_code = journal_src["code"]
+
+        journal_dest_ids = models.execute_kw(
+            db, uid, password,
+            "account.journal", "search",
+            [[("code", "=", journal_code)]],
+            {"limit": 1}
+        )
+
+        if not journal_dest_ids:
+            continue  # raise Exception(f"❌ Journal no encontrado en destino: {journal_code}")
+
+        journal_dest_id = journal_dest_ids[0]
+
+        # -------------------------------------------------
+        # 2️⃣ Preparar TODAS las líneas antes de crear el move
+        # -------------------------------------------------
+        line_vals = []
+        total_debit = 0.0
+        total_credit = 0.0
+
+        for line in lines_src:
+
+            # Mapear cuenta por código
+            if not line["account_id"]: continue
+            account_src_id = line["account_id"][0]
+
+            account_src = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.account", "read",
+                [[account_src_id]],
+                {"fields": ["code"]}
+            )[0]
+
+            account_code = account_src["code"]
+
+            account_dest_ids = models.execute_kw(
+                db, uid, password,
+                "account.account", "search",
+                [[("code", "=", account_code)]],
+                {"limit": 1}
+            )
+
+            if not account_dest_ids:
+                raise Exception(f"❌ Cuenta no encontrada: {account_code}")
+
+            account_dest_id = account_dest_ids[0]
+
+            # Mapear partner si existe
+            partner_dest_id = False
+            if line["partner_id"]:
+                partner_dest_id = Utils.get_by_x_id_interno("res.partner", line["partner_id"][0], db, uid, password,
+                                                            models)
+
+            debit = line["debit"] or 0.0
+            credit = line["credit"] or 0.0
+
+            total_debit += debit
+            total_credit += credit
+
+            line_vals.append((0, 0, {
+                "x_id_interno": line["id"],
+                "account_id": account_dest_id,
+                "partner_id": partner_dest_id,
+                "name": line["name"] or "/",
+                "debit": debit if not test else 0,
+                "credit": credit if not test else 0,
+                "currency_id": line["currency_id"][0] if line["currency_id"] else False,
+                "amount_currency": line["amount_currency"],
+            }))
+
+        # -------------------------------------------------
+        # 4️⃣ Crear MOVE con todas las líneas juntas
+        # -------------------------------------------------
+        # Mapear partner si existe
+        partner_dest_id = False
+        if move_src["partner_id"]:
+            partner_dest_id = Utils.get_by_x_id_interno("res.partner", move_src["partner_id"][0], db, uid, password,
+                                                        models)
+
+        move_dest_id = models.execute_kw(
+            db, uid, password,
+            "account.move", "create",
+            [{
+                "name": move_src["name"],
+                "partner_id": partner_dest_id,
+                "date": move_src["date"],
+                "journal_id": journal_dest_id,
+                "ref": move_src["ref"],
+                "line_ids": line_vals,
+            }]
+        )
+
+        # -------------------------------------------------
+        # 5️⃣ Postear asiento
+        # -------------------------------------------------
+        if not test:
+            models.execute_kw(
+                db, uid, password,
+                "account.move", "action_post",
+                [[move_dest_id]]
+            )
+
+        print("✅ Importado y posteado")
+
+    print("\n🎉 Todos los asientos banco importados")
+
+
+def actualizar_x_id_interno_lineas_payable_receivable_facturas(
+        company_src_id=2,
+        company_dest_id=1,
+        fecha_inicio="2025-01-01",
+        fecha_fin="2027-01-01",
+        aplicar=False,
+):
+    """
+    Rellena x_id_interno en líneas conciliables de facturas destino
+    comparándolas con las líneas conciliables de la factura origen.
+
+    Pensada para casos donde una factura tiene varias líneas payable/receivable,
+    por ejemplo:
+
+        400000 Proveedores 185,40
+        400000 Proveedores 185,39
+
+    En esos casos NO basta con account_code. Se usa:
+        - account_code
+        - signo
+        - debit
+        - credit
+        - balance
+
+    aplicar=False -> simulación
+    aplicar=True  -> escribe x_id_interno
+    """
+
+    from collections import defaultdict
+
+    print("🔄 Actualizando x_id_interno en líneas payable/receivable de facturas")
+    print(f"📅 Rango: {fecha_inicio} → {fecha_fin}")
+    print(f"🧪 aplicar={aplicar}")
+
+    MOVE_TYPES = [
+        "out_invoice",
+        "in_invoice",
+        "out_refund",
+        "in_refund",
+    ]
+
+    account_code_cache_src = {}
+    account_code_cache_dest = {}
+
+    def get_account_code_src(account_id):
+        if account_id not in account_code_cache_src:
+            acc = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.account", "read",
+                [[account_id]],
+                {"fields": ["code"]}
+            )[0]
+            account_code_cache_src[account_id] = acc.get("code")
+        return account_code_cache_src[account_id]
+
+    def get_account_code_dest(account_id):
+        if account_id not in account_code_cache_dest:
+            acc = models.execute_kw(
+                db, uid, password,
+                "account.account", "read",
+                [[account_id]],
+                {"fields": ["code"]}
+            )[0]
+            account_code_cache_dest[account_id] = acc.get("code")
+        return account_code_cache_dest[account_id]
+
+    def round_money(v):
+        return round(float(v or 0.0), 2)
+
+    def line_key(line, account_code):
+        debit = round_money(line.get("debit"))
+        credit = round_money(line.get("credit"))
+        balance = round_money(line.get("balance"))
+
+        if balance > 0:
+            sign = "debit"
+        elif balance < 0:
+            sign = "credit"
+        else:
+            sign = "zero"
+
+        return (
+            account_code,
+            sign,
+            abs(balance),
+            debit,
+            credit,
+        )
+
+    def simple_key(line, account_code):
+        balance = round_money(line.get("balance"))
+
+        if balance > 0:
+            sign = "debit"
+        elif balance < 0:
+            sign = "credit"
+        else:
+            sign = "zero"
+
+        return (
+            account_code,
+            sign,
+            abs(balance),
+        )
+
+    # -------------------------------------------------
+    # 1️⃣ Buscar facturas destino del periodo
+    # -------------------------------------------------
+    move_dest_ids = models.execute_kw(
+        db, uid, password,
+        "account.move", "search",
+        [[
+            ("company_id", "=", company_dest_id),
+            ("move_type", "in", MOVE_TYPES),
+            ("date", ">=", fecha_inicio),
+            ("date", "<", fecha_fin),
+            ("x_id_interno", "!=", False),
+        ]],
+        {"order": "date,id"}
+    )
+
+    print(f"📊 Facturas destino detectadas: {len(move_dest_ids)}")
+
+    if not move_dest_ids:
+        return {
+            "actualizados": 0,
+            "simulados": 0,
+            "errores": 0,
+            "ambiguos": 0,
+        }
+
+    moves_dest = models.execute_kw(
+        db, uid, password,
+        "account.move", "read",
+        [move_dest_ids],
+        {
+            "fields": [
+                "id",
+                "name",
+                "x_id_interno",
+                "date",
+                "move_type",
+            ]
+        }
+    )
+
+    actualizados = 0
+    simulados = 0
+    errores = 0
+    ambiguos = 0
+
+    # -------------------------------------------------
+    # 2️⃣ Procesar factura por factura
+    # -------------------------------------------------
+    for move_dest in moves_dest:
+        move_dest_id = move_dest["id"]
+        move_name = move_dest.get("name")
+        move_src_id = move_dest.get("x_id_interno")
+
+        if not move_src_id:
+            continue
+
+        if isinstance(move_src_id, list):
+            move_src_id = move_src_id[0]
+
+        print("\n" + "-" * 80)
+        print(f"🧾 Factura destino: {move_name} | dest_id={move_dest_id} | src_id={move_src_id}")
+
+        # -------------------------------------------------
+        # 3️⃣ Leer factura origen
+        # -------------------------------------------------
+        move_src = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move", "read",
+            [[move_src_id]],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "company_id",
+                    "move_type",
+                ]
+            }
+        )
+
+        if not move_src:
+            print(f"⚠️ No existe factura origen id={move_src_id}")
+            errores += 1
+            continue
+
+        move_src = move_src[0]
+
+        if move_src.get("company_id") and move_src["company_id"][0] != company_src_id:
+            print(
+                f"⚠️ Company origen distinta: "
+                f"{move_src.get('company_id')} esperado={company_src_id}"
+            )
+            errores += 1
+            continue
+
+        # -------------------------------------------------
+        # 4️⃣ Líneas conciliables origen
+        # -------------------------------------------------
+        lineas_src = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move.line", "search_read",
+            [[
+                ("move_id", "=", move_src_id),
+                ("account_id.reconcile", "=", True),
+            ]],
+            {
+                "fields": [
+                    "id",
+                    "account_id",
+                    "debit",
+                    "credit",
+                    "balance",
+                    "amount_currency",
+                    "name",
+                ],
+                "order": "id"
+            }
+        )
+
+        if not lineas_src:
+            print("⚠️ No hay líneas conciliables en origen")
+            continue
+
+        # -------------------------------------------------
+        # 5️⃣ Líneas conciliables destino
+        # -------------------------------------------------
+        lineas_dest = models.execute_kw(
+            db, uid, password,
+            "account.move.line", "search_read",
+            [[
+                ("move_id", "=", move_dest_id),
+                ("account_id.reconcile", "=", True),
+            ]],
+            {
+                "fields": [
+                    "id",
+                    "account_id",
+                    "debit",
+                    "credit",
+                    "balance",
+                    "amount_currency",
+                    "x_id_interno",
+                    "name",
+                ],
+                "order": "id"
+            }
+        )
+
+        if not lineas_dest:
+            print("⚠️ No hay líneas conciliables en destino")
+            continue
+
+        # Líneas destino pendientes de x_id_interno
+        pendientes_dest = []
+        ya_asignados_src = set()
+
+        for ld in lineas_dest:
+            xid = ld.get("x_id_interno")
+
+            if xid:
+                ya_asignados_src.add(xid)
+            else:
+                pendientes_dest.append(ld)
+
+        if not pendientes_dest:
+            print("✅ Todas las líneas destino ya tienen x_id_interno")
+            continue
+
+        lineas_src_disponibles = [
+            ls for ls in lineas_src
+            if ls["id"] not in ya_asignados_src
+        ]
+
+        print(
+            f"   Líneas origen conciliables: {len(lineas_src)} | "
+            f"disponibles: {len(lineas_src_disponibles)} | "
+            f"destino pendientes: {len(pendientes_dest)}"
+        )
+
+        if len(lineas_src_disponibles) != len(pendientes_dest):
+            print(
+                f"⚠️ Cantidad distinta origen/destino. "
+                f"Origen disponibles={len(lineas_src_disponibles)}, "
+                f"Destino pendientes={len(pendientes_dest)}"
+            )
+
+        # -------------------------------------------------
+        # 6️⃣ Enriquecer con account_code y keys
+        # -------------------------------------------------
+        src_items = []
+        for ls in lineas_src_disponibles:
+            if not ls.get("account_id"):
+                continue
+
+            code = get_account_code_src(ls["account_id"][0])
+            src_items.append({
+                "line": ls,
+                "code": code,
+                "key": line_key(ls, code),
+                "simple_key": simple_key(ls, code),
+            })
+
+        dest_items = []
+        for ld in pendientes_dest:
+            if not ld.get("account_id"):
+                continue
+
+            code = get_account_code_dest(ld["account_id"][0])
+            dest_items.append({
+                "line": ld,
+                "code": code,
+                "key": line_key(ld, code),
+                "simple_key": simple_key(ld, code),
+            })
+
+        asignaciones = []
+        src_usadas = set()
+        dest_usadas = set()
+
+        # -------------------------------------------------
+        # 7️⃣ Primera pasada: match exacto
+        # -------------------------------------------------
+        src_por_key = defaultdict(list)
+        dest_por_key = defaultdict(list)
+
+        for item in src_items:
+            src_por_key[item["key"]].append(item)
+
+        for item in dest_items:
+            dest_por_key[item["key"]].append(item)
+
+        for key, dests in dest_por_key.items():
+            srcs = src_por_key.get(key, [])
+
+            if not srcs:
+                continue
+
+            if len(srcs) == len(dests):
+                srcs_sorted = sorted(srcs, key=lambda x: x["line"]["id"])
+                dests_sorted = sorted(dests, key=lambda x: x["line"]["id"])
+
+                for src_item, dest_item in zip(srcs_sorted, dests_sorted):
+                    src_id = src_item["line"]["id"]
+                    dest_id = dest_item["line"]["id"]
+
+                    if src_id in src_usadas or dest_id in dest_usadas:
+                        continue
+
+                    asignaciones.append((dest_id, src_id, "match_exacto"))
+                    src_usadas.add(src_id)
+                    dest_usadas.add(dest_id)
+
+            else:
+                print(
+                    f"⚠️ Key ambigua en {move_name}: {key} | "
+                    f"src={len(srcs)} dest={len(dests)}"
+                )
+                ambiguos += 1
+
+        # -------------------------------------------------
+        # 8️⃣ Segunda pasada: simple_key para restantes
+        # -------------------------------------------------
+        src_restantes = [
+            item for item in src_items
+            if item["line"]["id"] not in src_usadas
+        ]
+
+        dest_restantes = [
+            item for item in dest_items
+            if item["line"]["id"] not in dest_usadas
+        ]
+
+        src_por_simple = defaultdict(list)
+        dest_por_simple = defaultdict(list)
+
+        for item in src_restantes:
+            src_por_simple[item["simple_key"]].append(item)
+
+        for item in dest_restantes:
+            dest_por_simple[item["simple_key"]].append(item)
+
+        for key, dests in dest_por_simple.items():
+            srcs = src_por_simple.get(key, [])
+
+            if not srcs:
+                continue
+
+            if len(srcs) == len(dests):
+                srcs_sorted = sorted(srcs, key=lambda x: x["line"]["id"])
+                dests_sorted = sorted(dests, key=lambda x: x["line"]["id"])
+
+                for src_item, dest_item in zip(srcs_sorted, dests_sorted):
+                    src_id = src_item["line"]["id"]
+                    dest_id = dest_item["line"]["id"]
+
+                    if src_id in src_usadas or dest_id in dest_usadas:
+                        continue
+
+                    asignaciones.append((dest_id, src_id, "match_simple"))
+                    src_usadas.add(src_id)
+                    dest_usadas.add(dest_id)
+            else:
+                print(
+                    f"⚠️ Simple key ambigua en {move_name}: {key} | "
+                    f"src={len(srcs)} dest={len(dests)}"
+                )
+                ambiguos += 1
+
+        # -------------------------------------------------
+        # 9️⃣ Tercera pasada: fallback ordenado si número coincide
+        # -------------------------------------------------
+        src_restantes = [
+            item for item in src_items
+            if item["line"]["id"] not in src_usadas
+        ]
+
+        dest_restantes = [
+            item for item in dest_items
+            if item["line"]["id"] not in dest_usadas
+        ]
+
+        if src_restantes or dest_restantes:
+            if len(src_restantes) == len(dest_restantes):
+                print(
+                    f"   🔁 Fallback ordenado en {move_name}: "
+                    f"{len(src_restantes)} líneas"
+                )
+
+                src_sorted = sorted(
+                    src_restantes,
+                    key=lambda x: (
+                        x["code"],
+                        round_money(x["line"].get("balance")),
+                        x["line"]["id"],
+                    )
+                )
+
+                dest_sorted = sorted(
+                    dest_restantes,
+                    key=lambda x: (
+                        x["code"],
+                        round_money(x["line"].get("balance")),
+                        x["line"]["id"],
+                    )
+                )
+
+                for src_item, dest_item in zip(src_sorted, dest_sorted):
+                    src_id = src_item["line"]["id"]
+                    dest_id = dest_item["line"]["id"]
+
+                    asignaciones.append((dest_id, src_id, "fallback_ordenado"))
+                    src_usadas.add(src_id)
+                    dest_usadas.add(dest_id)
+            else:
+                print(
+                    f"❌ No se puede asignar {move_name}: "
+                    f"src_restantes={len(src_restantes)} "
+                    f"dest_restantes={len(dest_restantes)}"
+                )
+                errores += 1
+                continue
+
+        # -------------------------------------------------
+        # 🔟 Aplicar escrituras
+        # -------------------------------------------------
+        if not asignaciones:
+            print("ℹ️ No hay asignaciones para aplicar")
+            continue
+
+        for dest_line_id, src_line_id, metodo in asignaciones:
+            print(
+                f"   {'🧪' if not aplicar else '✅'} "
+                f"{metodo}: dest_line={dest_line_id} → src_line={src_line_id}"
+            )
+
+            if aplicar:
+                models.execute_kw(
+                    db, uid, password,
+                    "account.move.line", "write",
+                    [[dest_line_id], {
+                        "x_id_interno": src_line_id
+                    }]
+                )
+                actualizados += 1
+            else:
+                simulados += 1
+
+    print("\n" + "=" * 80)
+    print("🏁 Proceso finalizado")
+    print(f"✅ Actualizados: {actualizados}")
+    print(f"🧪 Simulados: {simulados}")
+    print(f"⚠️ Ambiguos: {ambiguos}")
+    print(f"❌ Errores: {errores}")
+
+    return {
+        "actualizados": actualizados,
+        "simulados": simulados,
+        "ambiguos": ambiguos,
+        "errores": errores,
+    }
+#endregion
+
+#endregion
+
+# region REGION CONTABILIDAD
+from datetime import datetime
+
+LOG_FILE = "errores_conciliacion.txt"
+
+def log_error(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {msg}\n")
+
+def migrar_adjuntos_factura(origen_invoice_id, destino_invoice_id, lote=5):
+    """
+    Migra adjuntos PDF de una factura desde Odoo ORIGEN → DESTINO.
+
+    origen_invoice_id  : ID de factura en origen (account.move)
+    destino_invoice_id : ID de factura en destino (account.move)
+    lote               : cantidad de adjuntos por lote
+    """
+    import math
+    import time
+
+    print(f"\n=== MIGRANDO PDFs FACTURA {origen_invoice_id} → {destino_invoice_id} ===")
+
+     # --------------------------------------------------
+    # 🔹 BUSCAR ADJUNTOS PDF EN ORIGEN
+    # --------------------------------------------------
+    attach_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        'ir.attachment', 'search',
+        [[
+            ('res_model', '=', 'account.move'),
+            ('res_id', '=', origen_invoice_id),
+            ('mimetype', '=', 'application/pdf')
+        ]]
+    )
+
+    total_adjuntos = len(attach_ids)
+    print(f"📎 PDFs encontrados en origen: {total_adjuntos}")
+
+    if total_adjuntos == 0:
+        print("No hay PDFs que migrar.")
+        return
+
+    num_lotes = math.ceil(total_adjuntos / lote)
+
+    # --------------------------------------------------
+    # 🔹 MIGRAR POR LOTES
+    # --------------------------------------------------
+    for i in range(num_lotes):
+        inicio = i * lote
+        fin = inicio + lote
+        lote_ids = attach_ids[inicio:fin]
+
+        print(f"\nProcesando lote {i + 1}/{num_lotes} ({len(lote_ids)} PDFs)...")
+
+        adjuntos = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            'ir.attachment', 'read',
+            [lote_ids, ['name', 'datas', 'mimetype']]
+        )
+
+        for att in adjuntos:
+            try:
+                existing = models.execute_kw(
+                    db, uid, password,
+                    'ir.attachment', 'search',
+                    [[
+                        ('res_model', '=', 'account.move'),
+                        ('res_id', '=', destino_invoice_id),
+                        ('name', '=', att['name']),
+                    ]],
+                    {'limit': 1}
+                )
+
+                if existing:
+                    continue
+
+                models.execute_kw(
+                    db, uid, password,
+                    'ir.attachment', 'create',
+                    [{
+                        'name': att['name'],
+                        'datas': att['datas'],
+                        'mimetype': att['mimetype'],
+                        'res_model': 'account.move',
+                        'res_id': destino_invoice_id,
+                    }]
+                )
+            except Exception as e:
+                print(f"⚠️ Error importando PDF '{att['name']}': {e}")
+
+        print(f"✓ Lote {i + 1}/{num_lotes} completado.")
+
+    print("\n=== MIGRACIÓN DE PDFs DE FACTURA COMPLETADA ===")
+
+def crear_partial_reconcile_exacto(linea_factura_id, linea_pago_id, amount):
+    """
+    Crea una conciliación parcial exacta entre dos account.move.line
+    usando el importe detectado en origen.
+    """
+
+    lines = models.execute_kw(
+        db, uid, password,
+        "account.move.line", "read",
+        [[linea_factura_id, linea_pago_id]],
+        {
+            "fields": [
+                "id",
+                "debit",
+                "credit",
+                "balance",
+                "amount_currency",
+                "amount_residual",
+                "amount_residual_currency",
+                "currency_id",
+                "company_currency_id",
+                "reconciled",
+                "account_id",
+                "partner_id",
+            ]
+        }
+    )
+
+    l1, l2 = lines
+
+    if l1["account_id"][0] != l2["account_id"][0]:
+        raise Exception(
+            f"Las líneas no son de la misma cuenta: "
+            f"{l1['account_id']} vs {l2['account_id']}"
+        )
+
+    if l1["reconciled"]:
+        print(f"⏭️ Línea factura {linea_factura_id} ya conciliada")
+        return
+
+    if l2["reconciled"]:
+        print(f"⏭️ Línea contraparte {linea_pago_id} ya conciliada")
+        return
+
+    balance1 = l1.get("balance", 0) or (l1["debit"] - l1["credit"])
+    balance2 = l2.get("balance", 0) or (l2["debit"] - l2["credit"])
+
+    # En Odoo, debit_move_id debe ser la línea con balance positivo
+    # y credit_move_id la línea con balance negativo.
+    if balance1 > 0 and balance2 < 0:
+        debit_line = l1
+        credit_line = l2
+    elif balance2 > 0 and balance1 < 0:
+        debit_line = l2
+        credit_line = l1
+    else:
+        raise Exception(
+            f"No se puede determinar debit/credit para partial reconcile: "
+            f"{balance1} / {balance2}"
+        )
+
+    amount = abs(float(amount or 0))
+
+    debit_residual = abs(float(debit_line.get("amount_residual") or 0))
+    credit_residual = abs(float(credit_line.get("amount_residual") or 0))
+
+    amount_origen = abs(float(amount or 0))
+
+    debit_residual = abs(float(debit_line.get("amount_residual") or 0))
+    credit_residual = abs(float(credit_line.get("amount_residual") or 0))
+
+    amount_final = min(amount_origen, debit_residual, credit_residual)
+
+    # Si lo que queda disponible es una diferencia pequeña, no crear partial basura
+    if amount_final < 0.10:
+        print(
+            f"⏭️ Partial omitido por importe residual mínimo: "
+            f"amount_origen={amount_origen}, "
+            f"debit_residual={debit_residual}, "
+            f"credit_residual={credit_residual}, "
+            f"amount_final={amount_final}"
+        )
+        return
+
+    amount = amount_final
+
+    debit_currency = debit_line.get("currency_id")
+    credit_currency = credit_line.get("currency_id")
+
+    same_currency = (
+            debit_currency
+            and credit_currency
+            and debit_currency[0] == credit_currency[0]
+    )
+
+    if same_currency:
+        debit_amount_currency = amount
+        credit_amount_currency = amount
+    else:
+        debit_amount_currency = abs(float(
+            debit_line.get("amount_residual_currency") or amount
+        ))
+        credit_amount_currency = abs(float(
+            credit_line.get("amount_residual_currency") or amount
+        ))
+
+        debit_amount_currency = min(debit_amount_currency, amount)
+        credit_amount_currency = min(credit_amount_currency, amount)
+
+    vals = {
+        "debit_move_id": debit_line["id"],
+        "credit_move_id": credit_line["id"],
+        "amount": amount,
+        "debit_amount_currency": debit_amount_currency,
+        "credit_amount_currency": credit_amount_currency,
+    }
+
+    models.execute_kw(
+        db, uid, password,
+        "account.partial.reconcile", "create",
+        [vals],
+        {
+            "context": {
+                "active_test": False,
+                "tracking_disable": True,
+                "mail_notrack": True,
+            }
+        }
+    )
+
+    print(
+        f"✅ Partial reconcile creado: "
+        f"debit_line={debit_line['id']}, "
+        f"credit_line={credit_line['id']}, "
+        f"amount={amount}, "
+        f"debit_amount_currency={debit_amount_currency}, "
+        f"credit_amount_currency={credit_amount_currency}"
+    )
+
+def obtener_cuenta_factura_origen(factura_name):
+    factura_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "search",
+        [[("name", "=", factura_name)]],
+        {"limit": 1}
+    )
+    if not factura_ids:
+        raise Exception(f"Factura origen no encontrada: {factura_name}")
+
+    factura_id = factura_ids[0]
+
+    lines = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "search_read",
+        [[("move_id", "=", factura_id), ("account_id.reconcile", "=", True),]],
+        {"fields": ["account_id", "debit", "credit"]}
+    )
+
+    for l in lines:
+        if not l["account_id"]:
+            continue
+
+        acc = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.account", "read",
+            [[l["account_id"][0]]],
+            {"fields": ["account_type", "code"]}
+        )[0]
+
+        if acc["account_type"]:# in ("asset_receivable", "liability_payable"):
+            return {
+                "account_id": l["account_id"][0],
+                "account_code": acc["code"],
+            }
+
+    raise Exception(f"No se encontró cuenta receivable/payable en origen {factura_name}")
+
+def obtener_linea_factura_destino(factura_dest_id):
+    lines = models.execute_kw(
+        db, uid, password,
+        "account.move.line", "search_read",
+        [[("move_id", "=", factura_dest_id),("account_id.reconcile", "=", True),]],
+        {"fields": ["id", "account_id", "debit", "credit"]}
+    )
+
+    for l in lines:
+        if not l["account_id"]:
+            continue
+
+        acc = models.execute_kw(
+            db, uid, password,
+            "account.account", "read",
+            [[l["account_id"][0]]],
+            {"fields": ["account_type", "code"]}
+        )[0]
+
+        if acc["account_type"]:# in ("asset_receivable", "liability_payable"):
+            return {
+                "line_id": l["id"],
+                "account_id": l["account_id"][0],
+                "account_code": acc["code"],
+            }
+
+    raise Exception("No se encontró línea principal en factura destino")
+
+def mapear_cuenta_origen_a_destino_por_code(account_code):
+    ids = models.execute_kw(
+        db, uid, password,
+        "account.account", "search",
+        [[("code", "=", account_code)]],
+        {"limit": 1}
+    )
+    if not ids:
+        raise Exception(f"Cuenta destino no encontrada para code {account_code}")
+    return ids[0]
+
+def obtener_linea_principal_factura_destino(factura_dest_id):
+    """
+    Devuelve la línea conciliable principal de la factura en destino.
+    Compatible con 430, 431, 410, 411, etc.
+    """
+
+    lines = models.execute_kw(
+        db, uid, password,
+        "account.move.line", "search_read",
+        [[
+            ("move_id", "=", factura_dest_id),
+            ("account_id.reconcile", "=", True)
+        ]],
+        {
+            "fields": [
+                "id",
+                "account_id",
+                "debit",
+                "credit",
+            ]
+        }
+    )
+
+    if not lines:
+        raise Exception("❌ No se encontró línea conciliable en la factura destino")
+
+    # Si hay varias (raro pero posible), devolver la de mayor importe
+    linea_principal = max(
+        lines,
+        key=lambda x: abs(x["debit"] - x["credit"])
+    )
+
+    return linea_principal
+
+def detectar_pagos_factura_origen(factura_name):
+    """
+    Devuelve una lista de dicts con las líneas EXACTAS de pago
+    conciliadas con la factura en origen, incluyendo el importe.
+    """
+
+    resultados = []
+
+    # 1️⃣ Buscar factura
+    factura_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "search",
+        [[("name", "=", factura_name)]],
+        {"limit": 1}
+    )
+
+    if not factura_ids:
+        print(f"❌ Factura {factura_name} no encontrada")
+        return resultados
+
+    factura_id = factura_ids[0]
+
+    # 2️⃣ Obtener SOLO líneas conciliables de la factura
+    factura_lines = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "search_read",
+        [[
+            ("move_id", "=", factura_id),
+            ("account_id.reconcile", "=", True),
+        ]],
+        {
+            "fields": [
+                "id",
+                "matched_debit_ids",
+                "matched_credit_ids",
+            ]
+        }
+    )
+
+    if not factura_lines:
+        print("⚠️ No hay líneas conciliables en la factura")
+        return resultados
+
+    # Normalmente solo habrá una línea conciliable
+    for linea in factura_lines:
+
+        matched_ids = set(
+            linea["matched_debit_ids"] + linea["matched_credit_ids"]
+        )
+
+        if not matched_ids:
+            continue
+
+        # 3️⃣ Leer partial reconciles
+        partials = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.partial.reconcile", "read",
+            [list(matched_ids)],
+            {
+                "fields": [
+                    "debit_move_id",
+                    "credit_move_id",
+                    "amount",
+                ]
+            }
+        )
+
+        for pr in partials:
+
+            if pr["debit_move_id"][0] == linea["id"]:
+                pago_line_id = pr["credit_move_id"][0]
+            elif pr["credit_move_id"][0] == linea["id"]:
+                pago_line_id = pr["debit_move_id"][0]
+            else:
+                continue
+
+            pago_line = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.move.line", "read",
+                [[pago_line_id]],
+                {"fields": ["move_id"]}
+            )[0]
+
+            pago_move = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.move", "read",
+                [[pago_line["move_id"][0]]],
+                {"fields": ["id", "name", "date", "journal_id"]}
+            )[0]
+
+            resultados.append({
+                "pago_move_id": pago_move["id"],
+                "pago_move_name": pago_move["name"],
+                "pago_line_id": pago_line_id,
+                "amount": pr["amount"],
+            })
+
+    return resultados
+
+def obtener_lineas_conciliables_destino(move_id):
+    """
+    Devuelve TODAS las líneas conciliables (account.reconcile=True)
+    de un account.move en destino.
+    """
+
+    lines = models.execute_kw(
+        db, uid, password,
+        "account.move.line", "search_read",
+        [[
+            ("move_id", "=", move_id),
+            ("account_id.reconcile", "=", True)
+        ]],
+        {
+            "fields": [
+                "id",
+                "account_id",
+                "debit",
+                "credit",
+                "reconciled",
+            ]
+        }
+    )
+
+    if not lines:
+        raise Exception(
+            f"❌ No se encontraron líneas conciliables en move {move_id}"
+        )
+
+    return lines
+
+def conciliar_factura_con_pagos_destino(factura_dest_id, pagos_dest, factura_name, payment_state):
+    try:
+        def obtener_linea_destino_por_id_origen(move_id, origen_line_id):
+            """
+            Devuelve UNA línea conciliable en destino que corresponde
+            exactamente a la línea de origen.
+
+            Prioridad:
+            1) Buscar por x_id_interno
+            2) Si no existe, buscar por cuenta contable + signo del balance
+            """
+
+            # -------------------------------------------------
+            # 1️⃣ Leer línea origen
+            # -------------------------------------------------
+            line_src = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.move.line", "read",
+                [[origen_line_id]],
+                {
+                    "fields": [
+                        "id",
+                        "move_id",
+                        "account_id",
+                        "debit",
+                        "credit",
+                        "balance",
+                    ]
+                }
+            )[0]
+
+            if not line_src.get("account_id"):
+                raise Exception(
+                    f"No se pudo resolver cuenta origen para line_id={origen_line_id}"
+                )
+
+            account_src_id = line_src["account_id"][0]
+
+            acc_src = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.account", "read",
+                [[account_src_id]],
+                {"fields": ["code"]}
+            )[0]
+
+            account_code = acc_src["code"]
+            balance_src = line_src.get("balance", 0) or (line_src["debit"] - line_src["credit"])
+
+            # -------------------------------------------------
+            # 2️⃣ Buscar primero por x_id_interno exacto
+            # -------------------------------------------------
+            lines = models.execute_kw(
+                db, uid, password,
+                "account.move.line", "search_read",
+                [[
+                    ("move_id", "=", move_id),
+                    ("x_id_interno", "=", origen_line_id),
+                    ("account_id.reconcile", "=", True),
+                ]],
+                {
+                    "fields": [
+                        "id",
+                        "account_id",
+                        "debit",
+                        "credit",
+                        "balance",
+                        "reconciled",
+                    ]
+                }
+            )
+
+            if lines:
+                return lines[0]
+
+            # -------------------------------------------------
+            # 3️⃣ Si no existe x_id_interno, mapear cuenta por code
+            # -------------------------------------------------
+            cuenta_dest_id = mapear_cuenta_origen_a_destino_por_code(account_code)
+
+            lines = models.execute_kw(
+                db, uid, password,
+                "account.move.line", "search_read",
+                [[
+                    ("move_id", "=", move_id),
+                    ("account_id", "=", cuenta_dest_id),
+                    ("account_id.reconcile", "=", True),
+                ]],
+                {
+                    "fields": [
+                        "id",
+                        "account_id",
+                        "debit",
+                        "credit",
+                        "balance",
+                        "reconciled",
+                    ]
+                }
+            )
+
+            if not lines:
+                raise Exception(
+                    f"No se encontró línea destino para origen_line_id={origen_line_id}"
+                )
+
+            # -------------------------------------------------
+            # 4️⃣ Elegir por mismo signo de balance
+            # -------------------------------------------------
+            candidatas = []
+
+            for l in lines:
+                balance_dest = l.get("balance", 0) or (l["debit"] - l["credit"])
+
+                if balance_src > 0 and balance_dest > 0:
+                    candidatas.append(l)
+                elif balance_src < 0 and balance_dest < 0:
+                    candidatas.append(l)
+
+            if len(candidatas) == 1:
+                return candidatas[0]
+
+            if len(candidatas) > 1:
+                candidatas_no_reconciled = [
+                    l for l in candidatas if not l.get("reconciled")
+                ]
+
+                if len(candidatas_no_reconciled) == 1:
+                    return candidatas_no_reconciled[0]
+
+                raise Exception(
+                    f"Varias líneas destino candidatas para origen_line_id={origen_line_id}"
+                )
+
+            raise Exception(
+                f"No se pudo resolver línea destino por signo para origen_line_id={origen_line_id}"
+            )
+
+        ctx = {
+            "active_test": False,
+            "tracking_disable": True,
+            "mail_notrack": True,
+        }
+
+        # -------------------------------------------------
+        # 1️⃣ Línea principal de la factura destino
+        # -------------------------------------------------
+        linea_factura = obtener_linea_principal_factura_destino(factura_dest_id)
+
+        # -------------------------------------------------
+        # 2️⃣ Caso parcial: crear account.partial.reconcile exacto
+        # -------------------------------------------------
+        if payment_state == "partial":
+            for pago_move_id, pagos_info in pagos_dest.items():
+                for pago_info in pagos_info:
+                    origen_line_id = pago_info["origen_line_id"]
+                    amount = pago_info["amount"]
+
+                    linea_pago_dest = obtener_linea_destino_por_id_origen(
+                        pago_move_id,
+                        origen_line_id
+                    )
+
+                    linea_estado = models.execute_kw(
+                        db, uid, password,
+                        "account.move.line", "read",
+                        [[linea_pago_dest["id"]]],
+                        {
+                            "fields": [
+                                "reconciled",
+                            ]
+                        }
+                    )[0]
+
+                    if linea_estado["reconciled"]:
+                        print(
+                            f"⏭️ Línea {linea_pago_dest['id']} "
+                            f"ya conciliada, se omite"
+                        )
+                        continue
+
+                    crear_partial_reconcile_exacto(
+                        linea_factura["id"],
+                        linea_pago_dest["id"],
+                        amount
+                    )
+
+            print("✅ Conciliación parcial exacta completada")
+            return
+
+        # -------------------------------------------------
+        # 3️⃣ Caso no parcial: conciliación total normal
+        # -------------------------------------------------
+        line_ids = [linea_factura["id"]]
+
+        for pago_move_id, pagos_info in pagos_dest.items():
+            for pago_info in pagos_info:
+                origen_line_id = pago_info["origen_line_id"]
+
+                linea_pago_dest = obtener_linea_destino_por_id_origen(
+                    pago_move_id,
+                    origen_line_id
+                )
+
+                linea_estado = models.execute_kw(
+                    db, uid, password,
+                    "account.move.line", "read",
+                    [[linea_pago_dest["id"]]],
+                    {"fields": ["reconciled"]}
+                )[0]
+
+                if linea_estado["reconciled"]:
+                    print(
+                        f"⏭️ Línea {linea_pago_dest['id']} "
+                        f"ya conciliada, se omite"
+                    )
+                    continue
+
+                line_ids.append(linea_pago_dest["id"])
+
+        line_ids = list(set(line_ids))
+
+        if len(line_ids) < 2:
+            raise Exception("Los asientos no son de la misma cuenta")
+
+        models.execute_kw(
+            db, uid, password,
+            "account.move.line", "reconcile",
+            [line_ids],
+            {"context": ctx}
+        )
+
+        print("✅ Conciliación total completada")
+
+    except Exception as e:
+        msg = str(e)
+
+        if "No se encontró línea destino" in msg:
+            print(f"Revertir manualmente: {factura_name}")
+
+        elif "Los asientos no son de la misma cuenta" in msg:
+            try:
+                print(f"🔧 Corrigiendo cuenta de FACTURA destino: {factura_name}")
+
+                # 1️⃣ Cuenta correcta desde ORIGEN
+                cuenta_origen = obtener_cuenta_factura_origen(factura_name)
+                cuenta_origen_code = cuenta_origen["account_code"]
+
+                # 2️⃣ Cuenta actual en DESTINO
+                linea_factura_dest = obtener_linea_factura_destino(factura_dest_id)
+
+                if linea_factura_dest["account_code"] != cuenta_origen_code:
+                    # 3️⃣ Mapear cuenta correcta en DESTINO
+                    cuenta_destino_correcta = mapear_cuenta_origen_a_destino_por_code(
+                        cuenta_origen_code
+                    )
+
+                    # 4️⃣ Reescribir SOLO la línea de la factura
+                    models.execute_kw(
+                        db, uid, password,
+                        "account.move.line", "write",
+                        [[linea_factura_dest["line_id"]], {
+                            "account_id": cuenta_destino_correcta
+                        }],
+                        {"context": {"check_move_validity": False}}
+                    )
+
+                    print(
+                        f"   ✔ Factura {factura_name}: "
+                        f"{linea_factura_dest['account_code']} → {cuenta_origen_code}"
+                    )
+                else:
+                    log_error(f"Conciliar: {factura_name}")
+                    return
+
+                # 5️⃣ Reintentar conciliación
+                conciliar_factura_con_pagos_destino(
+                    factura_dest_id,
+                    pagos_dest,
+                    factura_name,
+                    payment_state
+                )
+
+            except Exception as e2:
+                print(f"Error corrigiendo factura {factura_name}: {e2}")
+
+        elif "allow_none" in msg:
+            print("✅ Conciliación completada")
+
+        else:
+            print(f"Error: {msg}")
+
+def mapear_cuenta_origen_destino(account_src_id):
+    # 1️⃣ Leer cuenta en origen
+    acc_src = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.account", "read",
+        [[account_src_id]],
+        {"fields": ["code", "name"]}
+    )[0]
+
+    # 2️⃣ Intentar por code (preferido)
+    if acc_src.get("code"):
+        domain_code = [("code", "=", acc_src["code"])]
+        acc_dest_ids = models.execute_kw(
+            db, uid, password,
+            "account.account", "search",
+            [domain_code],
+            {"limit": 1}
+        )
+        if acc_dest_ids:
+            return acc_dest_ids[0]
+
+    # 3️⃣ Fallback por name
+    domain_name = [("name", "=", acc_src["name"])]
+    acc_dest_ids = models.execute_kw(
+        db, uid, password,
+        "account.account", "search",
+        [domain_name],
+        {"limit": 1}
+    )
+
+    if acc_dest_ids:
+        return acc_dest_ids[0]
+
+    # 4️⃣ Error explícito (mejor que fallar silenciosamente)
+    raise Exception(
+        f"❌ Cuenta destino no encontrada: "
+        f"{acc_src['code']} - {acc_src['name']}"
+    )
+
+def migrar_pago_origen_a_destino(move_origen_id):
+    """
+    Migra un account.move desde origen a destino.
+
+    Si el movimiento origen es:
+    - entry       → lo migra como asiento contable normal, línea a línea.
+    - invoice/refund → lo migra también línea a línea, incluyendo líneas de factura.
+
+    Devuelve el ID del move creado o encontrado en destino.
+    """
+
+    # -------------------------------------------------
+    # 1️⃣ Leer move de origen
+    # -------------------------------------------------
+    move = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "read",
+        [[move_origen_id]],
+        {
+            "fields": [
+                "id",
+                "name",
+                "date",
+                "invoice_date",
+                "ref",
+                "journal_id",
+                "line_ids",
+                "move_type",
+                "partner_id",
+                "currency_id",
+            ]
+        }
+    )[0]
+
+    move_name = move["name"]
+    move_type = move.get("move_type") or "entry"
+
+    # -------------------------------------------------
+    # 2️⃣ Si ya existe en destino, devolverlo
+    # -------------------------------------------------
+    move_dest_existente = models.execute_kw(
+        db, uid, password,
+        "account.move", "search",
+        [[("x_id_interno", "=", move["id"])]],#[[("name", "=", move_name)]],
+        {"limit": 1}
+    )
+
+    if move_dest_existente:
+        print(f"⏭️ Move ya existe en destino: {move_name}")
+        return move_dest_existente[0]
+
+    # -------------------------------------------------
+    # 3️⃣ Mapear diario
+    # -------------------------------------------------
+    journal_dest_ids = models.execute_kw(
+        db, uid, password,
+        "account.journal", "search",
+        [[("x_id_interno", "=", move["journal_id"][0])]],
+        {"limit": 1}
+    )
+
+    if not journal_dest_ids:
+        raise Exception(f"Diario destino no encontrado para {move['journal_id']}")
+
+    journal_dest_id = journal_dest_ids[0]
+
+    # -------------------------------------------------
+    # 4️⃣ Mapear partner
+    # -------------------------------------------------
+    partner_dest_id = False
+
+    if move.get("partner_id"):
+        partner_id_origen = move["partner_id"][0]
+        partner_dest_id = Utils.get_by_x_id_interno(
+            "res.partner",
+            partner_id_origen,
+            db,
+            uid,
+            password,
+            models
+        )
+
+    # -------------------------------------------------
+    # 5️⃣ Crear move vacío en destino
+    # -------------------------------------------------
+    vals_move = {
+        #"name": move_name,
+        "date": move["date"],
+        "ref": move.get("ref"),
+        "journal_id": journal_dest_id,
+        "move_type": move_type,
+        "x_id_interno": move["id"],
+    }
+
+    if move.get("invoice_date"):
+        vals_move["invoice_date"] = move["invoice_date"]
+
+    if partner_dest_id:
+        vals_move["partner_id"] = partner_dest_id
+
+    dest_move_id = models.execute_kw(
+        db, uid, password,
+        "account.move", "create",
+        [vals_move],
+        {
+            "context": {
+                "check_move_validity": False,
+                "skip_invoice_sync": True,
+                "skip_account_move_synchronization": True,
+            }
+        }
+    )
+
+    # -------------------------------------------------
+    # 6️⃣ Leer TODAS las líneas de origen
+    # -------------------------------------------------
+    lines = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "read",
+        [move["line_ids"]],
+        {
+            "fields": [
+                "id",
+                "name",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+                "partner_id",
+                "amount_currency",
+                "currency_id",
+                "product_id",
+                "quantity",
+                "price_unit",
+                "discount",
+                "tax_ids",
+                "display_type",
+                "sequence",
+            ]
+        }
+    )
+
+    # -------------------------------------------------
+    # 7️⃣ Crear líneas en destino
+    # -------------------------------------------------
+    for l in lines:
+        display_type = l.get("display_type")
+
+        vals_line = {
+            "move_id": dest_move_id,
+            "name": l.get("name") or "/",
+            "x_id_interno": l["id"],
+            "sequence": l.get("sequence") or 10,
+        }
+
+        # -------------------------------------------------
+        # Líneas contables reales
+        # -------------------------------------------------
+        if not display_type:
+            if not l.get("account_id"):
+                continue
+
+            account_dest_id = mapear_cuenta_origen_destino(l["account_id"][0])
+
+            vals_line.update({
+                "account_id": account_dest_id,
+                "debit": l.get("debit") or 0.0,
+                "credit": l.get("credit") or 0.0,
+            })
+
+            if l.get("partner_id"):
+                partner_id_origen = l["partner_id"][0]
+                partner_id = Utils.get_by_x_id_interno(
+                    "res.partner",
+                    partner_id_origen,
+                    db,
+                    uid,
+                    password,
+                    models
+                )
+                if partner_id:
+                    vals_line["partner_id"] = partner_id
+
+            if l.get("currency_id"):
+                vals_line["currency_id"] = l["currency_id"][0]
+                vals_line["amount_currency"] = l.get("amount_currency") or 0.0
+
+        # -------------------------------------------------
+        # Líneas de factura / producto / sección / nota
+        # -------------------------------------------------
+        else:
+            vals_line["display_type"] = display_type
+
+            if l.get("account_id"):
+                vals_line["account_id"] = mapear_cuenta_origen_destino(
+                    l["account_id"][0]
+                )
+
+            if l.get("product_id"):
+                product_id_origen = l["product_id"][0]
+                product_id = Utils.get_by_x_id_interno(
+                    "product.product",
+                    product_id_origen,
+                    db,
+                    uid,
+                    password,
+                    models
+                )
+                if product_id:
+                    vals_line["product_id"] = product_id
+
+            if l.get("quantity") is not None:
+                vals_line["quantity"] = l.get("quantity") or 0.0
+
+            if l.get("price_unit") is not None:
+                vals_line["price_unit"] = l.get("price_unit") or 0.0
+
+            if l.get("discount") is not None:
+                vals_line["discount"] = l.get("discount") or 0.0
+
+            if l.get("partner_id"):
+                partner_id_origen = l["partner_id"][0]
+                partner_id = Utils.get_by_x_id_interno(
+                    "res.partner",
+                    partner_id_origen,
+                    db,
+                    uid,
+                    password,
+                    models
+                )
+                if partner_id:
+                    vals_line["partner_id"] = partner_id
+
+            if l.get("currency_id"):
+                vals_line["currency_id"] = l["currency_id"][0]
+                vals_line["amount_currency"] = l.get("amount_currency") or 0.0
+
+            # Ojo: tax_ids solo si tus impuestos están mapeados por x_id_interno
+            tax_dest_ids = []
+            for tax_id_origen in l.get("tax_ids") or []:
+                tax_dest_id = Utils.get_by_x_id_interno(
+                    "account.tax",
+                    tax_id_origen,
+                    db,
+                    uid,
+                    password,
+                    models
+                )
+                if tax_dest_id:
+                    tax_dest_ids.append(tax_dest_id)
+
+            if tax_dest_ids:
+                vals_line["tax_ids"] = [(6, 0, tax_dest_ids)]
+
+        models.execute_kw(
+            db, uid, password,
+            "account.move.line", "create",
+            [vals_line],
+            {
+                "context": {
+                    "check_move_validity": False,
+                    "skip_invoice_sync": True,
+                    "skip_invoice_line_sync": True,
+                    "skip_account_move_synchronization": True,
+                }
+            }
+        )
+
+    # -------------------------------------------------
+    # 8️⃣ Publicar move
+    # -------------------------------------------------
+    models.execute_kw(
+        db, uid, password,
+        "account.move", "action_post",
+        [[dest_move_id]],
+        {
+            "context": {
+                "check_move_validity": False,
+                "skip_invoice_sync": True,
+                "skip_account_move_synchronization": True,
+            }
+        }
+    )
+
+    print(f"✅ Move migrado completo: {move_name} ({move_type})")
+    return dest_move_id
+
+def conciliar_factura_(id, factura_name, estado):
+    try:
+        def existe_pago_en_destino(move_id):
+            """
+            Comprueba si un account.move existe en destino por nombre.
+            Devuelve el ID si existe, None si no.
+            """
+            ids = models.execute_kw(
+                db, uid, password,
+                "account.move", "search",
+                [[("x_id_interno", "=", move_id)]],
+                {"limit": 1}
+            )
+            return ids[0] if ids else None
+
+        # -------------------------------------------------
+        # 1️⃣ Obtener factura en destino
+        # -------------------------------------------------
+        factura_dest_ids = models.execute_kw(
+            db, uid, password,
+            "account.move", "search",
+            [[("x_id_interno", "=", id)]],
+            {"limit": 1}
+        )
+
+        if not factura_dest_ids:
+            raise Exception(f"❌ Factura {factura_name} no existe en destino")
+
+        factura_dest_id = factura_dest_ids[0]
+
+        # -------------------------------------------------
+        # 2️⃣ Detectar pagos / contraparte en origen
+        # -------------------------------------------------
+        pagos_origen = detectar_pagos_factura_origen(factura_name)
+
+        pagos_dest = defaultdict(list)
+
+        for pago in pagos_origen:
+            # 1️⃣ Comprobar si el pago/asiento/factura existe en destino
+            pago_dest_id = existe_pago_en_destino(pago["pago_move_id"])
+
+            # 2️⃣ Si no existe, migrarlo
+            if not pago_dest_id:
+                pago_dest_id = migrar_pago_origen_a_destino(
+                    pago["pago_move_id"]
+                )
+
+            # 3️⃣ Asociar línea origen + importe exacto del partial reconcile
+            pagos_dest[pago_dest_id].append({
+                "origen_line_id": pago["pago_line_id"],
+                "amount": pago["amount"],
+                "pago_move_name": pago["pago_move_name"],
+            })
+
+        # -------------------------------------------------
+        # 3️⃣ Conciliar en destino
+        # -------------------------------------------------
+        conciliar_factura_con_pagos_destino(
+            factura_dest_id,
+            pagos_dest,
+            factura_name,
+            estado
+        )
+
+    except Exception as e:
+        msg = str(e)
+
+        if "cannot marshal None unless allow_none is enabled" not in msg:
+            print(f"❌ Error al conciliar factura: {factura_name}, Error: {e}")
+
+def conciliar_todas_las_facturas_():
+
+    facturas_a_conciliar_test = [
+        "FV1OS/2026/00001",
+        "FC1OS/26/0001",
+        "FC1OS/26/0003",
+        "FC1OS/26/0004",
+    ]
+    test=False
+
+    print("🚀 Iniciando conciliación masiva de facturas...")
+
+    comp_src = 2 # OSE: 1 / ALM: 2
+
+    # 1️⃣ Buscar facturas cliente y proveedor no pendientes
+    factura_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "search",
+        [[
+            ("move_type", "in", [
+                "out_invoice",
+                "in_invoice",
+                "out_refund",
+                "in_refund",
+            ]),
+            ("state", "=", "posted"),
+            ("payment_state", "!=", "not_paid"),
+            ("company_id", "=", comp_src),
+            ("date", ">=", "2025-01-01"), ("date", "<", "2027-01-01"),
+        ]]
+    )
+
+    if not factura_ids:
+        print("ℹ️ No hay facturas para conciliar.")
+        return
+
+    # 2️⃣ Leer nombres
+    facturas = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "read",
+        [factura_ids],
+        {"fields": ["id", "name", "payment_state"]}
+    )
+
+    print(f"📄 Facturas a conciliar: {len(facturas)}")
+
+    # 3️⃣ Conciliar una a una
+    for f in facturas:
+        id = f["id"]
+        nombre = f["name"]
+        estado = f["payment_state"]
+
+        if test and nombre not in facturas_a_conciliar_test: continue
+
+        print(f"\n🔗 Conciliando factura {nombre} (estado={estado})")
+
+        try:
+            # 🔎 Buscar factura en destino
+            factura_dest_ids = models.execute_kw(
+                db, uid, password,
+                "account.move", "search",
+                [[("x_id_interno", "=", id)]],
+                {"limit": 1}
+            )
+
+            if not factura_dest_ids:
+                print(f"⚠️ Factura {nombre} con {id} no existe en destino, se intenta conciliar igualmente")
+                conciliar_factura_(id, nombre, estado)
+                continue
+
+            # 🔗 Solo si NO está conciliada
+            conciliar_factura_(id, nombre, estado)
+
+        except Exception as e:
+            print(f"❌ Error conciliando {nombre}: {e}")
+
+    print("✅ Conciliación masiva finalizada")
+
+# PARTE 2
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+COMPANY_SRC_ID = 2  # OSE: 1 / ALM: 2
+FECHA_INICIO = "2025-01-01"
+FECHA_FIN = "2027-01-01"
+
+TEST = False
+FACTURAS_A_CONCILIAR_TEST = [
+    "FV1OP/25/00664",
+    "FV1OP/25/00704",
+    "FV1OP/25/00562"
+]
+
+def log_error(msg):
+    print(f"❌ {msg}")
+
+# ============================================================
+# CUENTAS
+# ============================================================
+
+def mapear_cuenta_origen_a_destino_por_code(account_code):
+    ids = models.execute_kw(
+        db, uid, password,
+        "account.account", "search",
+        [[("code", "=", account_code)]],
+        {"limit": 1}
+    )
+    if not ids:
+        raise Exception(f"Cuenta destino no encontrada para code {account_code}")
+    return ids[0]
+
+def mapear_cuenta_origen_destino(account_src_id):
+    acc_src = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.account", "read",
+        [[account_src_id]],
+        {"fields": ["code", "name"]}
+    )[0]
+
+    if acc_src.get("code"):
+        acc_dest_ids = models.execute_kw(
+            db, uid, password,
+            "account.account", "search",
+            [[("code", "=", acc_src["code"])]],
+            {"limit": 1}
+        )
+        if acc_dest_ids:
+            return acc_dest_ids[0]
+
+    acc_dest_ids = models.execute_kw(
+        db, uid, password,
+        "account.account", "search",
+        [[("name", "=", acc_src["name"])]],
+        {"limit": 1}
+    )
+
+    if acc_dest_ids:
+        return acc_dest_ids[0]
+
+    raise Exception(
+        f"❌ Cuenta destino no encontrada: "
+        f"{acc_src.get('code')} - {acc_src.get('name')}"
+    )
+
+# ============================================================
+# MIGRAR MOVIMIENTO SI NO EXISTE EN DESTINO
+# ============================================================
+
+def migrar_pago_origen_a_destino(move_origen_id):
+    """
+    Migra un account.move de origen a destino.
+    Se usa cuando una contraparte del partial no existe todavía en destino.
+    """
+
+    def export_invoice_by_id(invoice_id):
+        """
+        Exporta UNA única factura de Odoo origen por ID.
+        Devuelve un dict con la factura y sus líneas de detalle.
+        """
+
+        from collections import defaultdict
+
+        FIELDS = [
+            "id",
+            "name",
+            "partner_id",
+            "ref",
+            "date",
+            "invoice_date",
+            "invoice_date_due",
+            "move_type",
+            "state",
+            "invoice_line_ids",
+            "amount_untaxed",
+            "amount_tax",
+            "amount_total",
+            "currency_id",
+            "payment_reference",
+            "invoice_payment_term_id",
+            "invoice_origin",
+            "narration",
+            "company_id",
+            "invoice_user_id",
+            "journal_id",
+        ]
+
+        print(f"📤 Exportando factura origen ID={invoice_id}")
+
+        invoices = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move", "read",
+            [[invoice_id]],
+            {"fields": FIELDS}
+        )
+
+        if not invoices:
+            raise Exception(f"❌ No se encontró factura origen con ID={invoice_id}")
+
+        inv = invoices[0]
+
+        if inv.get("move_type") not in ("out_invoice", "in_invoice", "out_refund", "in_refund"):
+            raise Exception(
+                f"❌ El move ID={invoice_id} no es factura/rectificativa. "
+                f"move_type={inv.get('move_type')}"
+            )
+
+        print(f"🧾 Factura encontrada: {inv.get('name')} | estado={inv.get('state')}")
+
+        # -------------------------------------------------
+        # Diario: añadir journal_code
+        # -------------------------------------------------
+        if inv.get("journal_id"):
+            journal = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.journal", "read",
+                [[inv["journal_id"][0]]],
+                {
+                    "fields": ["id", "code"],
+                    "context": {"active_test": False}
+                }
+            )
+
+            inv["journal_code"] = journal[0]["code"] if journal else None
+        else:
+            inv["journal_code"] = None
+
+        # -------------------------------------------------
+        # Líneas de factura
+        # -------------------------------------------------
+        line_ids = inv.get("invoice_line_ids", [])
+
+        if not line_ids:
+            print("⚠️ La factura no tiene invoice_line_ids")
+            inv["lineas_detalle"] = []
+            return inv
+
+        print(f"   → {len(line_ids)} líneas detectadas. Leyendo...")
+
+        lines = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move.line", "read",
+            [line_ids],
+            {
+                "fields": [
+                    "id",
+                    "move_id",
+                    "name",
+                    "product_id",
+                    "quantity",
+                    "price_unit",
+                    "discount",
+                    "price_subtotal",
+                    "tax_ids",
+                    "account_id",
+                    "display_type",
+                    "sequence",
+                ]
+            }
+        )
+
+        # -------------------------------------------------
+        # Resolver SKUs
+        # -------------------------------------------------
+        product_ids = {
+            l["product_id"][0]
+            for l in lines
+            if l.get("product_id")
+        }
+
+        sku_map = {}
+
+        if product_ids:
+            products = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "product.product", "read",
+                [list(product_ids)],
+                {"fields": ["id", "default_code"]}
+            )
+
+            sku_map = {
+                p["id"]: p.get("default_code")
+                for p in products
+            }
+
+        for line in lines:
+            if line.get("product_id"):
+                line["default_code"] = sku_map.get(line["product_id"][0])
+            else:
+                line["default_code"] = None
+
+        inv["lineas_detalle"] = lines
+
+        print("✅ Factura exportada correctamente")
+        return inv
+
+    def import_invoice_with_lines_single(inv):
+        """
+        Importa UNA única factura en Odoo destino junto con sus líneas.
+        Si la factura origen estaba posted, la crea en draft y luego la publica.
+        Si estaba cancel, la crea y luego intenta cancelarla.
+        """
+
+        import time
+        import socket
+
+        from App_Connection import db, uid, password, models
+
+        def safe_execute_line(model, method, args, retries=3, wait=5, timeout=60):
+            """
+            Ejecuta un método XML-RPC con reintentos y timeout.
+            """
+
+            for intento in range(1, retries + 1):
+                try:
+                    socket.setdefaulttimeout(timeout)
+                    result = models.execute_kw(
+                        db, uid, password,
+                        model,
+                        method,
+                        args
+                    )
+                    socket.setdefaulttimeout(None)
+                    return result
+
+                except Exception as e:
+                    print(f"⚠️ Error ({model}.{method}) intento {intento}/{retries}: {e}")
+
+                    if intento < retries:
+                        print(f"   ↪ Reintentando en {wait} segundos...")
+                        time.sleep(wait)
+                    else:
+                        print("   ❌ Operación fallida tras varios intentos.")
+                        return None
+
+        name = inv.get("name") or inv.get("payment_reference") or "SIN_NOMBRE"
+        x_id_interno = inv.get("id")
+        state_origen = inv.get("state")
+        move_type = inv.get("move_type") or "out_invoice"
+
+        print(f"\n🧾 Importando factura única: {name} | origen_id={x_id_interno}")
+
+        # -------------------------------------------------
+        # Comprobar si ya existe
+        # -------------------------------------------------
+        existing = models.execute_kw(
+            db, uid, password,
+            "account.move", "search",
+            [[("x_id_interno", "=", x_id_interno)]],
+            {"limit": 1}
+        )
+
+        if existing:
+            print(f"⚠️ Factura ya existente en destino: {name} | id={existing[0]}")
+            return existing[0]
+
+        # -------------------------------------------------
+        # Buscar cliente/proveedor
+        # -------------------------------------------------
+        partner_id = None
+
+        if inv.get("partner_id"):
+            partner_id_origen = inv["partner_id"][0]
+            partner_id = Utils.get_by_x_id_interno(
+                "res.partner",
+                partner_id_origen,
+                db,
+                uid,
+                password,
+                models
+            )
+
+        # -------------------------------------------------
+        # Buscar moneda
+        # -------------------------------------------------
+        currency_id = None
+
+        if inv.get("currency_id"):
+            currency_name = inv["currency_id"][1]
+
+            currencies = models.execute_kw(
+                db, uid, password,
+                "res.currency", "search_read",
+                [[("name", "=", currency_name)]],
+                {
+                    "fields": ["id"],
+                    "limit": 1
+                }
+            )
+
+            if currencies:
+                currency_id = currencies[0]["id"]
+
+        # -------------------------------------------------
+        # Buscar usuario de factura
+        # -------------------------------------------------
+        user_id_origen = None
+
+        if inv.get("invoice_user_id"):
+            user_id_origen = inv["invoice_user_id"][0]
+
+        invoice_user_id = Utils.get_by_x_id_interno(
+            "res.users",
+            user_id_origen,
+            db,
+            uid,
+            password,
+            models
+        )
+
+        # -------------------------------------------------
+        # Buscar diario por code
+        # -------------------------------------------------
+        journal_id = None
+
+        if inv.get("journal_code"):
+            journal_code = inv["journal_code"]
+
+            journals = models.execute_kw(
+                db, uid, password,
+                "account.journal", "search_read",
+                [[("code", "=", journal_code)]],
+                {
+                    "fields": ["id"],
+                    "limit": 1,
+                    "context": {"active_test": False},
+                }
+            )
+
+            if journals:
+                journal_id = journals[0]["id"]
+            else:
+                print(f"⚠️ Diario no encontrado: code={journal_code}")
+
+        # -------------------------------------------------
+        # Crear factura en borrador
+        # -------------------------------------------------
+        vals_inv = {
+            "x_id_interno": x_id_interno,
+            "name": name,
+            "move_type": move_type,
+            "partner_id": partner_id,
+            "ref": inv.get("ref"),
+            "payment_reference": inv.get("payment_reference"),
+            "date": inv.get("date"),
+            "invoice_date": inv.get("invoice_date"),
+            "invoice_date_due": inv.get("invoice_date_due"),
+            "currency_id": currency_id,
+            "invoice_origin": inv.get("invoice_origin"),
+            "narration": inv.get("narration"),
+            "invoice_user_id": invoice_user_id,
+            "journal_id": journal_id,
+            "state": "draft",
+            "partner_bank_id": False,
         }
 
         try:
-            if existing:
-                models.execute_kw(
-                    db, uid, password,
-                    'account.analytic.account', 'write',
-                    [existing, vals]
-                )
-                print("🔄 Existía → actualizada")
-                actualizadas += 1
-            else:
-                models.execute_kw(
-                    db, uid, password,
-                    'account.analytic.account', 'create',
-                    [vals]
-                )
-                print("✅ Creada")
-                creadas += 1
+            new_inv_id = models.execute_kw(
+                db, uid, password,
+                "account.move", "create",
+                [vals_inv]
+            )
+
+            print(f"✅ Factura creada en destino: {name} | ID={new_inv_id}")
+
         except Exception as e:
-            print(f"❌ Error procesando '{name}': {e}")
+            print(f"❌ Error creando factura {name}: {e}")
+            return None
 
-    print("\n📊 RESULTADO CUENTAS ANALÍTICAS")
-    print(f"   Creadas: {creadas}")
-    print(f"   Actualizadas: {actualizadas}")
+        # -------------------------------------------------
+        # Crear líneas
+        # -------------------------------------------------
+        for linea in inv.get("lineas_detalle", []):
+            display_type = linea.get("display_type")
 
-# accounts = export_cuentas_analiticas()
-# import_cuentas_analiticas(accounts)
+            # ---------------------------------------------
+            # Nota / sección
+            # ---------------------------------------------
+            if display_type in ("line_note", "line_section"):
+                vals_line = {
+                    "x_id_interno": linea.get("id"),
+                    "move_id": new_inv_id,
+                    "name": linea.get("name"),
+                    "display_type": display_type,
+                    "quantity": 0.0,
+                    "sequence": linea.get("sequence"),
+                }
 
+                result = safe_execute_line(
+                    "account.move.line",
+                    "create",
+                    [vals_line]
+                )
+
+                if result:
+                    print(f"   📝 Nota/sección creada: {linea.get('name')}")
+                else:
+                    print(f"   ⚠️ Error creando nota/sección: {linea.get('name')}")
+
+                continue
+
+            # ---------------------------------------------
+            # Línea normal
+            # ---------------------------------------------
+            product_id = None
+            account_id = None
+            cuenta_dest = None
+
+            sku = linea.get("default_code")
+
+            if sku:
+                productos = models.execute_kw(
+                    db, uid, password,
+                    "product.product", "search",
+                    [[("default_code", "=", sku)]],
+                    {"limit": 1}
+                )
+
+                if productos:
+                    product_id = productos[0]
+                else:
+                    productos = models.execute_kw(
+                        db, uid, password,
+                        "product.product", "search",
+                        [[("default_code", "ilike", sku)]],
+                        {
+                            "limit": 1,
+                            "context": {"active_test": False}
+                        }
+                    )
+
+                    if productos:
+                        product_id = productos[0]
+                    else:
+                        print(f"⚠️ Producto no encontrado: SKU={sku}")
+
+            # ---------------------------------------------
+            # Cuenta por defecto si no hay producto
+            # ---------------------------------------------
+            if not product_id:
+                if move_type in ("out_invoice", "out_refund"):
+                    accounts = models.execute_kw(
+                        db, uid, password,
+                        "account.account", "search",
+                        [[("account_type", "=", "income")]],
+                        {"limit": 1}
+                    )
+                else:
+                    accounts = models.execute_kw(
+                        db, uid, password,
+                        "account.account", "search",
+                        [[("account_type", "=", "expense")]],
+                        {"limit": 1}
+                    )
+
+                if accounts:
+                    account_id = accounts[0]
+                else:
+                    raise Exception("❌ No se encontró cuenta contable por defecto")
+
+            # ---------------------------------------------
+            # Intentar conservar cuenta original por code
+            # ---------------------------------------------
+            try:
+                account_id_origen = linea.get("account_id")
+
+                if account_id_origen:
+                    account_id_origen = account_id_origen[0]
+
+                    acc_origen = models_src.execute_kw(
+                        db_src, uid_src, password_src,
+                        "account.account", "read",
+                        [[account_id_origen]],
+                        {"fields": ["code"]}
+                    )[0]
+
+                    account_code = acc_origen["code"]
+
+                    cuenta_dest = models.execute_kw(
+                        db, uid, password,
+                        "account.account", "search",
+                        [[("code", "=", account_code)]],
+                        {"limit": 1}
+                    )
+            except Exception:
+                cuenta_dest = None
+
+            # ---------------------------------------------
+            # Impuestos
+            # ---------------------------------------------
+            tax_ids = []
+
+            if linea.get("tax_ids"):
+                for tax_origen in linea.get("tax_ids"):
+                    tax_id = Utils.get_by_x_id_interno(
+                        "account.tax",
+                        tax_origen,
+                        db,
+                        uid,
+                        password,
+                        models
+                    )
+
+                    if tax_id:
+                        tax_ids.append(tax_id)
+
+            # ---------------------------------------------
+            # Crear línea
+            # ---------------------------------------------
+            vals_line = {
+                "x_id_interno": linea.get("id"),
+                "move_id": new_inv_id,
+                "name": linea.get("name"),
+                "product_id": product_id,
+                "display_type": display_type,
+                "quantity": linea.get("quantity") or 1.0,
+                "price_unit": linea.get("price_unit") or 0.0,
+                "discount": linea.get("discount") or 0.0,
+                "tax_ids": [(6, 0, tax_ids)],
+                "sequence": linea.get("sequence"),
+            }
+
+            if cuenta_dest:
+                vals_line["account_id"] = cuenta_dest[0]
+            elif account_id:
+                vals_line["account_id"] = account_id
+
+            result = safe_execute_line(
+                "account.move.line",
+                "create",
+                [vals_line],
+                retries=3,
+                wait=5,
+                timeout=90
+            )
+
+            if result:
+                print(f"   ➕ Línea creada: {linea.get('name')}")
+            else:
+                print(f"   ⚠️ No se pudo crear línea: {linea.get('name')}")
+
+        # -------------------------------------------------
+        # Publicar/cancelar según estado origen
+        # -------------------------------------------------
+        if state_origen == "posted":
+            try:
+                models.execute_kw(
+                    db, uid, password,
+                    "account.move",
+                    "action_post",
+                    [[new_inv_id]]
+                )
+
+                print("   📤 Factura publicada correctamente.")
+
+            except Exception as e:
+                print(f"   ⚠️ Error al publicar factura {name}: {e}")
+
+        elif state_origen == "cancel":
+            try:
+                models.execute_kw(
+                    db, uid, password,
+                    "account.move",
+                    "button_cancel",
+                    [[new_inv_id]]
+                )
+
+                print("   🚫 Factura cancelada correctamente.")
+
+            except Exception as e:
+                print(f"   ⚠️ Error cancelando factura {name}: {e}")
+
+        print(f"✅ Migración individual completada: {name}")
+        return new_inv_id
+
+    def migrar_factura_unica_por_id(invoice_id):
+        """
+        Exporta UNA factura de origen por ID y la importa en destino.
+        """
+
+        print("=" * 80)
+        print(f"🚀 Migración individual de factura origen ID={invoice_id}")
+        print("=" * 80)
+
+        inv = export_invoice_by_id(invoice_id)
+
+        new_id = import_invoice_with_lines_single(inv)
+
+        print("=" * 80)
+        print(f"🏁 Fin migración individual. Destino ID={new_id}")
+        print("=" * 80)
+
+        return new_id
+
+    move = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "read",
+        [[move_origen_id]],
+        {"fields": ["id", "name", "date", "ref", "journal_id", "line_ids", "move_type"]}
+    )[0]
+
+    move_name = move["name"]
+    move_type = move.get("move_type") or "entry"
+    if move_type != "entry":
+        move_factura = migrar_factura_unica_por_id(move_origen_id)
+        return move_factura
+
+    journal_dest_ids = models.execute_kw(
+        db, uid, password,
+        "account.journal", "search",
+        [[("x_id_interno", "=", move["journal_id"][0])]],
+        {"limit": 1}
+    )
+
+    if not journal_dest_ids:
+        raise Exception(f"Diario destino no encontrado para {move['journal_id']}")
+
+    dest_move_id = models.execute_kw(
+        db, uid, password,
+        "account.move", "create",
+        [{
+            "date": move["date"],
+            "ref": move.get("ref"),
+            "journal_id": journal_dest_ids[0],
+            "move_type": "entry",
+            "x_id_interno": move["id"],
+        }]
+    )
+
+    lines = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "read",
+        [move["line_ids"]],
+        {
+            "fields": [
+                "id", "name", "account_id", "debit", "credit", "partner_id",
+                "amount_currency", "currency_id",
+            ]
+        }
+    )
+
+    for l in lines:
+        if not l.get("account_id"):
+            continue
+
+        account_dest_id = mapear_cuenta_origen_destino(l["account_id"][0])
+
+        vals = {
+            "move_id": dest_move_id,
+            "name": l.get("name") or "/",
+            "account_id": account_dest_id,
+            "debit": l.get("debit") or 0.0,
+            "credit": l.get("credit") or 0.0,
+            "x_id_interno": l["id"],
+        }
+
+        if l.get("partner_id"):
+            partner_id_origen = l["partner_id"][0]
+            partner_id = Utils.get_by_x_id_interno(
+                "res.partner", partner_id_origen, db, uid, password, models
+            )
+            if partner_id:
+                vals["partner_id"] = partner_id
+
+        if l.get("currency_id"):
+            # Solo mantener si las monedas tienen el mismo ID entre BDs.
+            # Si no es tu caso, comenta estas dos líneas.
+            vals["currency_id"] = l["currency_id"][0]
+            vals["amount_currency"] = l.get("amount_currency") or 0.0
+
+        models.execute_kw(
+            db, uid, password,
+            "account.move.line", "create",
+            [vals],
+            {
+                "context": {
+                    "check_move_validity": False,
+                    "skip_account_move_synchronization": True,
+                }
+            }
+        )
+
+    models.execute_kw(
+        db, uid, password,
+        "account.move", "action_post",
+        [[dest_move_id]],
+        {"context": {"check_move_validity": False}}
+    )
+
+    print(f"✅ Movimiento migrado: {move_name}")
+    return dest_move_id
+
+
+# ============================================================
+# DETECTAR PARTIALS EXACTOS EN ORIGEN
+# ============================================================
+
+def detectar_partials_factura_origen(factura_name):
+    """
+    Devuelve los account.partial.reconcile EXACTOS de origen
+    en los que participa la factura.
+    """
+
+    resultados = []
+
+    factura_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "search",
+        [[("name", "=", factura_name)]],
+        {"limit": 1}
+    )
+
+    if not factura_ids:
+        print(f"❌ Factura {factura_name} no encontrada en origen")
+        return resultados
+
+    factura_id = factura_ids[0]
+
+    factura_lines = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "search_read",
+        [[
+            ("move_id", "=", factura_id),
+            ("account_id.reconcile", "=", True),
+        ]],
+        {"fields": ["id", "matched_debit_ids", "matched_credit_ids"]}
+    )
+
+    partial_ids = set()
+    for linea in factura_lines:
+        partial_ids.update(linea.get("matched_debit_ids") or [])
+        partial_ids.update(linea.get("matched_credit_ids") or [])
+
+    if not partial_ids:
+        return resultados
+
+    partials = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.partial.reconcile", "read",
+        [list(partial_ids)],
+        {
+            "fields": [
+                "id", "debit_move_id", "credit_move_id", "amount",
+                "debit_amount_currency", "credit_amount_currency",
+            ]
+        }
+    )
+
+    for pr in partials:
+        debit_line_id = pr["debit_move_id"][0]
+        credit_line_id = pr["credit_move_id"][0]
+
+        src_lines = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move.line", "read",
+            [[debit_line_id, credit_line_id]],
+            {"fields": ["id", "move_id"]}
+        )
+
+        line_by_id = {l["id"]: l for l in src_lines}
+        debit_move_id = line_by_id[debit_line_id]["move_id"][0]
+        credit_move_id = line_by_id[credit_line_id]["move_id"][0]
+
+        src_moves = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move", "read",
+            [[debit_move_id, credit_move_id]],
+            {"fields": ["id", "name"]}
+        )
+
+        move_by_id = {m["id"]: m for m in src_moves}
+
+        resultados.append({
+            "partial_id": pr["id"],
+            "debit_line_src_id": debit_line_id,
+            "credit_line_src_id": credit_line_id,
+            "debit_move_src_id": debit_move_id,
+            "credit_move_src_id": credit_move_id,
+            "debit_move_name": move_by_id[debit_move_id]["name"],
+            "credit_move_name": move_by_id[credit_move_id]["name"],
+            "amount": pr["amount"],
+            "debit_amount_currency": pr.get("debit_amount_currency") or pr["amount"],
+            "credit_amount_currency": pr.get("credit_amount_currency") or pr["amount"],
+        })
+
+    return resultados
+
+# ============================================================
+# RESOLVER LÍNEA DESTINO DESDE LÍNEA ORIGEN
+# ============================================================
+
+def obtener_linea_destino_desde_linea_origen(origen_line_id, amount=None):
+    """
+    Resuelve una account.move.line de origen a su equivalente en destino.
+
+    Prioridad:
+    1) Buscar por x_id_interno exacto en account.move.line destino.
+    2) Si en origen hay varias líneas conciliables misma cuenta/signo,
+       exigir x_id_interno. No usar fallback ambiguo.
+    3) Si no hay ambigüedad, fallback por move + cuenta + signo.
+    4) Si en el paso 2) la línea por x_id_interno no tiene residual suficiente,
+       intentar con la siguiente línea payable/receivable del mismo move,
+       misma cuenta, mismo signo y residual suficiente.
+    """
+
+    def _balance(line):
+        return line.get("balance", 0) or (
+                (line.get("debit") or 0.0) - (line.get("credit") or 0.0)
+        )
+
+    def _residual_ok(line, amount):
+        if amount is None:
+            return True
+
+        residual = abs(float(line.get("amount_residual") or 0.0))
+        amount_cmp = abs(float(amount or 0.0))
+
+        return round(residual + 0.00001, 2) >= round(amount_cmp, 2)
+
+    def _mismo_signo(balance_src, balance_dest):
+        return (
+                (balance_src > 0 and balance_dest > 0)
+                or
+                (balance_src < 0 and balance_dest < 0)
+        )
+
+    # -------------------------------------------------
+    # 1️⃣ Leer línea origen
+    # -------------------------------------------------
+    line_src = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "read",
+        [[origen_line_id]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+            ]
+        }
+    )[0]
+
+    if not line_src.get("account_id"):
+        raise Exception(f"Línea origen sin cuenta: {origen_line_id}")
+
+    move_src_id = line_src["move_id"][0]
+    account_src_id = line_src["account_id"][0]
+    balance_src = _balance(line_src)
+
+    # -------------------------------------------------
+    # 2️⃣ Datos de move/cuenta origen
+    # -------------------------------------------------
+    move_src = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "read",
+        [[move_src_id]],
+        {"fields": ["id", "name"]}
+    )[0]
+
+    acc_src = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.account", "read",
+        [[account_src_id]],
+        {"fields": ["code"]}
+    )[0]
+
+    account_code = acc_src["code"]
+
+    # -------------------------------------------------
+    # 3️⃣ Buscar move destino por x_id_interno o name
+    # -------------------------------------------------
+    move_dest_ids = models.execute_kw(
+        db, uid, password,
+        "account.move",
+        "search",
+        [[("x_id_interno", "=", move_src_id)]],
+        {"limit": 1}
+    )
+
+    if not move_dest_ids:
+        raise Exception(f"Move destino no encontrado: {move_src['name']}")
+
+    move_dest_id = move_dest_ids[0]
+
+    cuenta_dest_id = mapear_cuenta_origen_a_destino_por_code(account_code)
+
+    # -------------------------------------------------
+    # 4️⃣ Buscar primero por x_id_interno exacto
+    # -------------------------------------------------
+    line_dest = models.execute_kw(
+        db, uid, password,
+        "account.move.line",
+        "search_read",
+        [[
+            ("x_id_interno", "=", origen_line_id),
+            ("account_id.reconcile", "=", True),
+        ]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+                "amount_residual",
+                "reconciled",
+                "x_id_interno",
+            ],
+            "limit": 1,
+        }
+    )
+
+    if line_dest:
+        l = line_dest[0]
+
+        if _residual_ok(l, amount):
+            return l["id"]
+
+        print(
+            f"⚠️ Línea por x_id_interno sin residual suficiente, "
+            f"se intenta siguiente payable: "
+            f"origen_line_id={origen_line_id}, "
+            f"dest_line_id={l['id']}, "
+            f"residual={l.get('amount_residual')}, "
+            f"amount={amount}"
+        )
+
+        # No hacemos raise. Continuamos al paso 4 real:
+        # buscar otra línea equivalente en el mismo move destino.
+
+    # -------------------------------------------------
+    # 5️⃣ Detectar si en ORIGEN hay varias líneas conciliables
+    #     misma cuenta/signo.
+    # -------------------------------------------------
+    lineas_conciliables_origen = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line",
+        "search_read",
+        [[
+            ("move_id", "=", move_src_id),
+            ("account_id", "=", account_src_id),
+            ("account_id.reconcile", "=", True),
+        ]],
+        {
+            "fields": [
+                "id",
+                "debit",
+                "credit",
+                "balance",
+            ]
+        }
+    )
+
+    mismas_cuenta_signo = []
+
+    for l in lineas_conciliables_origen:
+        balance_l = _balance(l)
+
+        if _mismo_signo(balance_src, balance_l):
+            mismas_cuenta_signo.append(l)
+
+    # -------------------------------------------------
+    # 6️⃣ Buscar candidatas destino por cuenta/signo
+    # -------------------------------------------------
+    lines_dest = models.execute_kw(
+        db, uid, password,
+        "account.move.line",
+        "search_read",
+        [[
+            ("move_id", "=", move_dest_id),
+            ("account_id", "=", cuenta_dest_id),
+            ("account_id.reconcile", "=", True),
+        ]],
+        {
+            "fields": [
+                "id",
+                "debit",
+                "credit",
+                "balance",
+                "amount_residual",
+                "reconciled",
+                "x_id_interno",
+            ],
+            "order": "id",
+        }
+    )
+
+    if not lines_dest:
+        raise Exception(
+            f"No se encontró línea destino para origen_line_id={origen_line_id}, "
+            f"move={move_src['name']}, account={account_code}"
+        )
+
+    candidatas = []
+
+    for l in lines_dest:
+        balance_dest = _balance(l)
+
+        if not _mismo_signo(balance_src, balance_dest):
+            continue
+
+        if not _residual_ok(l, amount):
+            continue
+
+        candidatas.append(l)
+
+    # -------------------------------------------------
+    # 7️⃣ Prioridad 4:
+    # Si había x_id_interno pero sin residual, usar la siguiente
+    # línea payable/receivable disponible con residual suficiente.
+    # -------------------------------------------------
+    if line_dest and candidatas:
+        # Evitar devolver la misma línea que ya sabemos que no sirve
+        line_dest_id_original = line_dest[0]["id"]
+
+        candidatas_alt = [
+            l for l in candidatas
+            if l["id"] != line_dest_id_original
+        ]
+
+        if candidatas_alt:
+            elegida = sorted(
+                candidatas_alt,
+                key=lambda x: (
+                    x.get("reconciled") or False,
+                    abs(float(x.get("amount_residual") or 0.0)),
+                    x["id"],
+                )
+            )[-1]
+
+            print(
+                f"✅ Usando línea alternativa por residual suficiente: "
+                f"origen_line_id={origen_line_id}, "
+                f"dest_original={line_dest_id_original}, "
+                f"dest_alternativa={elegida['id']}, "
+                f"residual_alt={elegida.get('amount_residual')}, "
+                f"amount={amount}"
+            )
+
+            return elegida["id"]
+
+    # -------------------------------------------------
+    # 8️⃣ Si hay varias líneas origen misma cuenta/signo y no hubo
+    #     x_id_interno útil ni alternativa, mantener seguridad.
+    # -------------------------------------------------
+    if len(mismas_cuenta_signo) > 1:
+        raise Exception(
+            f"Ambigüedad: el move origen {move_src['name']} tiene "
+            f"{len(mismas_cuenta_signo)} líneas conciliables en la misma cuenta/signo. "
+            f"No se encontró x_id_interno útil ni alternativa con residual suficiente "
+            f"para origen_line_id={origen_line_id}."
+        )
+
+    # -------------------------------------------------
+    # 9️⃣ Fallback normal si no hay ambigüedad
+    # -------------------------------------------------
+    if len(candidatas) == 1:
+        return candidatas[0]["id"]
+
+    candidatas_no_reconciled = [
+        l for l in candidatas
+        if not l.get("reconciled")
+    ]
+
+    if len(candidatas_no_reconciled) == 1:
+        return candidatas_no_reconciled[0]["id"]
+
+    raise Exception(
+        f"No se pudo resolver una única línea destino para origen_line_id={origen_line_id}, "
+        f"move={move_src['name']}, candidatas={len(candidatas)}"
+    )
+
+def corregir_cuenta_linea_destino_desde_origen(origen_line_id, dest_line_id):
+    """
+    Corrige la cuenta de UNA línea destino usando la cuenta de su línea origen exacta.
+    Sirve para casos donde la factura destino tiene una línea en 410000,
+    pero en origen esa misma línea era 400000.
+    """
+    print("Corrigiendo con: corregir_cuenta_linea_destino_desde_origen")
+    # -------------------------------------------------
+    # 1️⃣ Leer línea origen
+    # -------------------------------------------------
+    line_src = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "read",
+        [[origen_line_id]],
+        {
+            "fields": [
+                "id",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+            ]
+        }
+    )[0]
+
+    if not line_src.get("account_id"):
+        raise Exception(f"Línea origen sin cuenta: {origen_line_id}")
+
+    account_src_id = line_src["account_id"][0]
+
+    acc_src = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.account", "read",
+        [[account_src_id]],
+        {"fields": ["code", "name"]}
+    )[0]
+
+    account_code_src = acc_src["code"]
+
+    # -------------------------------------------------
+    # 2️⃣ Buscar cuenta equivalente en destino
+    # -------------------------------------------------
+    cuenta_destino_correcta = mapear_cuenta_origen_a_destino_por_code(
+        account_code_src
+    )
+
+    # -------------------------------------------------
+    # 3️⃣ Leer línea destino actual
+    # -------------------------------------------------
+    line_dest = models.execute_kw(
+        db, uid, password,
+        "account.move.line", "read",
+        [[dest_line_id]],
+        {
+            "fields": [
+                "id",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+                "move_id",
+            ]
+        }
+    )[0]
+
+    if not line_dest.get("account_id"):
+        raise Exception(f"Línea destino sin cuenta: {dest_line_id}")
+
+    account_dest_actual_id = line_dest["account_id"][0]
+
+    acc_dest_actual = models.execute_kw(
+        db, uid, password,
+        "account.account", "read",
+        [[account_dest_actual_id]],
+        {"fields": ["code", "name"]}
+    )[0]
+
+    account_code_dest_actual = acc_dest_actual["code"]
+
+    if account_dest_actual_id == cuenta_destino_correcta:
+        print(
+            f"ℹ️ Línea destino {dest_line_id} ya tiene la cuenta correcta "
+            f"{account_code_src}"
+        )
+        return False
+
+    # -------------------------------------------------
+    # 4️⃣ Corregir cuenta de la línea destino concreta
+    # -------------------------------------------------
+    models.execute_kw(
+        db, uid, password,
+        "account.move.line", "write",
+        [[dest_line_id], {
+            "account_id": cuenta_destino_correcta,
+        }],
+        {
+            "context": {
+                "check_move_validity": False,
+                "tracking_disable": True,
+                "mail_notrack": True,
+            }
+        }
+    )
+
+    print(
+        f"   ✔ Línea destino corregida: "
+        f"dest_line={dest_line_id} | "
+        f"{account_code_dest_actual} → {account_code_src} | "
+        f"origen_line={origen_line_id}"
+    )
+
+    return True
+
+# ============================================================
+# CREAR PARTIAL RECONCILE EXACTO EN DESTINO
+# ============================================================
+
+def crear_partial_reconcile_exacto(
+        debit_line_id,
+        credit_line_id,
+        amount,
+        debit_amount_currency=None,
+        credit_amount_currency=None,
+):
+    """
+    Crea un account.partial.reconcile exacto.
+    No usa account.move.line.reconcile(), por tanto no depende del orden de ejecución.
+    """
+
+    lines = models.execute_kw(
+        db, uid, password,
+        "account.move.line", "read",
+        [[debit_line_id, credit_line_id]],
+        {
+            "fields": [
+                "id", "debit", "credit", "balance", "amount_residual",
+                "amount_residual_currency", "currency_id", "reconciled", "account_id",
+            ]
+        }
+    )
+
+    l1, l2 = lines
+
+    if l1["account_id"][0] != l2["account_id"][0]:
+        raise Exception(f"Las líneas no son de la misma cuenta: {l1['account_id']} vs {l2['account_id']}")
+
+    balance1 = l1.get("balance", 0) or ((l1.get("debit") or 0.0) - (l1.get("credit") or 0.0))
+    balance2 = l2.get("balance", 0) or ((l2.get("debit") or 0.0) - (l2.get("credit") or 0.0))
+
+    if balance1 <= 0 or balance2 >= 0:
+        raise Exception(f"Orden incorrecto debit/credit para partial reconcile: {balance1} / {balance2}")
+
+    amount = abs(float(amount or 0))
+
+    if amount <= 0:
+        print("⏭️ Importe <= 0, se omite")
+        return
+
+    existing = models.execute_kw(
+        db, uid, password,
+        "account.partial.reconcile", "search",
+        [[
+            ("debit_move_id", "=", debit_line_id),
+            ("credit_move_id", "=", credit_line_id),
+            ("amount", "=", amount),
+        ]],
+        {"limit": 1}
+    )
+
+    if existing:
+        print(f"⏭️ Partial ya existe: debit={debit_line_id}, credit={credit_line_id}, amount={amount}")
+        return
+
+    debit_residual = abs(float(l1.get("amount_residual") or 0))
+    credit_residual = abs(float(l2.get("amount_residual") or 0))
+
+    amount_final = min(amount, debit_residual, credit_residual)
+
+    # Si lo único disponible es una diferencia pequeña, la tratamos como cero
+    amount_exception = False
+    if amount_final < 0.10 and not amount_exception:
+        print(
+            f"⏭️ Partial omitido por residual menor a 0,10: "
+            f"amount_origen={amount}, "
+            f"debit_residual={debit_residual}, "
+            f"credit_residual={credit_residual}, "
+            f"amount_final={amount_final}, "
+            f"debit_line={debit_line_id}, "
+            f"credit_line={credit_line_id}"
+        )
+        return
+
+    # Si el importe posible no coincide con el importe de origen, no conciliamos
+    if round(amount_final, 2) != round(amount, 2):
+        raise Exception(
+            f"Residual insuficiente para crear partial exacto: "
+            f"amount_origen={amount}, "
+            f"debit_residual={debit_residual}, "
+            f"credit_residual={credit_residual}, "
+            f"amount_final={amount_final}, "
+            f"debit_line={debit_line_id}, "
+            f"credit_line={credit_line_id}"
+        )
+
+    vals = {
+        "debit_move_id": debit_line_id,
+        "credit_move_id": credit_line_id,
+        "amount": amount,
+        "debit_amount_currency": abs(float(debit_amount_currency or amount)),
+        "credit_amount_currency": abs(float(credit_amount_currency or amount)),
+    }
+
+    models.execute_kw(
+        db, uid, password,
+        "account.partial.reconcile", "create",
+        [vals],
+        {
+            "context": {
+                "active_test": False,
+                "tracking_disable": True,
+                "mail_notrack": True,
+            }
+        }
+    )
+
+    print(f"✅ Partial creado exacto: debit={debit_line_id}, credit={credit_line_id}, amount={amount}")
+
+# ============================================================
+# CONCILIAR / REPLICAR UNA FACTURA
+# ============================================================
+
+def conciliar_factura(id, factura_name, estado=None):
+    """
+    Replica en destino todos los account.partial.reconcile de origen
+    en los que participa la factura indicada.
+
+    No depende de payment_state.
+    No usa reconcile().
+    """
+
+    try:
+        print(f"🔗 Replicando partials exactos de {factura_name}")
+
+        partials_origen = detectar_partials_factura_origen(factura_name)
+
+        if not partials_origen:
+            print(f"ℹ️ Sin partial reconciles en origen para {factura_name}")
+            return
+
+        for pr in partials_origen:
+            print(
+                f"   🔹 Partial origen {pr['partial_id']}: "
+                f"{pr['debit_move_name']} ↔ {pr['credit_move_name']} "
+                f"amount={pr['amount']}"
+            )
+
+            # -------------------------------------------------
+            # 1️⃣ Asegurar que ambos moves existen en destino
+            # -------------------------------------------------
+            for move_src_id, move_name in [
+                (pr["debit_move_src_id"], pr["debit_move_name"]),
+                (pr["credit_move_src_id"], pr["credit_move_name"]),
+            ]:
+                move_dest_ids = models.execute_kw(
+                    db, uid, password,
+                    "account.move",
+                    "search",
+                    [[("x_id_interno", "=", move_src_id)]],
+                    {"limit": 1}
+                )
+
+                if not move_dest_ids:
+                    print(f"   ⚠️ Move destino no existe, se migra: {move_name}")
+                    migrar_pago_origen_a_destino(move_src_id)
+
+            # -------------------------------------------------
+            # 2️⃣ Resolver líneas destino
+            # -------------------------------------------------
+            try:
+                debit_result = obtener_linea_destino_desde_linea_origen(
+                    pr["debit_line_src_id"],
+                    amount=pr["amount"]
+                )
+
+                credit_result = obtener_linea_destino_desde_linea_origen(
+                    pr["credit_line_src_id"],
+                    amount=pr["amount"]
+                )
+
+            except Exception as e:
+                def obtener_linea_destino_fallback_por_move_cuenta_signo_residual(origen_line_id, amount):
+                    """
+                    Fallback para casos ambiguos:
+                    busca una línea destino en el mismo move, mismo signo y con residual suficiente,
+                    SIN exigir que coincida la cuenta.
+
+                    Esto permite encontrar líneas que están en una cuenta incorrecta, por ejemplo:
+                        origen 400000
+                        destino 410000
+
+                    Después, crear_partial_reconcile_exacto() lanzará:
+                        "Las líneas no son de la misma cuenta"
+
+                    y entonces conciliar_factura() podrá llamar a:
+                        corregir_cuenta_linea_destino_desde_origen()
+                    """
+
+                    def _balance(line):
+                        return line.get("balance", 0) or (
+                                (line.get("debit") or 0.0) - (line.get("credit") or 0.0)
+                        )
+
+                    # -------------------------------------------------
+                    # 1️⃣ Leer línea origen
+                    # -------------------------------------------------
+                    line_src = models_src.execute_kw(
+                        db_src, uid_src, password_src,
+                        "account.move.line", "read",
+                        [[origen_line_id]],
+                        {
+                            "fields": [
+                                "id",
+                                "move_id",
+                                "account_id",
+                                "debit",
+                                "credit",
+                                "balance",
+                            ]
+                        }
+                    )[0]
+
+                    if not line_src.get("account_id"):
+                        raise Exception(f"Línea origen sin cuenta: {origen_line_id}")
+
+                    move_src_id = line_src["move_id"][0]
+                    balance_src = _balance(line_src)
+                    amount_cmp = abs(float(amount or 0.0))
+
+                    # -------------------------------------------------
+                    # 2️⃣ Leer move origen
+                    # -------------------------------------------------
+                    move_src = models_src.execute_kw(
+                        db_src, uid_src, password_src,
+                        "account.move", "read",
+                        [[move_src_id]],
+                        {
+                            "fields": [
+                                "id",
+                                "name",
+                            ]
+                        }
+                    )[0]
+
+                    # -------------------------------------------------
+                    # 3️⃣ Buscar move destino por x_id_interno o name
+                    # -------------------------------------------------
+                    move_dest_ids = models.execute_kw(
+                        db, uid, password,
+                        "account.move", "search",
+                        [[("x_id_interno", "=", move_src_id)]],
+                        {"limit": 1}
+                    )
+
+                    if not move_dest_ids:
+                        move_dest_ids = models.execute_kw(
+                            db, uid, password,
+                            "account.move", "search",
+                            [[("name", "=", move_src["name"])]],
+                            {"limit": 1}
+                        )
+
+                    if not move_dest_ids:
+                        raise Exception(f"Move destino no encontrado: {move_src['name']}")
+
+                    move_dest_id = move_dest_ids[0]
+
+                    # -------------------------------------------------
+                    # 4️⃣ Buscar TODAS las líneas conciliables destino
+                    #     No filtramos por cuenta para poder detectar/corregir 410000 → 400000
+                    # -------------------------------------------------
+                    lines_dest = models.execute_kw(
+                        db, uid, password,
+                        "account.move.line", "search_read",
+                        [[
+                            ("move_id", "=", move_dest_id),
+                            ("account_id.reconcile", "=", True),
+                        ]],
+                        {
+                            "fields": [
+                                "id",
+                                "account_id",
+                                "debit",
+                                "credit",
+                                "balance",
+                                "amount_residual",
+                                "reconciled",
+                                "x_id_interno",
+                            ],
+                            "order": "id",
+                        }
+                    )
+
+                    if not lines_dest:
+                        raise Exception(
+                            f"No hay líneas conciliables destino para move={move_src['name']}"
+                        )
+
+                    # -------------------------------------------------
+                    # 5️⃣ Filtrar por mismo signo y residual suficiente / tolerancia
+                    # -------------------------------------------------
+                    candidatas = []
+
+                    for l in lines_dest:
+                        balance_dest = _balance(l)
+                        residual = abs(float(l.get("amount_residual") or 0.0))
+
+                        mismo_signo = (
+                                (balance_src > 0 and balance_dest > 0)
+                                or
+                                (balance_src < 0 and balance_dest < 0)
+                        )
+
+                        if not mismo_signo:
+                            continue
+
+                        diferencia = round(amount_cmp - residual, 2)
+
+                        # Si falta más de 0,10, descartamos.
+                        # Si falta 0,01 / 0,02 / etc., dejamos pasar para que luego se gestione.
+                        if diferencia > 0.10:
+                            continue
+
+                        # Evitar líneas completamente consumidas salvo que el amount también sea micro.
+                        if residual <= 0 and amount_cmp >= 0.10:
+                            continue
+
+                        candidatas.append(l)
+
+                    if not candidatas:
+                        raise Exception(
+                            f"No hay línea destino fallback con residual suficiente para "
+                            f"origen_line_id={origen_line_id}, move={move_src['name']}, amount={amount_cmp}"
+                        )
+
+                    # -------------------------------------------------
+                    # 6️⃣ Elegir candidata
+                    #     Preferimos:
+                    #       - no reconciled
+                    #       - residual más cercano al importe esperado
+                    #       - id más bajo
+                    # -------------------------------------------------
+                    def _score(line):
+                        residual = abs(float(line.get("amount_residual") or 0.0))
+                        diferencia_abs = abs(round(residual - amount_cmp, 2))
+
+                        return (
+                            bool(line.get("reconciled")),
+                            diferencia_abs,
+                            line["id"],
+                        )
+
+                    candidatas = sorted(candidatas, key=_score)
+                    elegida = candidatas[0]
+
+                    print(
+                        f"✅ Fallback ambiguo resuelto: "
+                        f"origen_line_id={origen_line_id} → dest_line={elegida['id']} | "
+                        f"residual={elegida.get('amount_residual')} | "
+                        f"account={elegida.get('account_id')} | "
+                        f"amount={amount_cmp}"
+                    )
+
+                    return elegida["id"]
+
+                msg = str(e)
+
+                if (
+                        "sin residual útil" in msg
+                        or "residual insuficiente" in msg
+                        or "ya conciliada" in msg
+                ):
+                    print(
+                        f"⏭️ Partial origen {pr['partial_id']} omitido porque ya parece conciliado "
+                        f"o sin residual suficiente en destino: {msg}"
+                    )
+                    continue
+
+
+                elif (
+                        "misma cuenta/signo" in msg
+                        or "Ambigüedad" in msg
+                        or "No se pudo resolver una única línea destino" in msg
+                ):
+
+                    print(
+                        f"⚠️ No se pudo resolver líneas para partial {pr['partial_id']}. "
+                        f"Se intenta fallback por línea conciliable con residual suficiente."
+                    )
+
+                    try:
+                        debit_result = obtener_linea_destino_fallback_por_move_cuenta_signo_residual(
+                            pr["debit_line_src_id"],
+                            pr["amount"]
+                        )
+
+                        credit_result = obtener_linea_destino_fallback_por_move_cuenta_signo_residual(
+                            pr["credit_line_src_id"],
+                            pr["amount"]
+                        )
+
+                    except Exception as e2:
+                        print(
+                            f"⏭️ Partial origen {pr['partial_id']} omitido. "
+                            f"No se pudo resolver fallback: {e2}"
+                        )
+                        continue
+
+                else:
+                    raise
+
+            debit_line_dest_ids = (
+                debit_result
+                if isinstance(debit_result, list)
+                else [debit_result]
+            )
+
+            credit_line_dest_ids = (
+                credit_result
+                if isinstance(credit_result, list)
+                else [credit_result]
+            )
+
+            if len(debit_line_dest_ids) != 1:
+                print(
+                    f"⚠️ Partial {pr['partial_id']} omitido: se esperaba 1 línea debit destino, "
+                    f"pero se obtuvieron {len(debit_line_dest_ids)}"
+                )
+                continue
+
+            if len(credit_line_dest_ids) != 1:
+                print(
+                    f"⚠️ Partial {pr['partial_id']} omitido: se esperaba 1 línea credit destino, "
+                    f"pero se obtuvieron {len(credit_line_dest_ids)}"
+                )
+                continue
+
+            debit_line_dest_id = debit_line_dest_ids[0]
+            credit_line_dest_id = credit_line_dest_ids[0]
+
+            # -------------------------------------------------
+            # 3️⃣ Crear partial exacto
+            # -------------------------------------------------
+            try:
+                crear_partial_reconcile_exacto(
+                    debit_line_dest_id,
+                    credit_line_dest_id,
+                    pr["amount"],
+                    pr["debit_amount_currency"],
+                    pr["credit_amount_currency"],
+                )
+
+            except Exception as e:
+                msg = str(e)
+
+                # -------------------------------------------------
+                # 3.1️⃣ Residuales insuficientes / ya consumidos
+                # -------------------------------------------------
+                if (
+                        "Residual insuficiente" in msg
+                        or "residual insuficiente" in msg
+                        or "residual menor a 0,10" in msg
+                        or "sin residual útil" in msg
+                        or "Partial ya existe" in msg
+                ):
+                    print(
+                        f"⏭️ Partial origen {pr['partial_id']} omitido por residual insuficiente, "
+                        f"ya consumido o ya existente en destino: {msg}"
+                    )
+                    continue
+
+                # -------------------------------------------------
+                # 3.2️⃣ Cuentas distintas: corregir línea concreta
+                # -------------------------------------------------
+                if "Las líneas no son de la misma cuenta" in msg:
+                    print(
+                        f"🔧 Corrigiendo cuentas de líneas destino para partial "
+                        f"{pr['partial_id']}"
+                    )
+                    print(f"   Factura: {factura_name}")
+                    print(
+                        f"   debit_src={pr['debit_line_src_id']} "
+                        f"→ debit_dest={debit_line_dest_id}"
+                    )
+                    print(
+                        f"   credit_src={pr['credit_line_src_id']} "
+                        f"→ credit_dest={credit_line_dest_id}"
+                    )
+
+                    try:
+                        corregir_cuenta_linea_destino_desde_origen(
+                            pr["debit_line_src_id"],
+                            debit_line_dest_id
+                        )
+
+                        corregir_cuenta_linea_destino_desde_origen(
+                            pr["credit_line_src_id"],
+                            credit_line_dest_id
+                        )
+
+                        crear_partial_reconcile_exacto(
+                            debit_line_dest_id,
+                            credit_line_dest_id,
+                            pr["amount"],
+                            pr["debit_amount_currency"],
+                            pr["credit_amount_currency"],
+                        )
+
+                    except Exception as e2:
+                        msg2 = str(e2)
+
+                        if (
+                                "Residual insuficiente" in msg2
+                                or "residual insuficiente" in msg2
+                                or "residual menor a 0,10" in msg2
+                                or "sin residual útil" in msg2
+                                or "Partial ya existe" in msg2
+                        ):
+                            print(
+                                f"⏭️ Partial origen {pr['partial_id']} omitido tras corregir cuenta "
+                                f"por residual insuficiente, ya consumido o ya existente: {msg2}"
+                            )
+                            continue
+
+                        print(
+                            f"❌ Error corrigiendo cuentas para partial "
+                            f"{pr['partial_id']} de {factura_name}: {e2}"
+                        )
+                        continue
+
+                    continue
+
+                # -------------------------------------------------
+                # 3.3️⃣ Error no controlado
+                # -------------------------------------------------
+                print(
+                    f"❌ Error al conciliar factura: {factura_name}, "
+                    f"partial={pr['partial_id']}, Error: {msg}"
+                )
+                continue
+
+        print(f"✅ Partials exactos replicados para {factura_name}")
+
+    except Exception as e:
+        msg = str(e)
+
+        if "cannot marshal None unless allow_none is enabled" in msg:
+            print("✅ Conciliación completada")
+            return
+
+        print(f"❌ Error al conciliar factura: {factura_name}, Error: {e}")
+
+# ============================================================
+# CONCILIAR TODAS LAS FACTURAS
+# ============================================================
+
+def conciliar_todas_las_facturas():
+    print("🚀 Iniciando replicación masiva de partial reconciles...")
+
+    factura_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "search",
+        [[
+            ("move_type", "in", [
+                "out_invoice",
+                "out_refund",
+                "in_invoice",
+                "in_refund",
+            ]),
+            ("state", "=", "posted"),
+            ("payment_state", "!=", "not_paid"),
+            ("company_id", "=", COMPANY_SRC_ID),
+            ("date", ">=", FECHA_INICIO),
+            ("date", "<", FECHA_FIN),
+        ]]
+    )
+
+    if not factura_ids:
+        print("ℹ️ No hay facturas para replicar.")
+        return
+
+    facturas = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "read",
+        [factura_ids],
+        {"fields": ["id", "name", "payment_state"]}
+    )
+
+    print(f"📄 Facturas detectadas: {len(facturas)}")
+
+    for f in facturas:
+        factura_id = f["id"]
+        nombre = f["name"]
+        estado = f["payment_state"]
+
+        if TEST and nombre not in FACTURAS_A_CONCILIAR_TEST:
+            continue
+
+        print(f"\n🔗 Replicando partials de factura {nombre} (estado={estado})")
+
+        try:
+            conciliar_factura(factura_id, nombre, estado)
+        except Exception as e:
+            print(f"❌ Error replicando {nombre}: {e}")
+
+    print("✅ Replicación masiva finalizada")
+
+# ============================================================
+# LLAMADA
+# ============================================================
+
+#conciliar_todas_las_facturas()
+#conciliar_todas_las_facturas_()
+
+def normalizar_reverted_sobrantes_destino(company_src_id=2, aplicar=False):
+    """
+    Busca facturas que en DESTINO están payment_state='reversed'
+    pero que en ORIGEN no están reversed.
+
+    No escribe payment_state directamente.
+    Limpia reversed_entry_id en destino para que Odoo recalcule el estado
+    según las conciliaciones reales.
+
+    aplicar=False -> solo muestra lo que haría
+    aplicar=True  -> aplica cambios
+    """
+
+    print("🔎 Buscando facturas reversed en ORIGEN...")
+
+    # -------------------------------------------------
+    # 1️⃣ Facturas reversed en ORIGEN
+    # -------------------------------------------------
+    src_reversed_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "search",
+        [[
+            ("move_type", "in", [
+                "out_invoice",
+                "out_refund",
+                "in_invoice",
+                "in_refund",
+            ]),
+            ("state", "=", "posted"),
+            ("payment_state", "=", "reversed"),
+            ("company_id", "=", company_src_id),
+            ("date", ">=", "2025-01-01"), ("date", "<", "2026-01-01")
+        ]]
+    )
+
+    src_reversed_set = set(src_reversed_ids)
+
+    print(f"📌 Facturas reversed en ORIGEN: {len(src_reversed_set)}")
+
+    # -------------------------------------------------
+    # 2️⃣ Facturas reversed en DESTINO
+    # -------------------------------------------------
+    print("🔎 Buscando facturas reversed en DESTINO...")
+
+    dest_reversed_ids = models.execute_kw(
+        db, uid, password,
+        "account.move", "search",
+        [[
+            ("move_type", "in", [
+                "out_invoice",
+                "out_refund",
+                "in_invoice",
+                "in_refund",
+            ]),
+            ("state", "=", "posted"),
+            ("payment_state", "=", "reversed"),
+            ("date", ">=", "2025-01-01"), ("date", "<", "2026-01-01")
+        ]]
+    )
+
+    if not dest_reversed_ids:
+        print("ℹ️ No hay facturas reversed en DESTINO")
+        return []
+
+    dest_reversed = models.execute_kw(
+        db, uid, password,
+        "account.move", "read",
+        [dest_reversed_ids],
+        {
+            "fields": [
+                "id",
+                "name",
+                "x_id_interno",
+                "payment_state",
+                "amount_total",
+                "amount_residual",
+                "reversed_entry_id",
+            ]
+        }
+    )
+
+    print(f"📌 Facturas reversed en DESTINO: {len(dest_reversed)}")
+
+    # -------------------------------------------------
+    # 3️⃣ Filtrar reversed sobrantes
+    # -------------------------------------------------
+    sobrantes = []
+
+    for move in dest_reversed:
+        x_id = move.get("x_id_interno")
+
+        if not x_id:
+            print(
+                f"⚠️ Destino reversed sin x_id_interno: "
+                f"{move.get('name')} | id={move.get('id')}"
+            )
+            continue
+
+        if x_id not in src_reversed_set:
+            sobrantes.append(move)
+
+    print(f"❗ Reversed sobrantes en DESTINO: {len(sobrantes)}")
+
+    if not sobrantes:
+        print("✅ No hay reversed sobrantes que normalizar")
+        return []
+
+    # -------------------------------------------------
+    # 4️⃣ Mostrar candidatos
+    # -------------------------------------------------
+    for m in sobrantes:
+        print(
+            f"   🔸 {m['name']} | "
+            f"dest_id={m['id']} | "
+            f"x_id_interno={m.get('x_id_interno')} | "
+            f"total={m.get('amount_total')} | "
+            f"residual={m.get('amount_residual')} | "
+            f"reversed_entry_id={m.get('reversed_entry_id')}"
+        )
+
+    if not aplicar:
+        print("\n🧪 Modo simulación. No se ha modificado nada.")
+        print("👉 Ejecuta con aplicar=True para aplicar los cambios.")
+        #return sobrantes
+
+    # -------------------------------------------------
+    # 5️⃣ Aplicar acción de servidor 730 factura a factura
+    # -------------------------------------------------
+    print("\n🛠️ Aplicando acción de servidor 730 factura a factura...")
+
+    for m in sobrantes:
+        move_id = m["id"]
+        name = m.get("name")
+
+        print(f"\n🔧 Aplicando acción 730 sobre {name} | id={move_id}")
+
+        try:
+            models.execute_kw(
+                db, uid, password,
+                "ir.actions.server", "run",
+                [[730]],
+                {
+                    "context": {
+                        "active_model": "account.move",
+                        "active_ids": [move_id],
+                        "active_id": move_id,
+                    }
+                }
+            )
+
+            print(f"✅ Acción 730 aplicada correctamente sobre {name}")
+
+        except Exception as e:
+            msg = str(e)
+
+            if "cannot marshal <class 'odoo.api.ir.actions.server'> objects" in msg:
+                print(f"✅ Acción 730 ejecutada sobre {name}")
+                print("⚠️ Odoo devolvió un objeto no serializable por XML-RPC, se ignora.")
+
+            elif "cannot marshal" in msg:
+                print(f"✅ Acción 730 probablemente ejecutada sobre {name}")
+                print(f"⚠️ Error de serialización XML-RPC ignorado: {msg}")
+
+            else:
+                print(f"❌ Error aplicando acción 730 sobre {name}: {e}")
+                continue
+
+    print("\n✅ Proceso de acción 730 finalizado")
+
+#normalizar_reverted_sobrantes_destino(aplicar=True)
+# endregion
+
+# region REGION PROYECTOS
 # ---------------------------------------------------------------
 # 🔹 MIGRACIÓN DE PROYECTOS (project.project)
 # ---------------------------------------------------------------
 
-def export_projects(company_name="ALMAITANA DE LUZ, S.L."):
+def sincronizar_x_id_proyectos_existentes():
+    """
+    Busca proyectos ya creados en Odoo destino (por ventas),
+    encuentra su equivalente en Odoo origen por nombre,
+    y escribe el ID origen en el campo x_id_interno.
+    """
+
+    from App_Connection import db, uid, password, models
+    import xmlrpc.client
+    import re
+
+    def extraer_codigo_opt(texto):
+        """
+        Extrae secuencia tipo OPT/24/1227 de un string.
+        """
+        patron = r'OPT/\d+/\d+'
+        match = re.search(patron, texto)
+        return match.group(0) if match else None
+
+    total_actualizados = 0
+    total_no_encontrados = 0
+
+    print("🔎 Sincronizando proyectos existentes...")
+
+    # 1️⃣ Obtener todos los proyectos en destino sin x_id_interno
+    proyectos_destino = models.execute_kw(
+        db, uid, password,
+        "project.project", "search_read",
+        [[]],#[[("x_id_interno", "=", 0)]],
+        {"fields": ["id", "name"]}
+    )
+
+    print(f"📂 {len(proyectos_destino)} proyectos a revisar.")
+
+    for proj_dest in proyectos_destino:
+        name = proj_dest["name"]
+        codigo = extraer_codigo_opt(name)
+        dest_id = proj_dest["id"]
+
+        if name == "Interno": continue
+
+        print(f"\n📁 Procesando: {name}")
+
+        # 2️⃣ Buscar en origen por nombre exacto
+        proyectos_origen = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "project.project", "search_read",
+            [[("name", "ilike", codigo)]],
+            {
+                "fields": ["id", "active"],
+                "limit": 1,
+                "context": {"active_test": False}
+            }
+        )
+
+        if proyectos_origen:
+            id_origen = proyectos_origen[0]["id"]
+
+            # 3️⃣ Escribir x_id_interno en destino
+            try:
+                models.execute_kw(
+                    db, uid, password,
+                    "project.project", "write",
+                    [[dest_id], {"x_id_interno": id_origen}]
+                )
+
+                print(f"✅ Actualizado con ID origen: {id_origen}")
+                total_actualizados += 1
+
+            except Exception as e:
+                print(f"❌ Error escribiendo proyecto {name}: {e}")
+
+        else:
+            print("⚠️ No encontrado en origen.")
+            total_no_encontrados += 1
+
+    print("\n📊 SINCRONIZACIÓN COMPLETADA")
+    print(f"   Actualizados: {total_actualizados}")
+    print(f"   No encontrados: {total_no_encontrados}")
+
+def export_projects():
     """
     Exporta todos los proyectos activos de Odoo 16.
     Incluye campos clave como nombre, responsable, cliente y fechas.
     """
     import xmlrpc.client
 
-    url = 'https://optimaluz.soluntec.net'
-    db_old = 'Test'
-    username = 'jcoronado@optimaluz.com'
-    password_old = 'AlAi4ever'
-
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid_old = common.authenticate(db_old, username, password_old, {})
-    if not uid_old:
-        print("❌ No se pudo autenticar en origen.")
-        return []
-
-    models_old = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-    print(f'🔌 Conectado a Odoo origen como {username}')
-
     # Buscar compañía origen
-    company_id_src = models_old.execute_kw(
-        db_old, uid_old, password_old,
-        'res.company', 'search',
-        [[('name', '=', company_name)]],
-        {'limit': 1}
-    )
-    company_id_src = company_id_src[0] if company_id_src else False
+    company_id_src = 2
 
     # Campos de interés
     FIELDS = [
@@ -3758,21 +9540,20 @@ def export_projects(company_name="ALMAITANA DE LUZ, S.L."):
         "date_start",
         "date",
         "description",
-        "analytic_account_id",
-        "privacy_visibility",  # público, seguidores, portal
+        "privacy_visibility",
+        "id"
     ]
 
     # Buscar proyectos de esa compañía
-    projects = models_old.execute_kw(
-        db_old, uid_old, password_old,
+    projects = models_src.execute_kw(
+        db_src, uid_src, password_src,
         "project.project", "search_read",
-        [[("company_id", "=", company_id_src)]],
+        [[("company_id", "=", company_id_src), ("active", "in", [True, False])]],
         {"fields": FIELDS}
     )
 
     print(f"📤 {len(projects)} proyectos exportados correctamente.")
     return projects
-
 
 def import_projects(projects):
     """
@@ -3785,31 +9566,36 @@ def import_projects(projects):
     STAGE_ID_MAP = {
         5: 1,
         7: 2,
-        8: 5,
+        8: 6,
         9: 3,
         10: 4,
-        11: 6,
+        11: 5,
     }
 
     total_creados = 0
     total_existentes = 0
 
     def find_user_id(user_name):
+        if not user_name: return None
         users = models.execute_kw(
             db, uid, password,
             "res.users", "search_read",
             [[("name", "=", user_name)]],
             {"fields": ["id"], "limit": 1}
         )
-        return users[0]["id"] if users else None
+        return users[0]["id"] if users else 43
 
-    def find_partner_id(partner_name):
+    def find_partner_id(partner_name, partner_id_src):
         partners = models.execute_kw(
             db, uid, password,
             "res.partner", "search_read",
             [[("name", "=", partner_name)]],
             {"fields": ["id"], "limit": 1}
         )
+        if not partners:
+            partner_id = Utils.get_by_x_id_interno("res.partner", partner_id_src, db, uid, password, models)
+            return partner_id
+
         return partners[0]["id"] if partners else None
 
     print("📥 Iniciando importación de proyectos...")
@@ -3822,10 +9608,9 @@ def import_projects(projects):
         existing = models.execute_kw(
             db, uid, password,
             "project.project", "search",
-            [[("name", "=", name)]]
+            [[("x_id_interno", "=", proj.get("id"))]]
         )
         if existing:
-            print(f"⚠️ Proyecto ya existente: {name}")
             total_existentes += 1
             continue
 
@@ -3838,8 +9623,9 @@ def import_projects(projects):
         # Buscar cliente
         partner_id = None
         if proj.get("partner_id"):
+            partner_id = proj["partner_id"][0]
             partner_name = proj["partner_id"][1]
-            partner_id = find_partner_id(partner_name)
+            partner_id = find_partner_id(partner_name, partner_id)
 
         stage_id = None
         if proj.get("stage_id"):
@@ -3858,6 +9644,7 @@ def import_projects(projects):
             "privacy_visibility": proj.get("privacy_visibility", "followers"),
             "allow_billable": True,
             "stage_id": stage_id,
+            "x_id_interno": proj.get("id"),
         }
 
         # Limpiar valores nulos (evita TypeError: cannot marshal None)
@@ -3875,6 +9662,120 @@ def import_projects(projects):
     print(f"   Total creados: {total_creados}")
     print(f"   Ya existentes: {total_existentes}")
 
+def actualizar_proyectos_desde_origen():
+    """
+    Sincroniza proyectos destino con origen:
+    - allocated_hours
+    - user_id (si está vacío)
+    - stage_id según STAGE_ID_MAP
+    """
+
+    from App_Connection import db, uid, password, models
+
+    import xmlrpc.client
+
+    STAGE_ID_MAP = {
+        5: 1,
+        7: 2,
+        8: 6,
+        9: 3,
+        10: 4,
+        11: 5,
+    }
+
+    def find_user_id(user_name):
+        if not user_name:
+            return None
+
+        users = models.execute_kw(
+            db, uid, password,
+            "res.users", "search_read",
+            [[("name", "=", user_name)]],
+            {"fields": ["id"], "limit": 1}
+        )
+        return users[0]["id"] if users else 43
+
+    print("🔄 Actualizando proyectos desde origen...")
+
+    # 1️⃣ Obtener proyectos destino que tengan x_id_interno
+    proyectos_destino = models.execute_kw(
+        db, uid, password,
+        "project.project", "search_read",
+        [[("x_id_interno", "!=", False)]],
+        {
+            "fields": ["id", "x_id_interno", "user_id"],
+            "context": {"active_test": False}
+        }
+    )
+
+    print(f"📂 {len(proyectos_destino)} proyectos encontrados en destino.")
+
+    total_actualizados = 0
+
+    for proj_dest in proyectos_destino:
+
+        dest_id = proj_dest["id"]
+        id_origen = proj_dest["x_id_interno"]
+
+        print(f"\n📁 Procesando proyecto destino ID {dest_id} (origen {id_origen})")
+
+        # 2️⃣ Buscar proyecto en origen
+        proyectos_origen = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "project.project", "search_read",
+            [[("id", "=", id_origen)]],
+            {
+                "fields": ["allocated_hours", "user_id", "stage_id"],
+                "context": {"active_test": False},
+                "limit": 1
+            }
+        )
+
+        if not proyectos_origen:
+            print("⚠️ Proyecto no encontrado en origen")
+            continue
+
+        proj_src = proyectos_origen[0]
+
+        vals_update = {}
+
+        # 3️⃣ allocated_hours
+        allocated_hours = proj_src.get("allocated_hours")
+        if allocated_hours is not None:
+            vals_update["allocated_hours"] = allocated_hours
+
+        # 4️⃣ user_id (solo si no tiene en destino)
+        if not proj_dest.get("user_id") and proj_src.get("user_id"):
+            user_name = proj_src["user_id"][1]
+            user_id_dest = find_user_id(user_name)
+            if user_id_dest:
+                vals_update["user_id"] = user_id_dest
+
+        # 5️⃣ stage_id con mapeo
+        if proj_src.get("stage_id"):
+            stage_src_id = proj_src["stage_id"][0]
+            stage_dest_id = STAGE_ID_MAP.get(stage_src_id)
+
+            if stage_dest_id:
+                vals_update["stage_id"] = stage_dest_id
+
+        # 6️⃣ Escribir si hay algo que actualizar
+        if vals_update:
+            try:
+                models.execute_kw(
+                    db, uid, password,
+                    "project.project", "write",
+                    [[dest_id], vals_update]
+                )
+                print(f"✅ Actualizado: {vals_update}")
+                total_actualizados += 1
+            except Exception as e:
+                print(f"❌ Error actualizando proyecto {dest_id}: {e}")
+        else:
+            print("ℹ️ Nada que actualizar")
+
+    print("\n📊 ACTUALIZACIÓN COMPLETADA")
+    print(f"   Total actualizados: {total_actualizados}")
 
 # ---------------------------------------------------------------
 # 🔸 Función principal
@@ -3884,42 +9785,21 @@ def migrar_proyectos():
     proyectos = export_projects()
     import_projects(proyectos)
 
-
 # Llamada directa (opcional)
-# migrar_proyectos()
+#migrar_proyectos()
 
 # ---------------------------------------------------------------
 # 🔹 MIGRACIÓN DE TAREAS (project.task)
 # ---------------------------------------------------------------
 
-def export_tasks(company_name="ALMAITANA DE LUZ, S.L."):
+def export_tasks():
     """
     Exporta todas las tareas activas de Odoo 16 con sus campos clave.
     """
     import xmlrpc.client
 
-    url = 'https://optimaluz.soluntec.net'
-    db_old = 'Test'
-    username = 'jcoronado@optimaluz.com'
-    password_old = 'AlAi4ever'
-
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid_old = common.authenticate(db_old, username, password_old, {})
-    if not uid_old:
-        print("❌ No se pudo autenticar en origen.")
-        return []
-
-    models_old = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-    print(f'🔌 Conectado a Odoo origen como {username}')
-
     # Buscar compañía
-    company_id_src = models_old.execute_kw(
-        db_old, uid_old, password_old,
-        'res.company', 'search',
-        [[('name', '=', company_name)]],
-        {'limit': 1}
-    )
-    company_id_src = company_id_src[0] if company_id_src else False
+    company_id_src = 2
 
     # Campos relevantes
     FIELDS = [
@@ -3941,58 +9821,127 @@ def export_tasks(company_name="ALMAITANA DE LUZ, S.L."):
         "user_ids"
     ]
 
-    tasks = models_old.execute_kw(
-        db_old, uid_old, password_old,
+    tasks = models_src.execute_kw(
+        db_src, uid_src, password_src,
         "project.task", "search_read",
-        [[("company_id", "=", company_id_src)]],
+        [[("company_id", "=", company_id_src), ("active", "in", [True, False])]],
         {"fields": FIELDS}
     )
 
     print(f"📤 {len(tasks)} tareas exportadas correctamente.")
+    import_tasks(tasks, adjuntos=True)
     return tasks
-
 
 def import_tasks(tasks, adjuntos=True):
     """
-    Requisito: Desisntalar modulo website_sale_wishlist
-    Importa las tareas desde Odoo 16 a Odoo 18.
-    Mantiene nombre, responsable, proyecto, cliente y horas.
+    Importa tareas desde Odoo 16 a Odoo 18.
+    - Asigna proyecto por x_old_project_id
+    - Evita duplicados por x_old_task_id
+    - Integra sale_line_id, user_ids y tag_ids en el create
     """
-    import xmlrpc.client
-    from App_Connection import db, uid, password, models
+    import time
 
-    total_creadas = 0
-    total_existentes = 0
-
-    # -------------------------------
-    # Helpers
-    # -------------------------------
     def find_user_id(user_name):
+        if not user_name: return None
         users = models.execute_kw(
             db, uid, password,
             "res.users", "search_read",
             [[("name", "=", user_name)]],
             {"fields": ["id"], "limit": 1}
         )
-        return users[0]["id"] if users else None
+        return users[0]["id"] if users else 43
 
-    def find_partner_id(partner_name):
-        partners = models.execute_kw(
-            db, uid, password,
-            "res.partner", "search_read",
-            [[("name", "=", partner_name)]],
-            {"fields": ["id"], "limit": 1}
-        )
-        return partners[0]["id"] if partners else None
+    def migrar_adjuntos_tarea(origen_task_id, destino_task_id, lote=30, delay=0.1):
+        """
+        Migra adjuntos de una tarea desde Odoo ORIGEN → DESTINO.
 
-    def find_project_id(project_name):
-        projects = models.execute_kw(
-            db, uid, password,
-            "project.project", "search_read",
-            [[("name", "=", project_name)]],
-            {"fields": ["id"], "limit": 1}
+        origen_task_id : ID de tarea en origen
+        destino_task_id : ID de tarea en destino
+        lote : cantidad de adjuntos por lote
+        delay : pausa entre lotes
+        """
+        import math
+        import time
+
+        def safe_value(v):
+            return v[0] if isinstance(v, list) else v
+
+        print(f"\n=== MIGRANDO ADJUNTOS TAREA {origen_task_id} → {destino_task_id} ===")
+
+        # --------------------------------------------------
+        # 🔹 LEER ADJUNTOS EN ORIGEN
+        # --------------------------------------------------
+        attach_ids = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            'ir.attachment', 'search',
+            [[
+                ('res_model', '=', 'project.task'),
+                ('res_id', '=', origen_task_id)
+            ]]
         )
-        return projects[0]["id"] if projects else None
+
+        total_adjuntos = len(attach_ids)
+        print(f"📎 Adjuntos encontrados en origen: {total_adjuntos}")
+
+        if total_adjuntos == 0:
+            print("No hay adjuntos que migrar.")
+            return
+
+        num_lotes = math.ceil(total_adjuntos / lote)
+
+        # --------------------------------------------------
+        # 🔹 MIGRAR POR LOTES
+        # --------------------------------------------------
+        for i in range(num_lotes):
+            inicio = i * lote
+            fin = inicio + lote
+            lote_ids = attach_ids[inicio:fin]
+
+            print(f"\nProcesando lote {i + 1}/{num_lotes} ({len(lote_ids)} adjuntos)...")
+
+            adjuntos = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                'ir.attachment', 'read',
+                [lote_ids, ['name', 'datas', 'mimetype']]
+            )
+
+            for att in adjuntos:
+                try:
+                    existing = models.execute_kw(
+                        db, uid, password,
+                        'ir.attachment', 'search',
+                        [[
+                            ('res_model', '=', 'account.move'),
+                            ('res_id', '=', destino_task_id),
+                            ('name', '=', att['name']),
+                        ]],
+                        {'limit': 1}
+                    )
+
+                    if existing:
+                        continue
+
+                    models.execute_kw(
+                        db, uid, password,
+                        'ir.attachment', 'create',
+                        [{
+                            'name': safe_value(att['name']),
+                            'datas': safe_value(att['datas']),
+                            'mimetype': safe_value(att['mimetype']),
+                            'res_model': 'project.task',
+                            'res_id': destino_task_id,
+                        }]
+                    )
+                except Exception as e:
+                    print(f"⚠️ Error importando adjunto '{att['name']}': {e}")
+
+            print(f"✓ Lote {i + 1}/{num_lotes} completado.")
+            time.sleep(delay)
+
+        print("\n=== MIGRACIÓN DE ADJUNTOS COMPLETADA ===")
+
+    total_creadas = 0
+    total_existentes = 0
 
     print("📥 Iniciando importación de tareas...")
 
@@ -4006,46 +9955,107 @@ def import_tasks(tasks, adjuntos=True):
         print(f"\n🗂️ Procesando tarea ORIGEN ID {old_task_id}: {name}")
 
         # -------------------------------
-        # Comprobación por ID de origen
+        # Comprobación idempotente
         # -------------------------------
-        existing = models.execute_kw(
+        '''existing = models.execute_kw(
             db, uid, password,
             "project.task", "search",
-            [[("x_old_task_id", "=", old_task_id)]],
+            [[("x_id_interno", "=", old_task_id)]],
             {"limit": 1}
         )
-
         if existing:
             print(f"⚠️  Tarea ya importada (x_old_task_id={old_task_id}) → se omite")
             total_existentes += 1
-            continue
+            continue'''
 
         # -------------------------------
-        # Proyecto
+        # Proyecto (por x_old_project_id)
         # -------------------------------
         project_id = None
         if task.get("project_id"):
-            project_name = task["project_id"][1]
-            project_id = find_project_id(project_name)
+            old_project_id = task["project_id"][0]
+            project_ids = models.execute_kw(
+                db, uid, password,
+                "project.project", "search",
+                [[("x_id_interno", "=", old_project_id)]],
+                {"limit": 1}
+            )
+            if project_ids:
+                project_id = project_ids[0]
+            else:
+                print(f"⚠️ Proyecto destino no encontrado para x_old_project_id={old_project_id}")
 
         # -------------------------------
-        # Usuario responsable
+        # Usuario responsable (many2one)
         # -------------------------------
         user_id = None
         if task.get("user_id"):
-            user_name = task["user_id"][1]
-            user_id = find_user_id(user_name)
+            user_name_src = task["user_id"][1]
+            find_user_id(user_name_src)
+            #user_id = Utils.get_by_x_id_interno("res.users", user_id_src, db, uid, password, models)
 
         # -------------------------------
         # Cliente
         # -------------------------------
         partner_id = None
         if task.get("partner_id"):
-            partner_name = task["partner_id"][1]
-            partner_id = find_partner_id(partner_name)
+            partner_id_origen = task['partner_id'][0]
+            partner_id = Utils.get_by_x_id_interno("res.partner", partner_id_origen, db, uid, password, models)
 
         # -------------------------------
-        # Valores de la tarea
+        # sale_line_id (si existe ya)
+        # -------------------------------
+        sale_line_id = None
+        if task.get("sale_line_id"):
+            sale_line_name = task["sale_line_id"][1]
+            sale_lines = models.execute_kw(
+                db, uid, password,
+                "sale.order.line", "search",
+                [[("name", "=", sale_line_name)]],
+                {"limit": 1}
+            )
+            if sale_lines:
+                sale_line_id = sale_lines[0]
+
+        # -------------------------------
+        # user_ids (many2many)
+        # -------------------------------
+        user_ids = []
+        if task.get("user_ids"):
+            users_old = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "res.users", "read",
+                [task["user_ids"]],
+                {"fields": ["name"]}
+            )
+            for u in users_old:
+                uid_found = find_user_id(u["name"])
+                if uid_found:
+                    user_ids.append(uid_found)
+
+        # -------------------------------
+        # tag_ids (many2many)
+        # -------------------------------
+        tag_ids = []
+        if task.get("tag_ids"):
+            tags_old = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "project.tags", "read",
+                [task["tag_ids"]],
+                {"fields": ["name"]}
+            )
+            for tg in tags_old:
+                found = models.execute_kw(
+                    db, uid, password,
+                    "project.tags", "search",
+                    [[("name", "=", tg["name"])]],
+                    {"limit": 1}
+                )
+                if found:
+                    tag_ids.append(found[0])
+
+        # -------------------------------
+        # Valores de creación
         # -------------------------------
         vals = {
             "name": name,
@@ -4057,127 +10067,69 @@ def import_tasks(tasks, adjuntos=True):
             "priority": task.get("priority"),
             "remaining_hours": task.get("remaining_hours"),
             "description": task.get("description"),
-            "x_old_task_id": old_task_id,  # 🔑 CLAVE
+            "x_id_interno": old_task_id,  # 🔑 clave de idempotencia
         }
+
+        if sale_line_id:
+            vals["sale_line_id"] = sale_line_id
+        if user_ids:
+            vals["user_ids"] = [(6, 0, user_ids)]
+        if tag_ids:
+            vals["tag_ids"] = [(6, 0, tag_ids)]
 
         # Limpiar None
         vals = {k: v for k, v in vals.items() if v is not None}
 
+        # -------------------------------
+        # Crear tarea
+        # -------------------------------
         try:
-            new_id = models.execute_kw(db, uid, password, "project.task", "create", [vals])
-            print(f"✅ Tarea creada (ID {new_id})")
+            existing = models.execute_kw(
+                db, uid, password,
+                "project.task", "search",
+                [[("x_id_interno", "=", old_task_id)]],
+                {"limit": 1}
+            )
+            if existing:
+                print(f"⚠️  Tarea ya importada (x_old_task_id={old_task_id}) → se omite")
+                total_existentes += 1
+                continue
+
+            new_id = models.execute_kw(
+                db, uid, password,
+                "project.task", "create",
+                [vals]
+            )
+            print(f"✅ Tarea creada (ID destino {new_id})")
             total_creadas += 1
+
+            # -------------------------------
+            # Adjuntos (opcional)
+            # -------------------------------
+            if adjuntos:
+                try:
+
+                    migrar_adjuntos_tarea(
+                        origen_task_id=old_task_id,
+                        destino_task_id=new_id,
+                        lote=10,
+                        delay=0.1
+                    )
+
+                except Exception as e:
+                    print(f"⚠️ Error migrando adjuntos de la tarea {name}: {e}")
+
         except Exception as e:
             print(f"❌ Error creando tarea {name}: {e}")
 
-        if adjuntos:
-            try:
-                def migrar_adjuntos_tarea(origen_task_id, destino_task_id, lote=30, delay=0.1):
-                    """
-                    Migra adjuntos de una tarea desde Odoo ORIGEN → DESTINO.
+        time.sleep(0.05)
 
-                    origen_task_id : ID de tarea en origen
-                    destino_task_id : ID de tarea en destino
-                    lote : cantidad de adjuntos por lote
-                    delay : pausa entre lotes
-                    """
-                    import xmlrpc.client
-                    import math
-                    import time
-                    from App_Connection import models, db, uid, password  # DESTINO
-
-                    print(f"\n=== MIGRANDO ADJUNTOS TAREA {origen_task_id} → {destino_task_id} ===")
-
-                    # --------------------------------------------------
-                    # 🔹 CONEXIÓN ORIGEN
-                    # --------------------------------------------------
-                    url = 'https://optimaluz.soluntec.net'
-                    db_old = 'Test'
-                    username = 'jcoronado@optimaluz.com'
-                    password_old = 'AlAi4ever'
-
-                    common_old = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-                    uid_old = common_old.authenticate(db_old, username, password_old, {})
-
-                    if not uid_old:
-                        print("❌ No se pudo autenticar en ORIGEN.")
-                        return
-
-                    models_old = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-                    print(f"🔌 Conectado a ORIGEN como {username} (uid {uid_old})")
-
-                    # --------------------------------------------------
-                    # 🔹 LEER ADJUNTOS EN ORIGEN
-                    # --------------------------------------------------
-                    attach_ids = models_old.execute_kw(
-                        db_old, uid_old, password_old,
-                        'ir.attachment', 'search',
-                        [[
-                            ('res_model', '=', 'project.task'),
-                            ('res_id', '=', origen_task_id)
-                        ]]
-                    )
-
-                    total_adjuntos = len(attach_ids)
-                    print(f"📎 Adjuntos encontrados en origen: {total_adjuntos}")
-
-                    if total_adjuntos == 0:
-                        print("No hay adjuntos que migrar.")
-                        return
-
-                    num_lotes = math.ceil(total_adjuntos / lote)
-
-                    # --------------------------------------------------
-                    # 🔹 MIGRAR POR LOTES
-                    # --------------------------------------------------
-                    for i in range(num_lotes):
-                        inicio = i * lote
-                        fin = inicio + lote
-                        lote_ids = attach_ids[inicio:fin]
-
-                        print(f"\nProcesando lote {i + 1}/{num_lotes} ({len(lote_ids)} adjuntos)...")
-
-                        adjuntos = models_old.execute_kw(
-                            db_old, uid_old, password_old,
-                            'ir.attachment', 'read',
-                            [lote_ids, ['name', 'datas', 'mimetype']]
-                        )
-
-                        for att in adjuntos:
-                            try:
-                                models.execute_kw(
-                                    db, uid, password,
-                                    'ir.attachment', 'create',
-                                    [{
-                                        'name': att['name'],
-                                        'datas': att['datas'],
-                                        'mimetype': att['mimetype'],
-                                        'res_model': 'project.task',
-                                        'res_id': destino_task_id,
-                                    }]
-                                )
-                            except Exception as e:
-                                print(f"⚠️ Error importando adjunto '{att['name']}': {e}")
-
-                        print(f"✓ Lote {i + 1}/{num_lotes} completado.")
-                        time.sleep(delay)
-
-                    print("\n=== MIGRACIÓN DE ADJUNTOS COMPLETADA ===")
-
-                migrar_adjuntos_tarea(
-                    origen_task_id=task.get("id"),
-                    destino_task_id=new_id,
-                    lote=10,
-                    delay=0.1
-                )
-
-            except Exception as e:
-                print(f"⚠️ Error migrando adjuntos de la tarea {name}: {e}")
-
+    # -------------------------------
+    # Resumen
+    # -------------------------------
     print("\n📊 MIGRACIÓN DE TAREAS COMPLETADA")
     print(f"   Total creadas: {total_creadas}")
     print(f"   Ya existentes: {total_existentes}")
-
 
 # ---------------------------------------------------------------
 # 🔸 Función principal
@@ -4185,188 +10137,44 @@ def import_tasks(tasks, adjuntos=True):
 
 def migrar_tareas():
     tareas = export_tasks()
-    import_tasks(tareas)
-
+    #import_tasks(tareas)
 
 # Ejecución directa opcional
-# migrar_tareas()
-
-# Vincular Elemento del pedido de venta
-def sync_task_sale_line_id():
-    import xmlrpc.client
-    from App_Connection import db, uid, password, models
-
-    # -----------------------
-    # ORIGEN
-    # -----------------------
-    url = 'https://optimaluz.soluntec.net'
-    db_src = 'Test'  # o 'Real'
-    username = 'jcoronado@optimaluz.com'
-    password_src = 'AlAi4ever'
-
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid_src = common.authenticate(db_src, username, password_src, {})
-    if not uid_src:
-        print("❌ Error autenticación ORIGEN")
-        return
-
-    models_src = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-    print(f"🔌 Conectado a ORIGEN (uid={uid_src})")
-
-    # -----------------------
-    # 1️⃣ RESOLVER PRODUCTO DESTINO (UNA VEZ)
-    # -----------------------
-    PRODUCT_NAME = "Instalación eléctrica* "  # ← el name que ya sabes que coincide
-
-    product_dst_ids = models.execute_kw(
-        db, uid, password,
-        "product.product", "search",
-        [[("name", "=", PRODUCT_NAME)]],
-        {"limit": 1}
-    )
-
-    if not product_dst_ids:
-        print(f"❌ Producto '{PRODUCT_NAME}' no encontrado en DESTINO")
-        return
-
-    product_dst_id = product_dst_ids[0]
-    print(f"📦 Producto DESTINO resuelto: {PRODUCT_NAME} (ID {product_dst_id})")
-
-    # -----------------------
-    # 2️⃣ TAREAS ORIGEN con sale_line
-    # -----------------------
-    task_ids_src = models_src.execute_kw(
-        db_src, uid_src, password_src,
-        "project.task", "search",
-        [[("sale_line_id", "!=", False)]]
-    )
-
-    tasks_src = models_src.execute_kw(
-        db_src, uid_src, password_src,
-        "project.task", "read",
-        [task_ids_src],
-        {"fields": ["id", "name", "sale_line_id"]}
-    )
-
-    print(f"📋 Tareas origen con sale_line_id: {len(tasks_src)}")
-
-    # -----------------------
-    # 3️⃣ ITERAR
-    # -----------------------
-    for t in tasks_src:
-        old_task_id = t["id"]
-        task_name = t["name"]
-
-        # 🔹 Leer sale.order.line ORIGEN
-        sol_src = models_src.execute_kw(
-            db_src, uid_src, password_src,
-            "sale.order.line", "read",
-            [[t["sale_line_id"][0]]],
-            {"fields": ["order_id"]}
-        )[0]
-
-        order_name = sol_src["order_id"][1]
-
-        # 🔹 Buscar tarea DESTINO
-        task_dst_ids = models.execute_kw(
-            db, uid, password,
-            "project.task", "search",
-            [[("x_old_task_id", "=", old_task_id)]],
-            {"limit": 1}
-        )
-
-        if not task_dst_ids:
-            print(f"⚠️ Tarea destino no encontrada | {task_name}")
-            continue
-
-        task_dst_id = task_dst_ids[0]
-
-        # 🔹 Buscar sale.order.line DESTINO (CLAVE FINAL)
-        sol_dst_ids = models.execute_kw(
-            db, uid, password,
-            "sale.order.line", "search",
-            [[
-                ("order_id.name", "=", order_name),
-                ("product_id", "=", product_dst_id)
-            ]],
-            {"limit": 1}
-        )
-
-        if not sol_dst_ids:
-            print(
-                f"❌ Sale line NO encontrada | "
-                f"Tarea='{task_name}' | "
-                f"Pedido='{order_name}'"
-            )
-            continue
-
-        # 🔹 WRITE
-        try:
-            models.execute_kw(
-                db, uid, password,
-                "project.task", "write",
-                [[task_dst_id], {"sale_line_id": sol_dst_ids[0]}]
-            )
-            print(f"🔗 Vinculada venta → tarea '{task_name}'")
-        except Exception as e:
-            print(f"❌ Error escribiendo tarea '{task_name}': {e}")
-
-    print("✅ Sincronización sale_line_id finalizada")
-
+#migrar_tareas()
 # endregion
 
-#region PARTE DE HORAS
+# region PARTE DE HORAS
 # ---------------------------------------------------------------
 # 🔹 MIGRACIÓN DE PARTES DE HORAS (account.analytic.line)
 # ---------------------------------------------------------------
 
-def export_timesheets(company_name="ALMAITANA DE LUZ, S.L."):
+def export_timesheets():
     """
     Exporta partes de horas desde Odoo 16.
     Incluye referencias a empleado, tarea y proyecto.
     """
     import xmlrpc.client
 
-    url = 'https://optimaluz.soluntec.net'
-    db_old = 'Real'
-    username = 'jcoronado@optimaluz.com'
-    password_old = 'AlAi4ever'
-
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid_old = common.authenticate(db_old, username, password_old, {})
-    if not uid_old:
-        print("❌ No se pudo autenticar en origen.")
-        return []
-
-    models_old = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-    print(f'🔌 Conectado a Odoo 16 como {username}')
-
     # Buscar compañía
-    company_id_src = models_old.execute_kw(
-        db_old, uid_old, password_old,
-        'res.company', 'search',
-        [[('name', '=', company_name)]],
-        {'limit': 1}
-    )
-    company_id_src = company_id_src[0] if company_id_src else False
+    company_id_src = 2
 
     # Campos relevantes de partes de horas
     FIELDS = [
+        "id",
+        "date",
         "name",
         "employee_id",
         "project_id",
         "task_id",
         "unit_amount",  # Horas trabajadas
-        "date",
-        "amount",
+        "time_start",
+        "time_stop",
         "company_id",
-        "user_id",
-        "account_id",
     ]
 
-    domain = [("company_id", "=", company_id_src)]
-    timesheets = models_old.execute_kw(
-        db_old, uid_old, password_old,
+    domain = [("company_id", "=", company_id_src), ("employee_id", "!=", False)]
+    timesheets = models_src.execute_kw(
+        db_src, uid_src, password_src,
         "account.analytic.line", "search_read",
         [domain],
         {"fields": FIELDS}
@@ -4374,6 +10182,7 @@ def export_timesheets(company_name="ALMAITANA DE LUZ, S.L."):
 
     print(f"📤 {len(timesheets)} partes de horas exportados correctamente.")
     return timesheets
+
 
 def import_timesheets(timesheets):
     """
@@ -4387,92 +10196,74 @@ def import_timesheets(timesheets):
     total_existentes = 0
     total_sin_relacion = 0
 
-    def find_project_id(project_name):
-        projects = models.execute_kw(
-            db, uid, password,
-            "project.project", "search_read",
-            [[("name", "=", project_name)]],
-            {"fields": ["id"], "limit": 1}
-        )
-        return projects[0]["id"] if projects else None
-
-    def find_task_id(task_name, project_id=None):
-        domain = [("name", "=", task_name)]
-        if project_id:
-            domain.append(("project_id", "=", project_id))
-        tasks = models.execute_kw(
-            db, uid, password,
-            "project.task", "search_read",
-            [domain],
-            {"fields": ["id"], "limit": 1}
-        )
-        return tasks[0]["id"] if tasks else None
-
-    def find_employee_id(emp_name):
-        employees = models.execute_kw(
-            db, uid, password,
-            "hr.employee", "search_read",
-            [[("name", "=", emp_name)]],
-            {"fields": ["id"], "limit": 1}
-        )
-        return employees[0]["id"] if employees else None
-
     print("📥 Iniciando importación de partes de horas...")
 
     for line in timesheets:
         name = line.get("name") or "SIN_DESCRIPCIÓN"
         date = line.get("date")
+        x_id_interno = line.get("id")
         hours = line.get("unit_amount", 0.0)
+
+        # Comprobar si ya existe
+        existing = models.execute_kw(
+            db, uid, password,
+            "account.analytic.line", "search",
+            [[("x_id_interno", "=", x_id_interno)]]
+        )
+        '''if existing:
+            total_existentes += 1# print(f"⚠️  Factura ya existente: {total_existentes}")
+            continue'''
 
         print(f"\n🕒 Procesando parte: {name} ({hours}h en {date})")
 
         # Buscar proyecto y tarea
         project_id = None
+        so_line_id = None
         if line.get("project_id"):
-            project_name = line["project_id"][1]
-            project_id = find_project_id(project_name)
+            proyecto = line['project_id'][1]
+            if proyecto == "Interno":
+                project_id = 605
+                # project_id = Utils.get_by_x_id_interno("project.project", project_id, db, uid, password, models)
+            else:
+                project_id_origen = line['project_id'][0]
+                project_id = Utils.get_by_x_id_interno("project.project", project_id_origen, db, uid, password, models)
+
+            if project_id:
+                project = models.execute_kw(
+                    db, uid, password,
+                    "project.project", "read",
+                    [[project_id], ["sale_line_id"]]
+                )
+                if project and project[0]["sale_line_id"]:
+                    so_line_id = project[0]["sale_line_id"][0]
 
         task_id = None
         if line.get("task_id"):
-            task_name = line["task_id"][1]
-            task_id = find_task_id(task_name, project_id)
+            tarea = line['task_id'][1]
+            if tarea == "Ausencias":
+                task_id = 979
+                # task_id = Utils.get_by_x_id_interno("project.task", task_id, db, uid, password, models)
+            else:
+                task_id_origen = line['task_id'][0]
+                task_id = Utils.get_by_x_id_interno("project.task", task_id_origen, db, uid, password, models)
 
         # Buscar empleado
         employee_id = None
         if line.get("employee_id"):
-            emp_name = line["employee_id"][1]
-            employee_id = find_employee_id(emp_name)
-
-        # Saltar si faltan vínculos clave
-        if not employee_id or not project_id:
-            print(f"⚠️ Parte ignorado (falta empleado o proyecto).")
-            total_sin_relacion += 1
-            continue
-
-        # Comprobar duplicados por fecha, empleado, horas y proyecto
-        domain_check = [
-            ("name", "=", name),
-            ("date", "=", date),
-            ("employee_id", "=", employee_id),
-            ("project_id", "=", project_id),
-        ]
-        existing = models.execute_kw(
-            db, uid, password,
-            "account.analytic.line", "search",
-            [domain_check]
-        )
-        '''if existing:
-            print(f"⚠️ Parte ya existente para '{emp_name}' en '{project_name}' el {date}")
-            total_existentes += 1
-            continue'''
+            employee_id_origen = line['employee_id'][0]
+            employee_id = Utils.get_by_x_id_interno("hr.employee", employee_id_origen, db, uid, password, models)
 
         vals = {
             "name": name,
             "employee_id": employee_id,
             "project_id": project_id,
             "task_id": task_id,
+            # "time_start": start,    #Existe por modulo
+            # "time_stop": stop,     #Existe por modulo
             "unit_amount": hours,
             "date": date,
+            "so_line": so_line_id,
+            "x_id_interno": x_id_interno,
         }
 
         # Eliminar None antes de enviar
@@ -4490,6 +10281,7 @@ def import_timesheets(timesheets):
     print(f"   Ya existentes: {total_existentes}")
     print(f"   Ignorados (sin empleado o proyecto): {total_sin_relacion}")
 
+
 # ---------------------------------------------------------------
 # 🔸 Función principal
 # ---------------------------------------------------------------
@@ -4498,12 +10290,13 @@ def migrar_partes_horas():
     partes = export_timesheets()
     import_timesheets(partes)
 
+
 # Ejecución directa opcional
-#migrar_partes_horas()
+# migrar_partes_horas()
 
-#endregion
+# endregion
 
-#region ASISTENCIAS
+# region ASISTENCIAS
 # ---------------------------------------------------------------
 # 🔹 MIGRACIÓN DE ASISTENCIAS (hr.attendance)
 # ---------------------------------------------------------------
@@ -4515,20 +10308,6 @@ def export_attendances():
     """
     import xmlrpc.client
 
-    url = 'https://optimaluz.soluntec.net'
-    db_old = 'Real'
-    username = 'jcoronado@optimaluz.com'
-    password_old = 'AlAi4ever'
-
-    common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
-    uid_old = common.authenticate(db_old, username, password_old, {})
-    if not uid_old:
-        print("❌ No se pudo autenticar en origen.")
-        return []
-
-    models_old = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
-    print(f'🔌 Conectado a Odoo 16 como {username}')
-
     FIELDS = [
         "employee_id",
         "check_in",
@@ -4536,35 +10315,33 @@ def export_attendances():
         "worked_hours",
     ]
 
-    attendances = models_old.execute_kw(
-        db_old, uid_old, password_old,
+    domain = []
+    # domain=[("check_in", ">=", "2026-03-03 00:00:00")]
+    '''domain = [
+        ("check_in", ">=", "2025-09-01 00:00:00"),
+        ("check_in", "<=", "2026-04-01 23:59:59"),
+        ("employee_id.active", "=", True),
+    ]'''
+
+    attendances = models_src.execute_kw(
+        db_src, uid_src, password_src,
         "hr.attendance", "search_read",
-        [[]], {"fields": FIELDS}
+        [domain], {"fields": FIELDS}
     )
 
     print(f"📤 {len(attendances)} asistencias exportadas correctamente.")
     return attendances
+
 
 def import_attendances(attendances):
     """
     Importa asistencias (hr.attendance) en Odoo 18.
     Asocia correctamente al empleado.
     """
-    import xmlrpc.client
-    from App_Connection import db, uid, password, models
 
     total_creadas = 0
     total_existentes = 0
     total_sin_empleado = 0
-
-    def find_employee_id(emp_name):
-        employees = models.execute_kw(
-            db, uid, password,
-            "hr.employee", "search_read",
-            [[("name", "=", emp_name)]],
-            {"fields": ["id"], "limit": 1}
-        )
-        return employees[0]["id"] if employees else None
 
     print("📥 Iniciando importación de asistencias...")
 
@@ -4574,31 +10351,14 @@ def import_attendances(attendances):
         check_out = att.get("check_out")
         hours = att.get("worked_hours", 0.0)
 
-        if not emp_name:
-            print(f"⚠️ Asistencia ignorada (sin empleado).")
-            total_sin_empleado += 1
-            continue
-
-        employee_id = find_employee_id(emp_name)
+        employee_id = None
+        if att.get("employee_id"):
+            employee_id_origen = att['employee_id'][0]
+            employee_id = Utils.get_by_x_id_interno("hr.employee", employee_id_origen, db, uid, password,
+                                                    models)
         if not employee_id:
             print(f"⚠️ Empleado '{emp_name}' no encontrado en destino.")
             total_sin_empleado += 1
-            continue
-
-        # Comprobar duplicado exacto (empleado + check_in + check_out)
-        domain_check = [
-            ("employee_id", "=", employee_id),
-            ("check_in", "=", check_in),
-            ("check_out", "=", check_out),
-        ]
-        existing = models.execute_kw(
-            db, uid, password,
-            "hr.attendance", "search",
-            [domain_check]
-        )
-        if existing:
-            print(f"⚠️ Asistencia ya existente para {emp_name} el {check_in}")
-            total_existentes += 1
             continue
 
         vals = {
@@ -4623,6 +10383,7 @@ def import_attendances(attendances):
     print(f"   Ya existentes: {total_existentes}")
     print(f"   Ignoradas (sin empleado): {total_sin_empleado}")
 
+
 # ---------------------------------------------------------------
 # 🔸 Función principal
 # ---------------------------------------------------------------
@@ -4631,10 +10392,11 @@ def migrar_asistencias():
     asistencias = export_attendances()
     import_attendances(asistencias)
 
-# Ejecución directa opcional
-#migrar_asistencias()
 
-#endregion
+# Ejecución directa opcional
+# migrar_asistencias()
+
+# endregion
 
 # region TRANSFERENCIA
 def update_public_info(excel_path):

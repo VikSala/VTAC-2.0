@@ -56,6 +56,18 @@ def _init_driver():
     return uc.Chrome(options=options)
 
 
+def _reiniciar_driver(driver):
+    try:
+        driver.quit()
+    except:
+        pass
+
+    driver = _init_driver()
+
+    time.sleep(3)
+
+    return driver
+
 # 🔍 Obtiene las URLs de productos según el modo seleccionado
 def _get_product_links(driver, modo_scrap, only_new_products, file_path="", progress_callback=None):
     def emit_progress(message):
@@ -71,25 +83,19 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
         "https://led-italia.it/prodotti/M68-materiale-elettrico"
     ]
 
-    SCRAP_SELECTIVO = False
+    SCRAP_SELECTIVO = True
 
     if not SCRAP_SELECTIVO:
 
         if modo_scrap == ScrapMode.TEST:
             emit_progress("MODO TEST ACTIVADO")
             product_links = [
-                "https://led-italia.it/prodotti/v-tac/lampadine/21200216/lampadina-led-chip-cree-e27-22w-120lmw-g120-3000k?asq=ac67518b93a2324006af653033dafc74&c=44af3e96a6fe780b105761e98fb9e62b",
-                "https://led-italia.it/prodotti/v-tac/lampadine/21200226/lampadina-led-chip-cree-e27-22w-120lmw-g120-4000k?asq=ac67518b93a2324006af653033dafc74&c=f3fb3dec41b1c0dbffb3d74e421582ae",
                 "https://led-italia.it/prodotti/v-tac/lampadine/21200236/lampadina-led-chip-cree-e27-22w-120lmw-g120-6500k?asq=ac67518b93a2324006af653033dafc74&c=78b73f73f656060c5c48dafd9ff98df9",
-                "https://led-italia.it/prodotti/v-tac/lampadine/212356/lampadina-led-chip-cree-e14-2w-st26-4000k?asq=ac67518b93a2324006af653033dafc74&c=62891e0020cdf5e386ff7175179c4a31",
-                "https://led-italia.it/prodotti/v-tac/lampadine/2144566/lampadina-led-chip-cree-e27-17w-110lmw-a65-3000k?asq=ac67518b93a2324006af653033dafc74&c=0f05622b9611833eb61289c43bdd5dbe",
-                "https://led-italia.it/prodotti/v-tac/lampadine/2144576/lampadina-led-chip-cree-e27-17w-100lmw-a65-4000k?asq=ac67518b93a2324006af653033dafc74&c=4cda1734021db9312754b5a4604af29d",
                 "https://led-italia.it/prodotti/v-tac/tubi/216506/tubo-led-chip-cree-t8-9w-g13-60cm-in-nanoplastica-ruotabile-3000k?asq=8107fefdbe91fa336ef2f09ca6719a64&c=a00e03527ada2113598ae110532c1a83",
                 "https://led-italia.it/prodotti/v-tac/tubi/216516/tubo-led-chip-cree-t8-9w-g13-60cm-in-nanoplastica-ruotabile-4000k?asq=8107fefdbe91fa336ef2f09ca6719a64&c=98fe5aff9d54c67adba2b6f6002a4a35",
                 "https://led-italia.it/prodotti/v-tac/tubi/216526/tubo-led-chip-cree-t8-9w-g13-60cm-in-nanoplastica-ruotabile-6500k?asq=8107fefdbe91fa336ef2f09ca6719a64&c=f670b6f91a13cd1701ca52351a5e4ed3",
                 "https://led-italia.it/prodotti/v-tac/tubi/216556/tubo-led-chip-cree-t8-18w-100lmw-g13-120cm-in-nanoplastica-ruotabile-6500k?asq=8107fefdbe91fa336ef2f09ca6719a64&c=e0391cbda20618565377ed7e5e3a5faf",
                 "https://led-italia.it/prodotti/v-tac/tubi/216566/tubo-led-chip-cree-t8-20w-105lmw-g13-150cm-in-nanoplastica-ruotabile-3000k?asq=8107fefdbe91fa336ef2f09ca6719a64&c=d54c914a2b8b1cd33fdb4525479f7341",
-                "https://led-italia.it/prodotti/v-tac/illuminazione-di-emergenza/899-6/lampada-led-chip-cree-di-emergenza-38w-20led-montaggio-a-incassoplafone-e-modalita-sase-12h-di-ricarica-6000k-ip20?asq=b1cab57a42c92b551bc2d11eac03f150&c=e0b4a8a06acfce67d4f8077869f3e6cf",
             ]
         else:
             emit_progress("Explorando categorías principales...")
@@ -120,7 +126,7 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
                 emit_progress(f"🔍 Procesando subcategoría ({idx}/{len(subcategorias)}): {nombre_cat}")
 
                 driver.get(shop_link)
-                time.sleep(1)
+                time.sleep(4)
                 try:
                     pagination = driver.find_elements(By.CSS_SELECTOR, "div.mt-4 ul.flex li div")
                     last_page = max([int(p.text.strip()) for p in pagination if p.text.strip().isdigit()])
@@ -137,7 +143,7 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
                         emit_progress(f"  📄 Página {page_idx}/{len(shop_pages)}")
 
                     driver.get(page_url)
-                    time.sleep(3)
+                    time.sleep(4)
                     grid = driver.find_elements(By.CSS_SELECTOR, "span.px-2.grid a")#No lo detecta
                     for a in grid:
                         href = a.get_attribute("href")
@@ -169,8 +175,8 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
     else:
         emit_progress("🚀 MODO SCRAP SELECTIVO ITALIA ACTIVADO")
         import re
-        #from services.utils import Utils
-        #file_path = Utils.seleccionar_excel()
+        from services.utils import Utils
+        file_path = Utils.seleccionar_excel()
         SKU_EXCEL_PATH = file_path
         SKU_COLUMN_NAME = "SKU"
 
@@ -194,7 +200,7 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
         for i, url_categoria in enumerate(categorias_principales, 1):
             emit_progress(f"📁 Buscando subcategorías ({i}/{len(categorias_principales)}): {url_categoria}")
             driver.get(url_categoria)
-            time.sleep(1)
+            time.sleep(3)
 
             try:
                 contenedor = driver.find_element(
@@ -219,7 +225,7 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
         for idx, (nombre_cat, shop_link) in enumerate(subcategorias.items(), 1):
             emit_progress(f"🔍 Procesando subcategoría ({idx}/{len(subcategorias)}): {nombre_cat}")
             driver.get(shop_link)
-            time.sleep(1)
+            time.sleep(3)
             try:
                 pagination = driver.find_elements(By.CSS_SELECTOR, "div.mt-4 ul.flex li div")
                 last_page = max([int(p.text.strip()) for p in pagination if p.text.strip().isdigit()])
@@ -297,6 +303,11 @@ def _scrape_productos(driver, product_links, progress_callback=None):
     emit_progress(f"🚀 Iniciando scraping de {productos_totales} productos...")
 
     for i, url in enumerate(product_links, 1):
+
+        if i > 1 and i % 300 == 0:
+            emit_progress(f"♻️ Reiniciando Chrome ({i}/{productos_totales})")
+            driver = _reiniciar_driver(driver)
+
         # Mostrar progreso cada 10 productos o en hitos importantes
         if i % 10 == 0 or i == 1:
             porcentaje = int((i / productos_totales) * 100)

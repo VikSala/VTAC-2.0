@@ -12,14 +12,14 @@ def init(spider):
         'https://v-tac.es/smart-digital.html',
         'https://v-tac.es/el%C3%A9ctrico.html'
     )
-    #spider.start_urls = list(spider.CATEGORIES_LINKS)#comentar si prueba pequeña
+    spider.start_urls = list(spider.CATEGORIES_LINKS)#comentar si prueba pequeña
     spider.product_map = defaultdict(dict)
 
 def parse(spider, response):
     # Si el GUI/CLI no pasa el flag, mantenemos el comportamiento por defecto
     comercial_scrap = getattr(spider, "comercial_scrap", None)
     if comercial_scrap is None:
-        comercial_scrap = True
+        comercial_scrap = False
 
     if comercial_scrap:
         comercial_links = (

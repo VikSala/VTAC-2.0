@@ -419,7 +419,7 @@ def transferencia_productos_por_sku():
 
 #transferencia_productos_por_sku()
 
-def actualizar_categorias_por_sku(models_src, db_src, uid_src, pwd_src,
+def ctualizar_categorias_por_sku(models_src, db_src, uid_src, pwd_src,
                                   models, db, uid, pwd,
                                   excel_path):
 
@@ -1395,13 +1395,6 @@ def actualizar_odoos():
     import xmlrpc.client
     import ast
 
-    def conectar(config):
-        common = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/common")
-        uid = common.authenticate(config['db'], config['user'], config['password'], {})
-
-        models = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/object")
-
-        return models, uid
 
     def actualizar_prods_diariamente(origen, destino):
 
@@ -1828,6 +1821,15 @@ def actualizar_odoos():
             if excel_file_cambios:
                 aplicar_cambios_desde_excel(models_d, destino['db'], uid_d, destino['password'],
                                             ruta_excel=excel_file_cambios)
+
+    def conectar(config):
+        common = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/common")
+        uid = common.authenticate(config['db'], config['user'], config['password'], {})
+
+        models = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/object")
+
+        return models, uid
+
 
     origen = {
         'url': "https://b2b.optimaluz.com/",
@@ -2310,5 +2312,572 @@ def actualizar_odoos():
 
     ejecutar_transferencia_post_actualizacion()
 
+def actualizar_domain_names_odoos():
+    import xmlrpc.client
 
-#actualizar_odoos()
+    CTX = {"context": {"lang": "es_ES"}}
+
+    CATEGORIAS_ORIGEN = [
+        "TIRAS Y NEONES LED",
+        "FUENTES DE ALIMENTACIÓN",
+        "PROYECTORES LED",
+        "BOMBILLAS LED",
+        "PERFILERIA DE ALUMINIO PARA TIRAS Y NEONES LED",
+    ]
+
+    origen = {
+        'url': "https://b2b.optimaluz.com/",
+        'db': "odoo0",
+        'user': "admin",
+        'password': "1324",
+    }
+
+    destinos = [
+        {
+            'url': "https://optimaluz.com/",
+            'db': "odoo1",
+            'user': "admin",
+            'password': "1324"
+        },
+        {
+            'url': "http://82.70.85.127:8069/",
+            'db': "odoo0",
+            'user': "admin",
+            'password': "1324"
+        }
+    ]
+
+
+    def conectar(config):
+        common = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/common")
+        uid = common.authenticate(
+            config["db"],
+            config["user"],
+            config["password"],
+            {}
+        )
+
+        if not uid:
+            raise Exception(f"No se pudo conectar a {config['url']}")
+
+        models = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/object")
+        return models, uid
+
+    def obtener_productos_origen(origen):
+        models_o, uid_o = conectar(origen)
+
+        product_ids_total = set()
+
+        for cat_name in CATEGORIAS_ORIGEN:
+            cat_ids = models_o.execute_kw(
+                origen["db"],
+                uid_o,
+                origen["password"],
+                "product.public.category",
+                "search",
+                [[["name", "=", cat_name]]],
+                CTX
+            )
+
+            if not cat_ids:
+                print(f"Origen: categoría no encontrada: {cat_name}")
+                continue
+
+            product_ids = models_o.execute_kw(
+                origen["db"],
+                uid_o,
+                origen["password"],
+                "product.template",
+                "search",
+                [[["public_categ_ids", "child_of", cat_ids]]],
+                CTX
+            )
+
+            product_ids_total.update(product_ids)
+
+        productos = models_o.execute_kw(
+            origen["db"],
+            uid_o,
+            origen["password"],
+            "product.template",
+            "read",
+            [list(product_ids_total), ["default_code", "name"]],
+            CTX
+        )
+
+        return [
+            p for p in productos
+            if p.get("default_code") and p.get("name")
+        ]
+
+    def actualizar_names_destino(origen, destino):
+        productos_origen = obtener_productos_origen(origen)
+        models_d, uid_d = conectar(destino)
+
+        total_actualizados = 0
+        total_no_encontrados = 0
+
+        for prod in productos_origen:
+            sku = str(prod["default_code"]).strip()
+            name_origen = prod["name"]
+
+            dest_ids = models_d.execute_kw(
+                destino["db"],
+                uid_d,
+                destino["password"],
+                "product.template",
+                "search",
+                [[["default_code", "=", sku]]],
+                {"limit": 1, **CTX}
+            )
+
+            if not dest_ids:
+                total_no_encontrados += 1
+                print(f"No encontrado en destino: {sku}")
+                continue
+
+            models_d.execute_kw(
+                destino["db"],
+                uid_d,
+                destino["password"],
+                "product.template",
+                "write",
+                [
+                    dest_ids,
+                    {
+                        "name": name_origen,
+                    }
+                ],
+                CTX
+            )
+
+            total_actualizados += 1
+            print(f"Actualizado {sku}: {name_origen}")
+
+        print(f"Destino: {destino['url']}")
+        print(f"Actualizados: {total_actualizados}")
+        print(f"No encontrados: {total_no_encontrados}")
+
+        return total_actualizados
+
+    for destino in destinos:
+        print(f"\nActualizando destino: {destino['url']}")
+        actualizar_names_destino(origen, destino)
+
+def txt_saltados_a_excel(txt_path, output_excel_path):
+    import re
+    import pandas as pd
+
+    rows = []
+
+    patron = re.compile(
+        r"Saltado\s+(\S+):\s+faltan atributos\s+(.+)",
+        re.IGNORECASE
+    )
+
+    with open(txt_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line:
+                continue
+
+            match = patron.search(line)
+
+            if not match:
+                continue
+
+            sku = match.group(1).strip()
+            atributos = match.group(2).strip()
+
+            rows.append({
+                "SKU": sku,
+                "ATRIBUTOS": atributos,
+            })
+
+    df = pd.DataFrame(rows, columns=["SKU", "ATRIBUTOS"])
+
+    df.to_excel(output_excel_path, index=False)
+
+    print(f"✅ Excel creado: {output_excel_path}")
+    print(f"➡ Filas exportadas: {len(df)}")
+
+    return df
+
+#txt_saltados_a_excel("C:/Users/Quimi/Documents/logs.txt", ruta)
+
+def rellenar_hoja_diferencias_excel(ruta_excel):
+    import pandas as pd
+    import re
+    from openpyxl import load_workbook
+
+    H_MADRID = "Madrid"
+    H_BULGARIA = "Bulgaria"
+    H_STOCK = "Stock"
+    H_MEDIDAS = "Medidas"
+    H_DIF = "Diferencias"
+
+    COLUMNAS = [
+        "SKU", "NOMBRE", "NETO MADRID", "NETO BULGARIA", "DIFERENCIAS NETO",
+        "DTO. MADRID", "DTO. BULGARIA", "DIFERENCIAS DTO.",
+        "PROMO QTY MADRID", "PROMO QTY BULGARIA", "STOCK MADRID", "STOCK BULGARIA"
+    ]
+
+    def norm_cols(df):
+        df.columns = [str(c).replace("\xa0", " ").strip().upper() for c in df.columns]
+        return df
+
+    def norm_sku(df):
+        df["SKU"] = df["SKU"].astype(str).str.strip().str.upper()
+        df = df[df["SKU"].notna() & (df["SKU"] != "") & (df["SKU"] != "NAN")]
+        return df.drop_duplicates("SKU", keep="first")
+
+    def txt(x):
+        if pd.isna(x):
+            return ""
+        return str(x).strip()
+
+    def num(x):
+        if pd.isna(x) or x == "":
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        x = str(x).strip().replace("%", "").replace(",", ".")
+        try:
+            return float(x)
+        except:
+            return None
+
+    def fmt(x):
+        if pd.isna(x):
+            return ""
+        n = num(x)
+        if n is None:
+            return txt(x)
+        n = round(n, 3)
+        return str(int(n)) if n.is_integer() else str(n).rstrip("0").rstrip(".")
+
+    def fmt_pct(x):
+        if x is None or pd.isna(x):
+            return ""
+        n = round(float(x) * 100, 3)
+        return (str(int(n)) if n.is_integer() else str(n).rstrip("0").rstrip(".")) + "%"
+
+    def dto(v, p):
+        return " | ".join([x for x in [fmt(v), fmt_pct(num(p) / 100) if num(p) is not None else txt(p)] if x != ""])
+
+    def dif(madrid, bulgaria):
+        m = num(madrid)
+        b = num(bulgaria)
+        if m is None or b is None or m == 0:
+            return ""
+        return f"{fmt(b - m)} | {fmt_pct(-(1 - (b / m)))}"
+
+    def stock_calc(valor, medida):
+        n = num(valor)
+        if n is None:
+            return "" if pd.isna(valor) else valor
+
+        medida = txt(medida).upper()
+
+        r = re.search(r"(\d+(?:[.,]\d+)?)\s*METER\s*ROLL", medida)
+        if r:
+            return fmt(n / float(r.group(1).replace(",", ".")))
+
+        r = re.search(r"(\d+(?:[.,]\d+)?)\s*PCS\s*/\s*SET", medida)
+        if r:
+            return fmt(n * float(r.group(1).replace(",", ".")))
+
+        return fmt(n)
+
+    madrid = norm_sku(norm_cols(pd.read_excel(ruta_excel, sheet_name=H_MADRID)))
+    bulgaria = norm_sku(norm_cols(pd.read_excel(ruta_excel, sheet_name=H_BULGARIA)))
+    stock = norm_sku(norm_cols(pd.read_excel(ruta_excel, sheet_name=H_STOCK)))
+    medidas = norm_sku(norm_cols(pd.read_excel(ruta_excel, sheet_name=H_MEDIDAS)))
+
+    madrid = madrid.rename(columns={
+        "NOMBRE": "NOMBRE MADRID",
+        "NETO": "NETO MADRID",
+        "DTO": "DTO MADRID",
+        "DTO%": "DTO% MADRID",
+        "PROMO QTY": "PROMO QTY MADRID",
+    })
+
+    bulgaria = bulgaria.rename(columns={
+        "NOMBRE": "NOMBRE BULGARIA",
+        "NETO": "NETO BULGARIA",
+        "DTO": "DTO BULGARIA",
+        "DTO%": "DTO% BULGARIA",
+        "PROMO QTY": "PROMO QTY BULGARIA",
+    })
+
+    coinciden = sorted(set(madrid["SKU"]) & set(bulgaria["SKU"]))
+    no_coinciden = sorted((set(madrid["SKU"]) | set(bulgaria["SKU"])) - set(coinciden))
+
+    df = pd.DataFrame({"SKU": coinciden + no_coinciden})
+    df = df.merge(madrid, on="SKU", how="left")
+    df = df.merge(bulgaria, on="SKU", how="left")
+    df = df.merge(stock, on="SKU", how="left")
+    df = df.merge(medidas[["SKU", "MEDIDA"]], on="SKU", how="left")
+
+    df["NOMBRE"] = df["NOMBRE MADRID"].fillna("").where(df["NOMBRE MADRID"].fillna("") != "", df["NOMBRE BULGARIA"].fillna(""))
+    df["NETO MADRID"] = df["NETO MADRID"].apply(fmt)
+    df["NETO BULGARIA"] = df["NETO BULGARIA"].apply(fmt)
+
+    df["DTO. MADRID"] = df.apply(lambda x: dto(x.get("DTO MADRID"), x.get("DTO% MADRID")), axis=1)
+    df["DTO. BULGARIA"] = df.apply(lambda x: dto(x.get("DTO BULGARIA"), x.get("DTO% BULGARIA")), axis=1)
+
+    df["DIFERENCIAS NETO"] = df.apply(
+        lambda x: dif(x.get("NETO MADRID"), x.get("NETO BULGARIA")) if x["SKU"] in coinciden else "",
+        axis=1
+    )
+
+    df["DIFERENCIAS DTO."] = df.apply(
+        lambda x: dif(x.get("DTO MADRID"), x.get("DTO BULGARIA")) if x["SKU"] in coinciden else "",
+        axis=1
+    )
+
+    df["STOCK MADRID"] = df.apply(lambda x: stock_calc(x.get("STOCK MADRID"), x.get("MEDIDA")), axis=1)
+    df["STOCK BULGARIA"] = df.apply(lambda x: stock_calc(x.get("STOCK BULGARIA"), x.get("MEDIDA")), axis=1)
+
+    df_final = pd.DataFrame({
+        "SKU": df["SKU"],
+        "NOMBRE": df["NOMBRE"],
+        "NETO MADRID": df["NETO MADRID"],
+        "NETO BULGARIA": df["NETO BULGARIA"],
+        "DIFERENCIAS NETO": df["DIFERENCIAS NETO"],
+        "DTO. MADRID": df["DTO. MADRID"],
+        "DTO. BULGARIA": df["DTO. BULGARIA"],
+        "DIFERENCIAS DTO.": df["DIFERENCIAS DTO."],
+        "PROMO QTY MADRID": df["PROMO QTY MADRID"].apply(fmt),
+        "PROMO QTY BULGARIA": df["PROMO QTY BULGARIA"].apply(fmt),
+        "STOCK MADRID": df["STOCK MADRID"],
+        "STOCK BULGARIA": df["STOCK BULGARIA"],
+    })[COLUMNAS]
+
+    wb = load_workbook(ruta_excel)
+
+    if H_DIF in wb.sheetnames:
+        del wb[H_DIF]
+
+    wb.save(ruta_excel)
+
+    with pd.ExcelWriter(ruta_excel, engine="openpyxl", mode="a") as writer:
+        df_final.to_excel(writer, sheet_name=H_DIF, index=False)
+
+    return len(df_final)
+#FUNCION COMPARATIVA ENTRE MADRID-BULGARIA
+#rellenar_hoja_diferencias_excel(ruta)
+
+def actualizar_x_almacen_local_ose_desde_odoo16(batch_size=200):
+    """
+    Actualiza en OSE el campo custom x_almacen_local.
+
+    Lógica:
+        1. Busca todos los productos de OSE con default_code.
+        2. Pone x_almacen_local a 0.
+        3. Lee qty_available de OSE.
+        4. Busca el mismo default_code en Odoo16.
+        5. Lee qty_available de Odoo16 usando company_id = 2.
+        6. Escribe en OSE:
+              x_almacen_local = qty_available_odoo16 + qty_available_ose
+        7. Devuelve un DataFrame con columnas:
+              SKU, STOCK
+    """
+
+    import xmlrpc.client
+    import pandas as pd
+
+    def conectar(config):
+        common = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/common")
+        uid = common.authenticate(config['db'], config['user'], config['password'], {})
+
+        if not uid:
+            raise Exception(
+                f"No se pudo autenticar en {config['url']} "
+                f"con db={config['db']} user={config['user']}"
+            )
+
+        models = xmlrpc.client.ServerProxy(f"{config['url']}/xmlrpc/2/object")
+        return models, uid
+
+    odoo_ose = {
+        "url": "https://b2b.optimaluz.com/",
+        "db": "odoo0",
+        "user": "admin",
+        "password": "1324",
+    }
+
+    odoo16 = {
+        "url": "https://odoo16.optimaluz.com/",
+        "db": "Real",
+        "user": "jcoronado@optimaluz.com",
+        "password": "AlAi4ever",
+    }
+
+    models_16, uid_16 = conectar(odoo16)
+    models_ose, uid_ose = conectar(odoo_ose)
+
+    conn_16 = (models_16, uid_16, odoo16["db"], odoo16["password"], 2)
+    conn_ose = (models_ose, uid_ose, odoo_ose["db"], odoo_ose["password"], None)
+
+    def chunks(lista, size):
+        for i in range(0, len(lista), size):
+            yield lista[i:i + size]
+
+    def preparar_contexto(kwargs, company_id=None):
+        kwargs = kwargs or {}
+        context = kwargs.get("context", {}).copy()
+
+        context.setdefault("active_test", False)
+
+        if company_id is not None:
+            context["allowed_company_ids"] = [company_id]
+            context["force_company"] = company_id
+
+        kwargs["context"] = context
+        return kwargs
+
+    def execute(conn, model, method, args=None, kwargs=None):
+        models, uid, db, password, company_id = conn
+
+        args = args or []
+        kwargs = preparar_contexto(kwargs, company_id)
+
+        if method == "search" and company_id is not None:
+            if args and isinstance(args[0], list):
+                domain_original = args[0]
+
+                domain_company = [
+                    "|",
+                    ("company_id", "=", False),
+                    ("company_id", "=", company_id),
+                ]
+
+                args[0] = ["&"] + domain_company + domain_original
+
+        return models.execute_kw(
+            db,
+            uid,
+            password,
+            model,
+            method,
+            args,
+            kwargs
+        )
+
+    modelo = "product.product"
+    resultados_stock = []
+
+    ose_product_ids = execute(
+        conn_ose,
+        modelo,
+        "search",
+        [[("default_code", "!=", False)]],
+        {"context": {"active_test": False}}
+    )
+
+    if not ose_product_ids:
+        return pd.DataFrame(columns=["SKU", "STOCK"])
+
+    for lote_ids in chunks(ose_product_ids, batch_size):
+        execute(
+            conn_ose,
+            modelo,
+            "write",
+            [lote_ids, {"x_almacen_local": 0}],
+            {"context": {"active_test": False}}
+        )
+
+    for lote_ids in chunks(ose_product_ids, batch_size):
+
+        productos_ose = execute(
+            conn_ose,
+            modelo,
+            "read",
+            [lote_ids, ["default_code", "qty_available"]],
+            {"context": {"active_test": False}}
+        )
+
+        skus = [
+            p["default_code"]
+            for p in productos_ose
+            if p.get("default_code")
+        ]
+
+        if not skus:
+            continue
+
+        ids_16 = execute(
+            conn_16,
+            modelo,
+            "search",
+            [[("default_code", "in", skus)]],
+            {
+                "context": {
+                    "active_test": False,
+                    "allowed_company_ids": [2],
+                    "force_company": 2,
+                }
+            }
+        )
+
+        productos_16 = []
+
+        if ids_16:
+            productos_16 = execute(
+                conn_16,
+                modelo,
+                "read",
+                [ids_16, ["default_code", "qty_available"]],
+                {
+                    "context": {
+                        "active_test": False,
+                        "allowed_company_ids": [2],
+                        "force_company": 2,
+                    }
+                }
+            )
+
+        qty_16_por_sku = {}
+
+        for p16 in productos_16:
+            sku = p16.get("default_code")
+            if sku:
+                qty_16_por_sku[sku] = p16.get("qty_available") or 0
+
+        valores_por_qty = {}
+
+        for p_ose in productos_ose:
+            ose_id = p_ose["id"]
+            sku = p_ose.get("default_code")
+
+            if not sku:
+                continue
+
+            qty_ose = p_ose.get("qty_available") or 0
+            qty_16 = qty_16_por_sku.get(sku, 0)
+
+            nuevo_x_almacen_local = qty_16 + qty_ose
+
+            valores_por_qty.setdefault(nuevo_x_almacen_local, []).append(ose_id)
+
+            resultados_stock.append({
+                "SKU": sku,
+                "STOCK": nuevo_x_almacen_local,
+            })
+
+        for valor, ids_a_actualizar in valores_por_qty.items():
+            execute(
+                conn_ose,
+                modelo,
+                "write",
+                [ids_a_actualizar, {"x_almacen_local": valor}],
+                {"context": {"active_test": False}}
+            )
+
+    df_stock = pd.DataFrame(resultados_stock, columns=["SKU", "STOCK"])
+
+    return df_stock
+
+
