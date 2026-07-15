@@ -83,7 +83,7 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
         "https://led-italia.it/prodotti/M68-materiale-elettrico"
     ]
 
-    SCRAP_SELECTIVO = True
+    SCRAP_SELECTIVO = False
 
     if not SCRAP_SELECTIVO:
 

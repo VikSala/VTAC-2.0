@@ -1,5 +1,4 @@
 from services.campos_odoo import ClavesExcel, excel_a_odoo, FISCAL_POSITION_MAP
-from App_Connection import models, db, uid, password
 from collections import defaultdict
 from services.utils import Utils
 import xmlrpc
@@ -8,6 +7,7 @@ import math
 import pandas as pd
 import re
 
+models = ""; db = ""; uid = ""; password = ""
 url_src = 'https://odoo16.optimaluz.com/'#
 db_src = 'Real'
 username_src = 'jcoronado@optimaluz.com'
@@ -1009,11 +1009,11 @@ def import_comercial_stock():
     # 4) VD / VN desde hoja "Products" externa ===============
     def vd_vn_spain(products_excel_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Lee hoja 'Products' del Excel pasado y separa:
+        Lee hoja 'ES' del Excel pasado y separa:
           - 'Descatalogados' -> hoja VD (columna SKU)
           - 'Nuevos Productos' -> hoja VN (columna SKU)
         """
-        df = pd.read_excel(products_excel_path, sheet_name="Products", dtype=str)
+        df = pd.read_excel(products_excel_path, sheet_name="ES", dtype=str)
         col_cat = _find_col(df, "Categoría", "categoria", "category")
         col_sku = _find_col(df, "SKU", "sku", "default_code")
         if not col_cat or not col_sku:
@@ -1477,11 +1477,11 @@ def import_comercial_stock():
         print("Stock V-Tac reseteado con éxito! 5%")
 
     # 7) Ejecucion:
-    try:
+    '''try:
         abrir_vtac_gui()
     except:
         print()
-
+'''
     # Inicio
     reset_custom_stock()
 
@@ -3706,488 +3706,6 @@ def migrar_pedidos_compra():
 #endregion
 
 #region REGION FACTURACION
-def export_invoices_by_state(state):
-    """
-    Exporta facturas de Odoo 16 filtradas por estado, optimizado para rendimiento.
-    Lee las líneas en bloque para evitar miles de llamadas RPC.
-    """
-    import xmlrpc.client
-
-    # tipo_factura = "out_invoice" if cliente_T_proveedor_F else "in_invoice"
-    # if is_rectificativa: tipo_factura = "out_refund" if cliente_T_proveedor_F else "in_refund"
-
-    FIELDS = [
-        "id",
-        "name",
-        "partner_id",
-        "ref",
-        "date",
-        "invoice_date",
-        "invoice_date_due",
-        "move_type",
-        "state",
-        "invoice_line_ids",
-        "amount_untaxed",
-        "amount_tax",
-        "amount_total",
-        "currency_id",
-        "payment_reference",
-        "invoice_payment_term_id",
-        "invoice_origin",
-        "narration",
-        "company_id",
-        "invoice_user_id",
-        "journal_id",
-    ]
-
-    print(f"📤 Exportando facturas en estado '{state}'...")
-
-    # Define aquí el texto que escribe el usuario
-    termino_busqueda = "FC1OP/25/"  # "FV1OP/25/"#
-
-    # Este es el domain dinámico que debes usar:
-    domain = [
-        ("move_type", "in", ["out_invoice", "in_invoice", "out_refund", "in_refund"]),
-        ("state", "=", state),
-        ('company_id', '=', 2),  # OSE: 1 / ALM: 2
-        '|', '|', '|', '|',
-        ('name', 'ilike', termino_busqueda),
-        ('invoice_origin', 'ilike', termino_busqueda),
-        ('ref', 'ilike', termino_busqueda),
-        ('payment_reference', 'ilike', termino_busqueda),
-        ('partner_id', 'child_of', termino_busqueda)
-    ]
-
-    # 1️⃣ Exportar facturas
-    invoices = models_src.execute_kw(
-        db_src, uid_src, password_src,
-        "account.move", "search_read",
-        [domain],
-        {"fields": FIELDS}
-    )
-
-    print(f"   → {len(invoices)} facturas encontradas.")
-
-    journal_ids = {
-        inv["journal_id"][0]
-        for inv in invoices
-        if inv.get("journal_id")
-    }
-
-    journal_code_map = {}
-
-    if journal_ids:
-        journals = models_src.execute_kw(
-            db_src, uid_src, password_src,
-            "account.journal", "read",
-            [list(journal_ids)],
-            {"fields": ["id", "code"], "context": {"active_test": False}}
-        )
-
-        journal_code_map = {
-            j["id"]: j["code"]
-            for j in journals
-        }
-    # -------------------------------
-    # Añadir journal_code a cada factura
-    # -------------------------------
-    for inv in invoices:
-        if inv.get("journal_id"):
-            inv["journal_code"] = journal_code_map.get(inv["journal_id"][0])
-        else:
-            inv["journal_code"] = None
-
-    # 2️⃣ Reunir todos los IDs de líneas
-    all_line_ids = []
-    for inv in invoices:
-        all_line_ids.extend(inv.get("invoice_line_ids", []))
-
-    if not all_line_ids:
-        print("⚠️  No se encontraron líneas de factura.")
-        return invoices
-
-    print(f"   → {len(all_line_ids)} líneas totales detectadas. Leyendo en bloque...")
-
-    # 3️⃣ Leer todas las líneas en bloque
-    lines = models_src.execute_kw(
-        db_src, uid_src, password_src,
-        "account.move.line", "read",
-        [all_line_ids],
-        {"fields": [
-            "id",
-            "move_id",
-            "name",
-            "product_id",
-            "quantity",
-            "price_unit",
-            "discount",
-            "price_subtotal",
-            "tax_ids",
-            "account_id",
-            "display_type",
-        ]}
-    )
-
-    # ------------------------------------------------
-    # 4️⃣ Resolver SKUs de productos
-    # ------------------------------------------------
-    product_ids = {
-        l["product_id"][0]
-        for l in lines
-        if l.get("product_id")
-    }
-
-    sku_map = {}
-    if product_ids:
-        products = models_src.execute_kw(
-            db_src, uid_src, password_src,
-            "product.product", "read",
-            [list(product_ids)],
-            {"fields": ["id", "default_code"]}
-        )
-        sku_map = {p["id"]: p["default_code"] for p in products}
-
-    # 4️⃣ Agrupar las líneas por factura
-    grouped_lines = defaultdict(list)
-    for line in lines:
-        move = line.get("move_id")
-        if move:
-            line["default_code"] = (
-                sku_map.get(line["product_id"][0])
-                if line.get("product_id")
-                else None
-            )
-            grouped_lines[move[0]].append(line)
-
-    # 5️⃣ Asignar líneas a cada factura
-    for inv in invoices:
-        inv_id = inv["id"]
-        inv["lineas_detalle"] = grouped_lines.get(inv_id, [])
-
-    print("✅ Líneas asignadas correctamente a cada factura.")
-    return invoices
-
-def import_invoices_with_lines(invoices, state):
-    """
-    Importa facturas en Odoo 18 junto con sus líneas y mapeo de impuestos.
-    Si state='posted', primero crea en draft y luego ejecuta action_post().
-    """
-    import xmlrpc.client
-    from App_Connection import db, uid, password, models
-
-    test = False
-    total_creadas = 0
-    total_existentes = 0
-
-    def safe_execute_line(model, method, args, retries=3, wait=5, timeout=60):
-        """
-        Ejecuta un método XML-RPC con reintentos y timeout de seguridad.
-        Evita bloqueos permanentes por errores de red o cuelgues del servidor.
-        """
-        import xmlrpc.client
-        import time
-        import socket
-
-        for intento in range(1, retries + 1):
-            try:
-                # Ajustar timeout del socket
-                socket.setdefaulttimeout(timeout)
-                result = models.execute_kw(db, uid, password, model, method, args)
-                socket.setdefaulttimeout(None)
-                return result
-            except Exception as e:
-                print(f"⚠️ Error ({model}.{method}) intento {intento}/{retries}: {e}")
-                if intento < retries:
-                    print(f"   ↪ Reintentando en {wait} segundos...")
-                    time.sleep(wait)
-                else:
-                    print(f"   ❌ Línea fallida tras {retries} intentos.")
-                    return None
-
-    for inv in invoices:
-        name = inv.get("name") or inv.get("payment_reference") or "SIN_NOMBRE"
-        x_id_interno = inv.get("id")
-        print(f"\n🧾 Procesando factura: {name}")
-
-        # Comprobar si ya existe
-        existing = models.execute_kw(
-            db, uid, password,
-            "account.move", "search",
-            [[("x_id_interno", "=", x_id_interno)]]
-        )
-        if existing:
-            print(f"⚠️  Factura ya existente: {total_existentes}")
-            continue
-
-        # -------------------------------
-        # Buscar cliente/proveedor
-        # -------------------------------
-        partner_id = None
-        if inv.get("partner_id"):
-            partner_id_origen = inv.get("partner_id")[0]
-            partner_id = Utils.get_by_x_id_interno("res.partner", partner_id_origen, db, uid, password, models)
-
-        # -------------------------------
-        # Buscar moneda
-        # -------------------------------
-        currency_id = None
-        if inv["currency_id"]:
-            currency_name = inv["currency_id"][1]
-            currencies = models.execute_kw(
-                db, uid, password,
-                "res.currency", "search_read",
-                [[("name", "=", currency_name)]],
-                {"fields": ["id"], "limit": 1}
-            )
-            if currencies:
-                currency_id = currencies[0]["id"]
-
-        # -------------------------------
-        # Buscar usuario de factura
-        # -------------------------------
-        user_id_origen = None
-        if inv.get("invoice_user_id"):
-            user_id_origen = inv.get("invoice_user_id")[0]
-        invoice_user_id = Utils.get_by_x_id_interno("res.users", user_id_origen, db, uid, password, models)
-
-        # -------------------------------
-        # Buscar diario contable (por code)
-        # -------------------------------
-        journal_id = None
-        if inv.get("journal_code"):
-            journal_code = inv["journal_code"]
-
-            journals = models.execute_kw(
-                db, uid, password,
-                "account.journal", "search_read",
-                [[("code", "=", journal_code)]],
-                {
-                    "fields": ["id"],
-                    "limit": 1,
-                    "context": {"active_test": False},
-                }
-            )
-
-            if journals:
-                journal_id = journals[0]["id"]
-            else:
-                print(f"⚠️ Diario no encontrado: code={journal_code}")
-
-        # -------------------------------
-        # Crear factura en borrador siempre
-        # -------------------------------
-        vals_inv = {
-            "x_id_interno": inv.get("id"),
-            "name": name,
-            "move_type": inv.get("move_type") or "out_invoice",
-            "partner_id": partner_id,
-            "ref": inv.get("ref"),
-            "payment_reference": inv.get("payment_reference"),
-            "date": inv.get("date"),
-            "invoice_date": inv.get("invoice_date"),
-            "invoice_date_due": inv.get("invoice_date_due"),
-            "currency_id": currency_id,
-            "invoice_origin": inv.get("invoice_origin"),
-            "narration": inv.get("narration"),
-            "invoice_user_id": invoice_user_id,
-            "journal_id": journal_id,
-            "state": "draft",
-            "partner_bank_id": "",
-        }
-
-        try:
-            new_inv_id = models.execute_kw(
-                db, uid, password,
-                "account.move", "create", [vals_inv]
-            )
-            print(f"✅ Factura creada: {name} (ID {new_inv_id})")
-            total_creadas += 1
-        except Exception as e:
-            print(f"❌ Error creando factura {name}: {e}")
-            continue
-
-        # -------------------------------
-        # Crear líneas
-        # -------------------------------
-        for linea in inv.get("lineas_detalle", []):
-            display_type = linea.get("display_type")
-
-            # -------------------------------
-            # 📝 NOTA / SECCIÓN
-            # -------------------------------
-            if display_type in ("line_note", "line_section"):
-                vals_line = {
-                    "x_id_interno": linea.get("id"),
-                    "move_id": new_inv_id,
-                    "name": linea.get("name"),
-                    "display_type": display_type,
-                    "quantity": 0.0,
-                    "sequence": linea.get("sequence"),
-                }
-
-                result = safe_execute_line(
-                    "account.move.line", "create", [vals_line]
-                )
-                if not result:
-                    print(f"⚠️ Error creando nota/sección: {linea.get('name')}")
-                continue
-
-            # -------------------------------
-            # 📦 LÍNEA NORMAL (PRODUCTO O CONCEPTO)
-            # -------------------------------
-            product_id = None
-            account_id = None
-
-            sku = linea.get("default_code")
-
-            # 🔹 Intentar resolver producto por SKU
-            if sku:
-                productos = models.execute_kw(
-                    db, uid, password,
-                    "product.product", "search",
-                    [[("default_code", "=", sku)]],
-                    {"limit": 1}
-                )
-                if productos:
-                    product_id = productos[0]
-                else:
-                    productos = models.execute_kw(
-                        db, uid, password,
-                        "product.product", "search",
-                        [[("default_code", "ilike", sku)]],
-                        {"limit": 1, "context": {"active_test": False}}
-                    )
-                    if productos:
-                        product_id = productos[0]
-                    else:
-                        print(f"⚠️ Producto no encontrado (SKU={sku})")
-
-            # 🔹 Si NO hay producto → resolver cuenta contable
-            if not product_id:
-                if inv.get("move_type") in ("out_invoice", "out_refund"):
-                    accounts = models.execute_kw(
-                        db, uid, password,
-                        "account.account", "search",
-                        [[
-                            ("account_type", "=", "income"),
-                        ]],
-                        {"limit": 1}
-                    )
-                else:
-                    accounts = models.execute_kw(
-                        db, uid, password,
-                        "account.account", "search",
-                        [[
-                            ("account_type", "=", "expense"),
-                        ]],
-                        {"limit": 1}
-                    )
-
-                if accounts:
-                    account_id = accounts[0]
-                else:
-                    raise Exception("❌ No se encontró cuenta contable por defecto")
-            cuenta_dest = None
-            try:
-                account_id_origen = linea.get("account_id")
-                if account_id_origen:
-                    account_id_origen = account_id_origen[0]
-
-                # Obtener código cuenta origen
-                acc_origen = models_src.execute_kw(
-                    db_src, uid_src, password_src,
-                    "account.account", "read",
-                    [[account_id_origen]],
-                    {"fields": ["code"]}
-                )[0]
-
-                account_code = acc_origen["code"]
-
-                # Buscar cuenta destino
-                cuenta_dest = models.execute_kw(
-                    db, uid, password,
-                    "account.account", "search",
-                    [[("code", "=", account_code)]],
-                    {"limit": 1}
-                )
-            except:
-                pass
-
-            # -------------------------------
-            # 🔹 Impuestos
-            # -------------------------------
-            tax_ids = []
-            if linea.get("tax_ids"):
-                for tax_origen in linea.get("tax_ids"):
-                    tax_id = Utils.get_by_x_id_interno("account.tax", tax_origen, db, uid, password, models)
-                    if tax_id:
-                        tax_ids.append(tax_id)
-
-            # -------------------------------
-            # 🔹 Crear línea
-            # -------------------------------
-            vals_line = {
-                "x_id_interno": linea.get("id"),
-                "move_id": new_inv_id,
-                "name": linea.get("name"),
-                "product_id": product_id,
-                "display_type": display_type,
-                "quantity": linea.get("quantity") or 1.0,
-                "price_unit": linea.get("price_unit") or 0.0,
-                "discount": linea.get("discount") or 0.0,
-                "tax_ids": [(6, 0, tax_ids)],
-                "sequence": linea.get("sequence"),
-            }
-
-            if cuenta_dest:
-                vals_line["account_id"] = cuenta_dest[0]
-            elif account_id:
-                vals_line["account_id"] = account_id
-
-            result = safe_execute_line(
-                "account.move.line", "create", [vals_line],
-                retries=3, wait=5, timeout=90
-            )
-
-            if result:
-                print(f"   ➕ Línea creada: {linea.get('name')}")
-            else:
-                print(f"   ⚠️ No se pudo crear la línea: {linea.get('name')}")
-
-        # -------------------------------
-        # Publicar si corresponde
-        # -------------------------------
-        if not test:
-            if state == "posted":
-                try:
-                    models.execute_kw(
-                        db, uid, password,
-                        "account.move", "action_post",
-                        [[new_inv_id]]
-                    )
-                    print(f"   📤 Factura publicada correctamente.")
-                except Exception as e:
-                    print(f"   ⚠️ Error al publicar factura {name}: {e}")
-
-            elif state == "cancel":
-                try:
-                    models.execute_kw(
-                        db, uid, password,
-                        "account.move", "button_cancel",
-                        [[new_inv_id]]
-                    )
-                    print(f"   🚫 Factura cancelada correctamente.")
-                except Exception as e:
-                    print(f"   ⚠️ Error cancelando factura {name}: {e}")
-
-    print("\n📊 MIGRACIÓN COMPLETADA")
-    print(f"   Total creadas: {total_creadas}")
-    print(f"   Ya existentes: {total_existentes}")
-
-# ----------------------------------------------------------------------
-# Funcion core
-# ----------------------------------------------------------------------
-
 def migrar_facturas(termino):
     from collections import defaultdict
     import re
@@ -5177,6 +4695,7 @@ def migrar_nomina_origen_a_destino(nomina_origen_id):
         [[nomina_origen_id]],
         {
             "fields": [
+                "id",
                 "name",
                 "ref",
                 "date",
@@ -5207,6 +4726,7 @@ def migrar_nomina_origen_a_destino(nomina_origen_id):
         db, uid, password,
         "account.move", "create",
         [{
+            "x_id_interno": move["id"],
             "name": move["name"],
             "ref": move["ref"],
             "date": move["date"],
@@ -5368,64 +4888,462 @@ def migrar_y_conciliar_una_nomina(nomina_origen):
 def analizar_asientos_faltantes():
     """
     Analiza los asientos que faltan en DESTINO
-    clasificándolos por journal y tipo.
+    usando x_id_interno como vínculo real entre origen y destino.
+
+    Ya NO compara por name, porque ahora algunos asientos se crean
+    sin name para que Odoo destino asigne su propia secuencia.
+
+    Además resume cuántos de los faltantes tienen conciliaciones
+    en origen.
     """
 
-    # Buscar todos en origen
+    # -------------------------------------------------
+    # 1️⃣ Buscar todos los movimientos publicados en origen
+    # -------------------------------------------------
     origen_ids = models_src.execute_kw(
         db_src, uid_src, password_src,
         "account.move", "search",
-        [[("state", "=", "posted"), ("company_id", "=", 2),
-          ("date", ">=", "2025-01-01"),
-          ("date", "<", "2027-01-01"), ]]
+        [[
+            ("state", "=", "posted"),
+            ("company_id", "=", 2),
+            ("date", ">=", "2025-01-01"),
+            ("date", "<", "2026-01-01"),
+        ]]
     )
+
+    if not origen_ids:
+        print("ℹ️ No se encontraron asientos en origen.")
+        return []
 
     origen_moves = models_src.execute_kw(
         db_src, uid_src, password_src,
         "account.move", "read",
         [origen_ids],
-        {"fields": ["name", "journal_id", "date", "move_type"]}
+        {
+            "fields": [
+                "id",
+                "name",
+                "journal_id",
+                "date",
+                "move_type",
+                "state",
+            ]
+        }
     )
 
+    # -------------------------------------------------
+    # 2️⃣ Buscar movimientos destino que vienen de origen
+    # -------------------------------------------------
     destino_ids = models.execute_kw(
         db, uid, password,
         "account.move", "search",
-        [[("state", "=", "posted")]]
+        [[
+            ("state", "=", "posted"),
+            ("x_id_interno", "!=", False),
+        ]]
     )
 
-    destino_moves = models.execute_kw(
-        db, uid, password,
-        "account.move", "read",
-        [destino_ids],
-        {"fields": ["name"]}
-    )
+    destino_moves = []
 
-    destino_names = {m["name"] for m in destino_moves}
+    if destino_ids:
+        destino_moves = models.execute_kw(
+            db, uid, password,
+            "account.move", "read",
+            [destino_ids],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "x_id_interno",
+                    "journal_id",
+                    "date",
+                    "move_type",
+                ]
+            }
+        )
 
-    faltantes = [m for m in origen_moves if m["name"] not in destino_names]
+    destino_x_ids = {
+        int(m["x_id_interno"])
+        for m in destino_moves
+        if m.get("x_id_interno")
+    }
+
+    # -------------------------------------------------
+    # 3️⃣ Detectar faltantes por ID de origen
+    # -------------------------------------------------
+    faltantes = [
+        m for m in origen_moves
+        if m["id"] not in destino_x_ids
+    ]
 
     print(f"\n🔴 Total faltantes: {len(faltantes)}")
 
-    # Clasificar por journal
-    resumen = {}
+    # -------------------------------------------------
+    # 4️⃣ Clasificar por journal
+    # -------------------------------------------------
+    resumen_journal = {}
 
     for m in faltantes:
-        journal = m["journal_id"][1] if m["journal_id"] else "SIN JOURNAL"
-
-        if journal not in resumen:
-            resumen[journal] = 0
-
-        resumen[journal] += 1
+        journal = m["journal_id"][1] if m.get("journal_id") else "SIN JOURNAL"
+        resumen_journal[journal] = resumen_journal.get(journal, 0) + 1
 
     print("\n📊 Faltantes por journal:")
-    for journal, cantidad in sorted(resumen.items(), key=lambda x: x[1], reverse=True):
+    for journal, cantidad in sorted(
+            resumen_journal.items(),
+            key=lambda x: x[1],
+            reverse=True
+    ):
         print(f"   {journal}: {cantidad}")
+
+    # -------------------------------------------------
+    # 5️⃣ Clasificar por tipo de move
+    # -------------------------------------------------
+    resumen_tipo = {}
+
+    for m in faltantes:
+        move_type = m.get("move_type") or "SIN TIPO"
+        resumen_tipo[move_type] = resumen_tipo.get(move_type, 0) + 1
+
+    print("\n📊 Faltantes por tipo:")
+    for move_type, cantidad in sorted(
+            resumen_tipo.items(),
+            key=lambda x: x[1],
+            reverse=True
+    ):
+        print(f"   {move_type}: {cantidad}")
+
+    # -------------------------------------------------
+    # 6️⃣ Detectar faltantes con conciliaciones en origen
+    # -------------------------------------------------
+    faltantes_conciliados = set()
+    total_partials_faltantes = 0
+
+    faltantes_ids = [m["id"] for m in faltantes]
+
+    if faltantes_ids:
+        lineas_conciliables = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move.line", "search_read",
+            [[
+                ("move_id", "in", faltantes_ids),
+                ("account_id.reconcile", "=", True),
+            ]],
+            {
+                "fields": [
+                    "id",
+                    "move_id",
+                    "matched_debit_ids",
+                    "matched_credit_ids",
+                ]
+            }
+        )
+
+        partial_ids_detectados = set()
+
+        for line in lineas_conciliables:
+            matched_debit_ids = line.get("matched_debit_ids") or []
+            matched_credit_ids = line.get("matched_credit_ids") or []
+
+            partial_ids = set(matched_debit_ids) | set(matched_credit_ids)
+
+            if partial_ids:
+                faltantes_conciliados.add(line["move_id"][0])
+                partial_ids_detectados.update(partial_ids)
+
+        total_partials_faltantes = len(partial_ids_detectados)
+
+    print("\n🔗 Faltantes con conciliaciones en origen:")
+    print(f"   Asientos faltantes con conciliación: {len(faltantes_conciliados)}")
+    print(f"   Partials detectados en esos faltantes: {total_partials_faltantes}")
+    print(f"   Asientos faltantes sin conciliación: {len(faltantes) - len(faltantes_conciliados)}")
+
+    return faltantes
+
+
+def detectar_asientos_conciliados_origen_no_destino(
+        fecha_inicio="2025-01-01",
+        fecha_fin="2026-01-01",
+        company_id_origen=2,
+        batch_size=300,
+):
+    from App_Connection import models, db, uid, password
+
+    # Origen:
+    # Deben existir en tu entorno:
+    # models_src, db_src, uid_src, password_src
+
+    def chunks(lista, size):
+        for i in range(0, len(lista), size):
+            yield lista[i:i + size]
+
+    def search_read(model_proxy, database, user_id, passwd, model, domain, fields, limit=False):
+        kwargs = {"fields": fields}
+        if limit:
+            kwargs["limit"] = limit
+        return model_proxy.execute_kw(
+            database,
+            user_id,
+            passwd,
+            model,
+            "search_read",
+            [domain],
+            kwargs,
+        )
+
+    def read(model_proxy, database, user_id, passwd, model, ids, fields):
+        if not ids:
+            return []
+        return model_proxy.execute_kw(
+            database,
+            user_id,
+            passwd,
+            model,
+            "read",
+            [ids],
+            {"fields": fields},
+        )
+
+    print("🔎 Buscando apuntes conciliados en ORIGEN...")
+    print(f"   Fecha inicio: {fecha_inicio}")
+    print(f"   Fecha fin:    {fecha_fin}")
+    print(f"   Company origen: {company_id_origen}")
+
+    # 1) Buscar apuntes de origen que tengan conciliación parcial o completa.
+    domain_lineas_origen = [
+        ("company_id", "=", company_id_origen),
+        ("date", ">=", fecha_inicio),
+        ("date", "<", fecha_fin),
+        ("parent_state", "=", "posted"),
+        "|",
+        ("matched_debit_ids", "!=", False),
+        ("matched_credit_ids", "!=", False),
+    ]
+
+    campos_linea_origen = [
+        "id",
+        "move_id",
+        "date",
+        "name",
+        "account_id",
+        "partner_id",
+        "debit",
+        "credit",
+        "balance",
+        "amount_residual",
+        "reconciled",
+        "full_reconcile_id",
+        "matched_debit_ids",
+        "matched_credit_ids",
+    ]
+
+    lineas_origen = search_read(
+        models_src,
+        db_src,
+        uid_src,
+        password_src,
+        "account.move.line",
+        domain_lineas_origen,
+        campos_linea_origen,
+    )
+
+    if not lineas_origen:
+        print("✅ No se han encontrado apuntes conciliados en origen para ese rango.")
+        return []
+
+    print(f"✅ Apuntes conciliados encontrados en origen: {len(lineas_origen)}")
+
+    # 2) Preparar ids de líneas y asientos origen.
+    origen_line_ids = [l["id"] for l in lineas_origen]
+    origen_move_ids = list({
+        l["move_id"][0]
+        for l in lineas_origen
+        if l.get("move_id")
+    })
+
+    # 3) Leer asientos origen para tener name/ref/journal.
+    moves_origen = {}
+    for bloque in chunks(origen_move_ids, batch_size):
+        datos = read(
+            models_src,
+            db_src,
+            uid_src,
+            password_src,
+            "account.move",
+            bloque,
+            ["id", "name", "date", "ref", "journal_id", "company_id"],
+        )
+        for m in datos:
+            moves_origen[m["id"]] = m
+
+    # 4) Buscar líneas destino por x_id_interno = id línea origen.
+    print("🔎 Buscando equivalentes en DESTINO por x_id_interno...")
+
+    destino_por_xid_linea = {}
+
+    for bloque in chunks(origen_line_ids, batch_size):
+        lineas_destino = search_read(
+            models,
+            db,
+            uid,
+            password,
+            "account.move.line",
+            [("x_id_interno", "in", bloque)],
+            [
+                "id",
+                "x_id_interno",
+                "move_id",
+                "date",
+                "name",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+                "amount_residual",
+                "reconciled",
+                "full_reconcile_id",
+                "matched_debit_ids",
+                "matched_credit_ids",
+            ],
+        )
+
+        for ld in lineas_destino:
+            xid = ld.get("x_id_interno")
+            if xid:
+                destino_por_xid_linea[int(xid)] = ld
+
+    print(f"✅ Líneas equivalentes encontradas en destino: {len(destino_por_xid_linea)}")
+
+    # 5) Comparar conciliación origen vs destino.
+    asientos_con_problema = {}
+    lineas_no_encontradas_destino = []
+    lineas_sin_conciliacion_destino = []
+
+    for lo in lineas_origen:
+        src_line_id = lo["id"]
+        src_move_id = lo["move_id"][0]
+        src_move_name = lo["move_id"][1]
+
+        ld = destino_por_xid_linea.get(src_line_id)
+
+        if not ld:
+            lineas_no_encontradas_destino.append(lo)
+
+            move = moves_origen.get(src_move_id, {})
+            asientos_con_problema[src_move_id] = {
+                "move_id_origen": src_move_id,
+                "name": move.get("name") or src_move_name,
+                "date": move.get("date"),
+                "ref": move.get("ref"),
+                "journal": move.get("journal_id")[1] if move.get("journal_id") else "",
+                "motivos": set(),
+                "lineas": [],
+            }
+            asientos_con_problema[src_move_id]["motivos"].add("línea no encontrada en destino por x_id_interno")
+            asientos_con_problema[src_move_id]["lineas"].append({
+                "line_id_origen": src_line_id,
+                "line_name": lo.get("name"),
+                "account": lo["account_id"][1] if lo.get("account_id") else "",
+                "debit": lo.get("debit"),
+                "credit": lo.get("credit"),
+                "balance": lo.get("balance"),
+                "destino_line_id": None,
+            })
+            continue
+
+        destino_tiene_conciliacion = bool(
+            ld.get("reconciled")
+            or ld.get("full_reconcile_id")
+            or ld.get("matched_debit_ids")
+            or ld.get("matched_credit_ids")
+        )
+
+        if not destino_tiene_conciliacion:
+            lineas_sin_conciliacion_destino.append((lo, ld))
+
+            move = moves_origen.get(src_move_id, {})
+            asientos_con_problema[src_move_id] = asientos_con_problema.get(src_move_id, {
+                "move_id_origen": src_move_id,
+                "name": move.get("name") or src_move_name,
+                "date": move.get("date"),
+                "ref": move.get("ref"),
+                "journal": move.get("journal_id")[1] if move.get("journal_id") else "",
+                "motivos": set(),
+                "lineas": [],
+            })
+
+            asientos_con_problema[src_move_id]["motivos"].add("origen conciliado / destino no conciliado")
+            asientos_con_problema[src_move_id]["lineas"].append({
+                "line_id_origen": src_line_id,
+                "line_name": lo.get("name"),
+                "account": lo["account_id"][1] if lo.get("account_id") else "",
+                "debit": lo.get("debit"),
+                "credit": lo.get("credit"),
+                "balance": lo.get("balance"),
+                "destino_line_id": ld.get("id"),
+                "destino_move": ld["move_id"][1] if ld.get("move_id") else "",
+            })
+
+    resultado = list(asientos_con_problema.values())
+
+    # 6) Print resumen.
+    print("")
+    print("==============================================")
+    print("📊 RESUMEN COMPARACIÓN CONCILIACIONES")
+    print("==============================================")
+    print(f"Apuntes conciliados en origen: {len(lineas_origen)}")
+    print(f"Líneas destino encontradas por x_id_interno: {len(destino_por_xid_linea)}")
+    print(f"Líneas origen no encontradas en destino: {len(lineas_no_encontradas_destino)}")
+    print(f"Líneas origen conciliadas pero destino sin conciliación: {len(lineas_sin_conciliacion_destino)}")
+    print(f"Asientos origen afectados: {len(resultado)}")
+    print("")
+
+    if not resultado:
+        print("✅ Todo correcto: no hay asientos de origen conciliados que estén sin conciliar en destino.")
+        return []
+
+    print("==============================================")
+    print("🔴 ASIENTOS ORIGEN CONCILIADOS QUE EN DESTINO NO LO ESTÁN")
+    print("==============================================")
+
+    for item in resultado:
+        motivos = ", ".join(sorted(item["motivos"]))
+
+        print("")
+        print(
+            f"❌ {item['name']} | "
+            f"Fecha: {item['date']} | "
+            f"Journal: {item['journal']} | "
+            f"Origen move_id: {item['move_id_origen']} | "
+            f"Motivo: {motivos}"
+        )
+
+        if item.get("ref"):
+            print(f"   Ref: {item['ref']}")
+
+        for linea in item["lineas"]:
+            print(
+                f"   - Línea origen {linea['line_id_origen']} | "
+                f"Cuenta: {linea['account']} | "
+                f"Debe: {linea['debit']} | "
+                f"Haber: {linea['credit']} | "
+                f"Balance: {linea['balance']} | "
+                f"Línea destino: {linea.get('destino_line_id')}"
+            )
+
+    print("")
+    print("✅ Comparación terminada.")
+
+    return resultado
 
 
 def export_asientos_banco_faltantes():
     """
     Exporta asientos de banco/caja que existen en ORIGEN
     pero no en DESTINO.
+
+    Comparación por x_id_interno, no por name, porque ahora
+    algunos asientos destino se crean dejando que Odoo asigne
+    su propia secuencia.
     """
 
     print("🏦 Exportando asientos de banco/caja faltantes")
@@ -5434,22 +5352,15 @@ def export_asientos_banco_faltantes():
     # 1️⃣ Domain base
     # -------------------------------------------------
     domain_src = [
-        ("state", "=", "posted"),  # draft#posted
+        ("state", "=", "posted"),
         ("company_id", "=", 2),
         ("date", ">=", "2025-01-01"),
-        ("date", "<", "2027-01-01"),
-        # "|",
-        # ("journal_id.type", "in", ["bank", "cash"]),
-        # ("journal_id.code", "=", "VAR"),
+        ("date", "<", "2026-01-01"),
     ]
 
     domain_dest = [
         ("state", "=", "posted"),
-        ("date", ">=", "2025-01-01"),
-        ("date", "<", "2027-01-01"),
-        # "|",
-        # ("journal_id.type", "in", ["bank", "cash"]),
-        # ("journal_id.code", "=", "VAR"),
+        ("x_id_interno", "!=", False),
     ]
 
     # -------------------------------------------------
@@ -5479,6 +5390,7 @@ def export_asientos_banco_faltantes():
                 "company_id",
                 "partner_id",
                 "state",
+                "move_type",
             ]
         }
     )
@@ -5486,7 +5398,7 @@ def export_asientos_banco_faltantes():
     print(f"📄 Asientos banco en ORIGEN: {len(origen_moves)}")
 
     # -------------------------------------------------
-    # 3️⃣ Obtener DESTINO para comparar
+    # 3️⃣ Obtener DESTINO para comparar por x_id_interno
     # -------------------------------------------------
     destino_ids = models.execute_kw(
         db, uid, password,
@@ -5494,28 +5406,64 @@ def export_asientos_banco_faltantes():
         [domain_dest]
     )
 
-    destino_moves = models.execute_kw(
-        db, uid, password,
-        "account.move", "read",
-        [destino_ids],
-        {"fields": ["name"]}
-    )
+    destino_moves = []
 
-    destino_names = {m["name"] for m in destino_moves}
+    if destino_ids:
+        destino_moves = models.execute_kw(
+            db, uid, password,
+            "account.move", "read",
+            [destino_ids],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "x_id_interno",
+                    "date",
+                    "journal_id",
+                    "move_type",
+                ]
+            }
+        )
+
+    destino_x_ids = {
+        int(m["x_id_interno"])
+        for m in destino_moves
+        if m.get("x_id_interno")
+    }
 
     # -------------------------------------------------
-    # 4️⃣ Filtrar faltantes
+    # 4️⃣ Filtrar faltantes por ID real de origen
     # -------------------------------------------------
-    faltantes = [m for m in origen_moves if m["name"] not in destino_names]
+    faltantes = [
+        m for m in origen_moves
+        if m["id"] not in destino_x_ids
+    ]
 
     print(f"❗ Asientos banco faltantes en DESTINO: {len(faltantes)}")
+
+    # -------------------------------------------------
+    # 4.1️⃣ Resumen por diario
+    # -------------------------------------------------
+    resumen_journal = {}
+
+    for m in faltantes:
+        journal = m["journal_id"][1] if m.get("journal_id") else "SIN JOURNAL"
+        resumen_journal[journal] = resumen_journal.get(journal, 0) + 1
+
+    print("\n📊 Faltantes por journal:")
+    for journal, cantidad in sorted(
+            resumen_journal.items(),
+            key=lambda x: x[1],
+            reverse=True
+    ):
+        print(f"   {journal}: {cantidad}")
 
     resultado = []
 
     # -------------------------------------------------
     # 5️⃣ Exportar cada asiento con sus líneas
     # -------------------------------------------------
-    for move in faltantes:  # faltantes_test:#
+    for move in faltantes:
         move_id = move["id"]
 
         line_ids = models_src.execute_kw(
@@ -5524,23 +5472,26 @@ def export_asientos_banco_faltantes():
             [[("move_id", "=", move_id)]]
         )
 
-        lines = models_src.execute_kw(
-            db_src, uid_src, password_src,
-            "account.move.line", "read",
-            [line_ids],
-            {
-                "fields": [
-                    "id",
-                    "account_id",
-                    "partner_id",
-                    "name",
-                    "debit",
-                    "credit",
-                    "currency_id",
-                    "amount_currency",
-                ]
-            }
-        )
+        lines = []
+
+        if line_ids:
+            lines = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.move.line", "read",
+                [line_ids],
+                {
+                    "fields": [
+                        "id",
+                        "account_id",
+                        "partner_id",
+                        "name",
+                        "debit",
+                        "credit",
+                        "currency_id",
+                        "amount_currency",
+                    ]
+                }
+            )
 
         resultado.append({
             "move": move,
@@ -5558,6 +5509,11 @@ def import_asientos_banco_faltantes(data):
     No realiza conciliación.
     Crea el asiento con todas las líneas juntas para evitar
     errores de desbalanceo.
+
+    IMPORTANTE:
+    - No copia el name del asiento origen.
+    - Deja que Odoo destino asigne la secuencia al publicar.
+    - Vincula el asiento destino con el origen mediante x_id_interno.
     """
 
     print("📥 Importando asientos banco faltantes")
@@ -5566,11 +5522,36 @@ def import_asientos_banco_faltantes(data):
         move_src = item["move"]
         lines_src = item["lines"]
 
-        test = False  # En la segunda ejecucion: True y comentar la linea de abajo
-        if move_src['name'] == "CB472/22/1140" or move_src['name'] == "VAR/25/0120" or move_src[
-            'name'] == "VAR/24/0127": continue
+        test = False  # En pruebas: True para crear sin importes/posteo
 
-        print(f"\n🏦 Importando asiento {move_src['name']}")
+        if (
+                move_src["name"] == "CB472/22/1140"
+                # or move_src["name"] == "VAR/25/0120"
+                or move_src["name"] == "VAR/24/0127"
+        ):
+            continue
+
+        print(
+            f"\n🏦 Importando asiento origen "
+            f"{move_src['name']} | origen_id={move_src['id']}"
+        )
+
+        # -------------------------------------------------
+        # 0️⃣ Evitar duplicados por x_id_interno
+        # -------------------------------------------------
+        move_existente = models.execute_kw(
+            db, uid, password,
+            "account.move", "search",
+            [[("x_id_interno", "=", move_src["id"])]],
+            {"limit": 1}
+        )
+
+        if move_existente:
+            print(
+                f"⏭️ Ya existe en destino por x_id_interno: "
+                f"{move_src['name']} | destino_id={move_existente[0]}"
+            )
+            continue
 
         # -------------------------------------------------
         # 1️⃣ Mapear JOURNAL por código
@@ -5594,7 +5575,8 @@ def import_asientos_banco_faltantes(data):
         )
 
         if not journal_dest_ids:
-            continue  # raise Exception(f"❌ Journal no encontrado en destino: {journal_code}")
+            print(f"⚠️ Journal no encontrado en destino: {journal_code}")
+            continue
 
         journal_dest_id = journal_dest_ids[0]
 
@@ -5608,7 +5590,9 @@ def import_asientos_banco_faltantes(data):
         for line in lines_src:
 
             # Mapear cuenta por código
-            if not line["account_id"]: continue
+            if not line.get("account_id"):
+                continue
+
             account_src_id = line["account_id"][0]
 
             account_src = models_src.execute_kw(
@@ -5634,60 +5618,114 @@ def import_asientos_banco_faltantes(data):
 
             # Mapear partner si existe
             partner_dest_id = False
-            if line["partner_id"]:
-                partner_dest_id = Utils.get_by_x_id_interno("res.partner", line["partner_id"][0], db, uid, password,
-                                                            models)
 
-            debit = line["debit"] or 0.0
-            credit = line["credit"] or 0.0
+            if line.get("partner_id"):
+                partner_dest_id = Utils.get_by_x_id_interno(
+                    "res.partner",
+                    line["partner_id"][0],
+                    db,
+                    uid,
+                    password,
+                    models
+                )
+
+            debit = line.get("debit") or 0.0
+            credit = line.get("credit") or 0.0
 
             total_debit += debit
             total_credit += credit
 
-            line_vals.append((0, 0, {
+            vals_line = {
                 "x_id_interno": line["id"],
                 "account_id": account_dest_id,
                 "partner_id": partner_dest_id,
-                "name": line["name"] or "/",
-                "debit": debit if not test else 0,
-                "credit": credit if not test else 0,
-                "currency_id": line["currency_id"][0] if line["currency_id"] else False,
-                "amount_currency": line["amount_currency"],
-            }))
+                "name": line.get("name") or "/",
+                "debit": debit if not test else 0.0,
+                "credit": credit if not test else 0.0,
+            }
+
+            if line.get("currency_id"):
+                vals_line["currency_id"] = line["currency_id"][0]
+                vals_line["amount_currency"] = line.get("amount_currency") or 0.0
+
+            line_vals.append((0, 0, vals_line))
 
         # -------------------------------------------------
-        # 4️⃣ Crear MOVE con todas las líneas juntas
+        # 3️⃣ Validar balance antes de crear
         # -------------------------------------------------
-        # Mapear partner si existe
+        if not line_vals:
+            print(f"⚠️ Asiento sin líneas válidas, omitido: {move_src['name']}")
+            continue
+
+        if not test and round(total_debit, 2) != round(total_credit, 2):
+            raise Exception(
+                f"❌ Asiento desbalanceado origen {move_src['name']} | "
+                f"debit={total_debit} | credit={total_credit}"
+            )
+
+        # -------------------------------------------------
+        # 4️⃣ Mapear partner del move si existe
+        # -------------------------------------------------
         partner_dest_id = False
-        if move_src["partner_id"]:
-            partner_dest_id = Utils.get_by_x_id_interno("res.partner", move_src["partner_id"][0], db, uid, password,
-                                                        models)
+
+        if move_src.get("partner_id"):
+            partner_dest_id = Utils.get_by_x_id_interno(
+                "res.partner",
+                move_src["partner_id"][0],
+                db,
+                uid,
+                password,
+                models
+            )
+
+        # -------------------------------------------------
+        # 5️⃣ Crear MOVE con todas las líneas juntas
+        # -------------------------------------------------
+        vals_move = {
+            # No poner name: dejamos que Odoo asigne secuencia al postear
+            "x_id_interno": move_src["id"],
+            "partner_id": partner_dest_id,
+            "date": move_src["date"],
+            "journal_id": journal_dest_id,
+            "ref": move_src.get("ref"),
+            "move_type": "entry",
+            "line_ids": line_vals,
+        }
 
         move_dest_id = models.execute_kw(
             db, uid, password,
             "account.move", "create",
-            [{
-                "name": move_src["name"],
-                "partner_id": partner_dest_id,
-                "date": move_src["date"],
-                "journal_id": journal_dest_id,
-                "ref": move_src["ref"],
-                "line_ids": line_vals,
-            }]
+            [vals_move],
+            {
+                "context": {
+                    "check_move_validity": False,
+                    "skip_invoice_sync": True,
+                    "skip_account_move_synchronization": True,
+                }
+            }
         )
 
         # -------------------------------------------------
-        # 5️⃣ Postear asiento
+        # 6️⃣ Postear asiento
         # -------------------------------------------------
         if not test:
             models.execute_kw(
                 db, uid, password,
                 "account.move", "action_post",
-                [[move_dest_id]]
+                [[move_dest_id]],
+                {
+                    "context": {
+                        "check_move_validity": False,
+                        "skip_invoice_sync": True,
+                        "skip_account_move_synchronization": True,
+                    }
+                }
             )
 
-        print("✅ Importado y posteado")
+        print(
+            f"✅ Importado y posteado: "
+            f"origen={move_src['name']} | destino_id={move_dest_id}"
+        )
 
     print("\n🎉 Todos los asientos banco importados")
 
@@ -5696,7 +5734,7 @@ def actualizar_x_id_interno_lineas_payable_receivable_facturas(
         company_src_id=2,
         company_dest_id=1,
         fecha_inicio="2025-01-01",
-        fecha_fin="2027-01-01",
+        fecha_fin="2026-01-01",
         aplicar=False,
 ):
     """
@@ -6197,6 +6235,4388 @@ def actualizar_x_id_interno_lineas_payable_receivable_facturas(
         "ambiguos": ambiguos,
         "errores": errores,
     }
+
+
+def conciliar_asientos_conciliados_origen_no_destino():
+    """
+    Replica conciliaciones de asientos contables normales.
+
+    Busca asientos entry publicados en ORIGEN que tengan partial reconciles
+    y replica en DESTINO los partials que aún no existan.
+
+    No se limita a los asientos faltantes.
+    Sirve tanto para:
+    - asientos recién importados
+    - asientos que ya existían en destino pero estaban sin conciliar
+    - contrapartes de facturas/pagos que falten parcialmente
+
+    Todo se resuelve por:
+    - account.move.x_id_interno
+    - account.move.line.x_id_interno
+    """
+
+    print("🔗 Replicando conciliaciones de asientos conciliados en origen")
+
+    # -------------------------------------------------
+    # 1️⃣ Buscar asientos entry publicados en origen
+    # -------------------------------------------------
+    move_src_ids = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move",
+        "search",
+        [[
+            ("state", "=", "posted"),
+            ("company_id", "=", COMPANY_SRC_ID),
+            ("date", ">=", FECHA_INICIO),
+            ("date", "<", FECHA_FIN),
+            ("move_type", "=", "entry"),
+        ]]
+    )
+
+    if not move_src_ids:
+        print("ℹ️ No hay asientos entry en origen.")
+        return
+
+    print(f"📄 Asientos entry origen detectados: {len(move_src_ids)}")
+
+    # -------------------------------------------------
+    # 2️⃣ Detectar de forma masiva qué asientos tienen partials
+    # -------------------------------------------------
+    lineas_conciliables = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line",
+        "search_read",
+        [[
+            ("move_id", "in", move_src_ids),
+            ("account_id.reconcile", "=", True),
+        ]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "matched_debit_ids",
+                "matched_credit_ids",
+            ]
+        }
+    )
+
+    moves_con_partials = set()
+    partial_ids_origen = set()
+
+    for line in lineas_conciliables:
+        partials_linea = set(line.get("matched_debit_ids") or []) | set(
+            line.get("matched_credit_ids") or [])
+
+        if partials_linea:
+            moves_con_partials.add(line["move_id"][0])
+            partial_ids_origen.update(partials_linea)
+
+    if not moves_con_partials:
+        print("ℹ️ No hay asientos entry con conciliaciones en origen.")
+        return
+
+    print(f"🔎 Asientos con conciliaciones en origen: {len(moves_con_partials)}")
+    print(f"🔎 Partials origen detectados: {len(partial_ids_origen)}")
+
+    # -------------------------------------------------
+    # 3️⃣ Procesar por partial único, no por asiento
+    #    Así evitamos duplicar trabajo si un partial aparece en dos moves.
+    # -------------------------------------------------
+    partials = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.partial.reconcile",
+        "read",
+        [list(partial_ids_origen)],
+        {
+            "fields": [
+                "id",
+                "debit_move_id",
+                "credit_move_id",
+                "amount",
+                "debit_amount_currency",
+                "credit_amount_currency",
+            ]
+        }
+    )
+
+    total_partials = len(partials)
+    total_creados = 0
+    total_omitidos = 0
+    total_ya_existian = 0
+    total_migrados_contraparte = 0
+    total_errores = 0
+
+    print(f"🚀 Procesando partials únicos: {total_partials}")
+
+    for pr in partials:
+        partial_id = pr["id"]
+
+        try:
+            debit_line_src_id = pr["debit_move_id"][0]
+            credit_line_src_id = pr["credit_move_id"][0]
+
+            # -------------------------------------------------
+            # 4️⃣ Leer líneas origen del partial
+            # -------------------------------------------------
+            src_lines = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.move.line",
+                "read",
+                [[debit_line_src_id, credit_line_src_id]],
+                {
+                    "fields": [
+                        "id",
+                        "move_id",
+                    ]
+                }
+            )
+
+            line_by_id = {l["id"]: l for l in src_lines}
+
+            debit_move_src_id = line_by_id[debit_line_src_id]["move_id"][0]
+            credit_move_src_id = line_by_id[credit_line_src_id]["move_id"][0]
+
+            src_moves = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.move",
+                "read",
+                [[debit_move_src_id, credit_move_src_id]],
+                {
+                    "fields": [
+                        "id",
+                        "name",
+                        "move_type",
+                    ]
+                }
+            )
+
+            move_by_id = {m["id"]: m for m in src_moves}
+
+            print(
+                f"\n🔹 Partial origen {partial_id}: "
+                f"{move_by_id[debit_move_src_id]['name']} ↔ "
+                f"{move_by_id[credit_move_src_id]['name']} "
+                f"amount={pr['amount']}"
+            )
+
+            # -------------------------------------------------
+            # 5️⃣ Asegurar que ambos moves existen en destino
+            # -------------------------------------------------
+            for move_src_id, move_name in [
+                (debit_move_src_id, move_by_id[debit_move_src_id]["name"]),
+                (credit_move_src_id, move_by_id[credit_move_src_id]["name"]),
+            ]:
+                move_dest_ids = models.execute_kw(
+                    db, uid, password,
+                    "account.move",
+                    "search",
+                    [[("x_id_interno", "=", move_src_id)]],
+                    {"limit": 1}
+                )
+
+                if not move_dest_ids:
+                    print(
+                        f"   ⚠️ Move destino no existe, se migra: "
+                        f"{move_name} | origen_id={move_src_id}"
+                    )
+
+                    migrar_pago_origen_a_destino(move_src_id)
+                    total_migrados_contraparte += 1
+
+            # -------------------------------------------------
+            # 6️⃣ Resolver líneas destino por x_id_interno
+            # -------------------------------------------------
+            debit_line_dest_id = obtener_linea_destino_desde_linea_origen(
+                debit_line_src_id,
+                amount=pr["amount"]
+            )
+
+            credit_line_dest_id = obtener_linea_destino_desde_linea_origen(
+                credit_line_src_id,
+                amount=pr["amount"]
+            )
+
+            # -------------------------------------------------
+            # 7️⃣ Si ya existe el partial destino, no hacer nada
+            # -------------------------------------------------
+            partial_dest_existente = models.execute_kw(
+                db, uid, password,
+                "account.partial.reconcile",
+                "search",
+                [[
+                    ("debit_move_id", "=", debit_line_dest_id),
+                    ("credit_move_id", "=", credit_line_dest_id),
+                    ("amount", "=", abs(float(pr["amount"] or 0.0))),
+                ]],
+                {"limit": 1}
+            )
+
+            if partial_dest_existente:
+                print(
+                    f"   ⏭️ Partial ya existe en destino: "
+                    f"debit={debit_line_dest_id}, credit={credit_line_dest_id}, amount={pr['amount']}"
+                )
+                total_ya_existian += 1
+                continue
+
+            # -------------------------------------------------
+            # 8️⃣ Crear partial exacto
+            # -------------------------------------------------
+            try:
+                crear_partial_reconcile_exacto(
+                    debit_line_dest_id,
+                    credit_line_dest_id,
+                    pr["amount"],
+                    pr.get("debit_amount_currency") or pr["amount"],
+                    pr.get("credit_amount_currency") or pr["amount"],
+                )
+
+                total_creados += 1
+
+            except Exception as e:
+                msg = str(e)
+
+                if "Las líneas no son de la misma cuenta" in msg:
+                    print(
+                        f"   🔧 Cuentas distintas. Corrigiendo líneas para partial "
+                        f"{partial_id}"
+                    )
+
+                    corregir_cuenta_linea_destino_desde_origen(
+                        debit_line_src_id,
+                        debit_line_dest_id
+                    )
+
+                    corregir_cuenta_linea_destino_desde_origen(
+                        credit_line_src_id,
+                        credit_line_dest_id
+                    )
+
+                    crear_partial_reconcile_exacto(
+                        debit_line_dest_id,
+                        credit_line_dest_id,
+                        pr["amount"],
+                        pr.get("debit_amount_currency") or pr["amount"],
+                        pr.get("credit_amount_currency") or pr["amount"],
+                    )
+
+                    total_creados += 1
+                    continue
+
+                if (
+                        "Residual insuficiente" in msg
+                        or "residual insuficiente" in msg
+                        or "residual menor a 0,10" in msg
+                        or "sin residual útil" in msg
+                        or "Partial ya existe" in msg
+                ):
+                    print(f"   ⏭️ Partial omitido por residual/ya existente: {msg}")
+                    total_omitidos += 1
+                    continue
+
+                raise
+
+        except Exception as e:
+            print(f"❌ Error procesando partial origen {partial_id}: {e}")
+            total_errores += 1
+            continue
+
+    print("\n✅ Replicación de conciliaciones de asientos finalizada")
+    print(f"   Partials origen procesados: {total_partials}")
+    print(f"   Partials creados: {total_creados}")
+    print(f"   Partials ya existentes: {total_ya_existian}")
+    print(f"   Partials omitidos: {total_omitidos}")
+    print(f"   Contrapartes migradas: {total_migrados_contraparte}")
+    print(f"   Errores: {total_errores}")
+
+
+def replicar_conciliaciones_2025_por_matching_xid(
+        company_id=2,
+        fecha_inicio="2025-01-01",
+        fecha_fin="2026-01-01",
+        limite_grupos=None,
+        incluir_parciales=False,
+):
+    from App_Connection import models, db, uid, password
+    from collections import defaultdict
+
+    print("🔗 Replicando conciliaciones 2025 por matching_number + x_id_interno")
+    print(f"🏢 Company origen: {company_id}")
+    print(f"📅 Rango base: {fecha_inicio} -> {fecha_fin}")
+    print(f"🔢 Límite grupos: {limite_grupos}")
+    print(f"🟡 Incluir parciales P: {incluir_parciales}")
+
+    # -------------------------------------------------
+    # 1️⃣ Detectar matching_number con alguna línea en 2025
+    # -------------------------------------------------
+    lineas_2025 = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "search_read",
+        [[
+            ("account_id.reconcile", "=", True),
+            ("company_id", "=", company_id),
+            ("date", ">=", fecha_inicio),
+            ("date", "<", fecha_fin),
+            ("matching_number", "!=", False),
+        ]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "matching_number",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+                "reconciled",
+                "date",
+            ]
+        }
+    )
+
+    print(f"📊 Líneas origen 2025 con matching_number: {len(lineas_2025)}")
+
+    matchings = sorted({
+        l["matching_number"]
+        for l in lineas_2025
+        if l.get("matching_number")
+    })
+
+    if not incluir_parciales:
+        matchings = [m for m in matchings if m != "P"]
+
+    print(f"📦 Grupos matching detectados desde 2025: {len(matchings)}")
+
+    if not matchings:
+        print("✅ No hay grupos para procesar.")
+        return {
+            "grupos_ok": [],
+            "grupos_incompletos": [],
+            "grupos_error": [],
+            "grupos_ya_conciliados": [],
+        }
+
+    # -------------------------------------------------
+    # 2️⃣ Cargar TODAS las líneas origen de esos matching_number
+    #    aunque sean de otros años
+    # -------------------------------------------------
+    lineas_grupo = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "search_read",
+        [[
+            ("account_id.reconcile", "=", True),
+            ("company_id", "=", company_id),
+            ("matching_number", "in", matchings),
+        ]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "matching_number",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+                "reconciled",
+                "date",
+            ]
+        }
+    )
+
+    grupos = defaultdict(list)
+
+    for l in lineas_grupo:
+        matching = l.get("matching_number")
+        if not matching:
+            continue
+        if not incluir_parciales and matching == "P":
+            continue
+        grupos[matching].append(l)
+
+    print(f"📦 Grupos cargados completos: {len(grupos)}")
+
+    resultado = {
+        "grupos_ok": [],
+        "grupos_incompletos": [],
+        "grupos_error": [],
+        "grupos_ya_conciliados": [],
+    }
+
+    grupos_procesados = 0
+
+    # -------------------------------------------------
+    # 3️⃣ Procesar grupos
+    # -------------------------------------------------
+    for matching, lineas in grupos.items():
+
+        if limite_grupos and grupos_procesados >= limite_grupos:
+            break
+
+        print("\n" + "=" * 80)
+        print(f"🔵 Matching_number origen: {matching}")
+        print(f"📄 Líneas origen en grupo completo: {len(lineas)}")
+
+        line_ids_destino = []
+        lineas_faltantes = []
+        lineas_ya_conciliadas_destino = []
+
+        for l in lineas:
+            src_line_id = l["id"]
+            move_name = l["move_id"][1] if l.get("move_id") else ""
+            account_name = l["account_id"][1] if l.get("account_id") else ""
+
+            print("")
+            print(f"   🔎 Línea origen: {src_line_id}")
+            print(f"      Asiento origen: {move_name}")
+            print(f"      Fecha: {l.get('date')}")
+            print(f"      Cuenta: {account_name}")
+            print(f"      Debe: {l.get('debit')} | Haber: {l.get('credit')} | Balance: {l.get('balance')}")
+
+            # Buscar directamente la línea destino por x_id_interno.
+            linea_dest = models.execute_kw(
+                db, uid, password,
+                "account.move.line", "search_read",
+                [[
+                    ("x_id_interno", "=", src_line_id),
+                    ("account_id.reconcile", "=", True),
+                ]],
+                {
+                    "fields": [
+                        "id",
+                        "move_id",
+                        "account_id",
+                        "debit",
+                        "credit",
+                        "balance",
+                        "reconciled",
+                        "full_reconcile_id",
+                        "matched_debit_ids",
+                        "matched_credit_ids",
+                    ],
+                    "limit": 1,
+                }
+            )
+
+            if not linea_dest:
+                print("      ❌ Línea destino no encontrada por x_id_interno")
+                lineas_faltantes.append({
+                    "src_line_id": src_line_id,
+                    "move_name": move_name,
+                    "account": account_name,
+                    "date": l.get("date"),
+                    "debit": l.get("debit"),
+                    "credit": l.get("credit"),
+                    "balance": l.get("balance"),
+                })
+                continue
+
+            ld = linea_dest[0]
+
+            destino_ya_conciliado = bool(
+                ld.get("reconciled")
+                or ld.get("full_reconcile_id")
+                or ld.get("matched_debit_ids")
+                or ld.get("matched_credit_ids")
+            )
+
+            print(f"      ✅ Línea destino encontrada: {ld['id']}")
+            print(f"      Asiento destino: {ld['move_id'][1] if ld.get('move_id') else ''}")
+            print(f"      Ya conciliada destino: {destino_ya_conciliado}")
+
+            if destino_ya_conciliado:
+                lineas_ya_conciliadas_destino.append(ld["id"])
+            else:
+                line_ids_destino.append(ld["id"])
+
+        print("")
+        print(f"   📊 Líneas destino pendientes de conciliar: {len(line_ids_destino)}")
+        print(f"   📊 Líneas destino ya conciliadas: {len(lineas_ya_conciliadas_destino)}")
+        print(f"   📊 Líneas faltantes destino: {len(lineas_faltantes)}")
+
+        # -------------------------------------------------
+        # 4️⃣ Decisiones de seguridad
+        # -------------------------------------------------
+
+        if lineas_faltantes:
+            print("   ❌ Grupo incompleto. No se concilia.")
+            resultado["grupos_incompletos"].append({
+                "matching_number": matching,
+                "lineas_origen_total": len(lineas),
+                "lineas_faltantes": lineas_faltantes,
+                "line_ids_destino_pendientes": line_ids_destino,
+                "line_ids_destino_ya_conciliadas": lineas_ya_conciliadas_destino,
+            })
+            grupos_procesados += 1
+            continue
+
+        if not line_ids_destino:
+            print("   ⚠️ Todas las líneas destino ya estaban conciliadas. Se salta.")
+            resultado["grupos_ya_conciliados"].append({
+                "matching_number": matching,
+                "line_ids_destino_ya_conciliadas": lineas_ya_conciliadas_destino,
+            })
+            grupos_procesados += 1
+            continue
+
+        if len(line_ids_destino) < 2:
+            print("   ⚠️ Solo queda una línea pendiente. No se puede conciliar.")
+            resultado["grupos_incompletos"].append({
+                "matching_number": matching,
+                "motivo": "solo una línea pendiente de conciliar",
+                "line_ids_destino_pendientes": line_ids_destino,
+                "line_ids_destino_ya_conciliadas": lineas_ya_conciliadas_destino,
+            })
+            grupos_procesados += 1
+            continue
+
+        # -------------------------------------------------
+        # 5️⃣ Conciliar grupo destino
+        # -------------------------------------------------
+        print("   🔗 Intentando reconciliar grupo en destino...")
+
+        try:
+            models.execute_kw(
+                db, uid, password,
+                "account.move.line", "reconcile",
+                [line_ids_destino],
+                {"context": {"company_id": company_id}}
+            )
+
+            print("   ✅ Grupo conciliado correctamente")
+
+            resultado["grupos_ok"].append({
+                "matching_number": matching,
+                "line_ids_destino_conciliadas": line_ids_destino,
+                "line_ids_destino_ya_conciliadas": lineas_ya_conciliadas_destino,
+            })
+
+        except Exception as e:
+            msg = str(e)
+
+            if "cannot marshal None unless allow_none is enabled" in msg:
+                print("   ✅ Grupo conciliado correctamente")
+                resultado["grupos_ok"].append({
+                    "matching_number": matching,
+                    "line_ids_destino_conciliadas": line_ids_destino,
+                    "warning": msg,
+                })
+
+            elif "Está tratando de conciliar algunos asientos que ya han sido conciliados" in msg:
+                print("   ⚠️ Alguna línea ya estaba conciliada. Se guarda como ya conciliado/error controlado.")
+                resultado["grupos_ya_conciliados"].append({
+                    "matching_number": matching,
+                    "line_ids_destino": line_ids_destino,
+                    "error": msg,
+                })
+
+            else:
+                print(f"   ❌ Error al conciliar grupo: {e}")
+                resultado["grupos_error"].append({
+                    "matching_number": matching,
+                    "line_ids_destino": line_ids_destino,
+                    "error": msg,
+                })
+
+        grupos_procesados += 1
+
+    # -------------------------------------------------
+    # 6️⃣ Resumen final
+    # -------------------------------------------------
+    print("\n" + "=" * 80)
+    print("🏁 REPLICACIÓN FINALIZADA")
+    print("=" * 80)
+    print(f"✅ Grupos conciliados: {len(resultado['grupos_ok'])}")
+    print(f"⚠️ Grupos ya conciliados/saltados: {len(resultado['grupos_ya_conciliados'])}")
+    print(f"❌ Grupos incompletos: {len(resultado['grupos_incompletos'])}")
+    print(f"💥 Grupos con error: {len(resultado['grupos_error'])}")
+
+    return resultado
+
+
+# Intenta conciliar, pero migrar migra
+def conciliar_asiento_destino_replicando_origen(
+        asiento_origen_name,
+        company_id_origen=2,
+        dry_run=False,
+):
+    def normalizar_move_name(name):
+        if not name:
+            return ""
+        return name.split("(")[0].strip()
+
+    def get_account_code_origen(account_id):
+        res = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.account", "read",
+            [[account_id]],
+            {"fields": ["code"]}
+        )
+        return res[0]["code"] if res else None
+
+    def buscar_cuenta_destino_por_codigo(account_code):
+        if not account_code:
+            return None
+
+        res = models.execute_kw(
+            db, uid, password,
+            "account.account", "search",
+            [[("code", "=", account_code)]],
+            {"limit": 1}
+        )
+        return res[0] if res else None
+
+    def buscar_move_destino_desde_linea_origen(linea_origen):
+        move_name_origen = linea_origen["move_id"][1] if linea_origen.get("move_id") else ""
+        move_name_limpio = normalizar_move_name(move_name_origen)
+
+        # 1) Intentar por nombre limpio
+        move_dest = models.execute_kw(
+            db, uid, password,
+            "account.move", "search_read",
+            [[("name", "=", move_name_limpio)]],
+            {
+                "fields": ["id", "name", "x_id_interno"],
+                "limit": 1,
+            }
+        )
+
+        if move_dest:
+            return move_dest[0]
+
+        # 2) Intentar por nombre completo
+        move_dest = models.execute_kw(
+            db, uid, password,
+            "account.move", "search_read",
+            [[("name", "=", move_name_origen)]],
+            {
+                "fields": ["id", "name", "x_id_interno"],
+                "limit": 1,
+            }
+        )
+
+        if move_dest:
+            return move_dest[0]
+
+        # 3) Si el move destino tiene x_id_interno del move origen
+        move_id_origen = linea_origen["move_id"][0] if linea_origen.get("move_id") else None
+
+        if move_id_origen:
+            move_dest = models.execute_kw(
+                db, uid, password,
+                "account.move", "search_read",
+                [[("x_id_interno", "=", move_id_origen)]],
+                {
+                    "fields": ["id", "name", "x_id_interno"],
+                    "limit": 1,
+                }
+            )
+
+            if move_dest:
+                return move_dest[0]
+
+        return None
+
+    def buscar_linea_destino_equivalente(
+            linea_origen,
+            corregir_cuenta=True,
+            corregir_importe=True,
+            tolerancia_importe=0.05,
+    ):
+        """
+        Busca una línea destino equivalente a una línea origen.
+
+        Orden:
+        1) x_id_interno exacto.
+        2) move destino + cuenta correcta + importe exacto.
+        3) move destino + importe exacto sin cuenta, corrigiendo cuenta si hace falta.
+        4) move destino + cuenta correcta + mismo signo + importe aproximado.
+           Si hay una única candidata, corrige importe y cuenta.
+        5) move destino + mismo signo + importe aproximado sin cuenta.
+           Si hay una única candidata, corrige importe y cuenta.
+
+        Este caso cubre facturas donde origen tiene, por ejemplo, 281.69
+        y destino tiene 281.67 por redondeos/condiciones de pago.
+        """
+
+        src_line_id = linea_origen["id"]
+
+        campos_destino = [
+            "id",
+            "move_id",
+            "account_id",
+            "partner_id",
+            "debit",
+            "credit",
+            "balance",
+            "amount_residual",
+            "reconciled",
+            "full_reconcile_id",
+            "matched_debit_ids",
+            "matched_credit_ids",
+            "x_id_interno",
+            "display_type",
+            "amount_currency",
+            "date_maturity",
+        ]
+
+        def tiene_conciliacion_dest(linea):
+            return bool(
+                linea.get("reconciled")
+                or linea.get("full_reconcile_id")
+                or linea.get("matched_debit_ids")
+                or linea.get("matched_credit_ids")
+            )
+
+        def releer_linea_destino(line_id, metodo):
+            res = models.execute_kw(
+                db, uid, password,
+                "account.move.line", "search_read",
+                [[("id", "=", line_id)]],
+                {
+                    "fields": campos_destino,
+                    "limit": 1,
+                },
+            )
+            if res:
+                res[0]["_metodo_busqueda"] = metodo
+                return res[0]
+            return None
+
+        def aplicar_correcciones_linea_destino(candidata, metodo):
+            vals = {}
+
+            cuenta_actual_id = candidata["account_id"][0] if candidata.get("account_id") else None
+
+            if corregir_cuenta and cuenta_actual_id != account_dest_id:
+                vals["account_id"] = account_dest_id
+
+            if corregir_importe:
+                debit_dest = round(float(candidata.get("debit") or 0.0), 2)
+                credit_dest = round(float(candidata.get("credit") or 0.0), 2)
+
+                if debit:
+                    if abs(debit_dest - debit) <= tolerancia_importe:
+                        vals["debit"] = debit
+                        vals["credit"] = 0.0
+                        vals["amount_currency"] = debit
+                elif credit:
+                    if abs(credit_dest - credit) <= tolerancia_importe:
+                        vals["debit"] = 0.0
+                        vals["credit"] = credit
+                        vals["amount_currency"] = -credit
+
+            if vals:
+                print("      🔧 Corrigiendo línea destino equivalente...")
+                print(f"         Línea destino: {candidata['id']}")
+                print(f"         Valores: {vals}")
+
+                models.execute_kw(
+                    db, uid, password,
+                    "account.move.line", "write",
+                    [[candidata["id"]], vals],
+                    {
+                        "context": {
+                            "check_move_validity": False,
+                            "skip_account_move_synchronization": True,
+                            "skip_invoice_sync": True,
+                            "skip_invoice_line_sync": True,
+                        }
+                    },
+                )
+
+                return releer_linea_destino(candidata["id"], metodo)
+
+            candidata["_metodo_busqueda"] = metodo
+            return candidata
+
+        # -----------------------------------------------------
+        # 1) Búsqueda exacta por x_id_interno
+        # -----------------------------------------------------
+
+        linea_dest = models.execute_kw(
+            db, uid, password,
+            "account.move.line", "search_read",
+            [[
+                ("x_id_interno", "=", src_line_id),
+                ("account_id.reconcile", "=", True),
+            ]],
+            {
+                "fields": campos_destino,
+                "limit": 1,
+            },
+        )
+
+        if linea_dest:
+            linea_dest[0]["_metodo_busqueda"] = "x_id_interno"
+            return linea_dest[0]
+
+        # -----------------------------------------------------
+        # 2) Resolver move destino y cuenta correcta
+        # -----------------------------------------------------
+
+        move_dest = buscar_move_destino_desde_linea_origen(linea_origen)
+
+        if not move_dest:
+            print(f"      ❌ No se encontró move destino para línea origen {src_line_id}")
+            return None
+
+        account_id_origen = linea_origen["account_id"][0] if linea_origen.get("account_id") else None
+        account_code = get_account_code_origen(account_id_origen)
+        account_dest_id = buscar_cuenta_destino_por_codigo(account_code)
+
+        if not account_dest_id:
+            print(f"      ❌ No se encontró cuenta destino con código origen {account_code}")
+            return None
+
+        debit = round(float(linea_origen.get("debit") or 0.0), 2)
+        credit = round(float(linea_origen.get("credit") or 0.0), 2)
+        balance = round(float(linea_origen.get("balance") or 0.0), 2)
+
+        # -----------------------------------------------------
+        # 3) Exacto con cuenta correcta
+        # -----------------------------------------------------
+
+        domain_con_cuenta = [
+            ("move_id", "=", move_dest["id"]),
+            ("account_id", "=", account_dest_id),
+            ("account_id.reconcile", "=", True),
+        ]
+
+        if debit:
+            domain_con_cuenta += [
+                ("debit", "=", debit),
+                ("credit", "=", 0),
+            ]
+        elif credit:
+            domain_con_cuenta += [
+                ("credit", "=", credit),
+                ("debit", "=", 0),
+            ]
+        else:
+            domain_con_cuenta += [
+                ("balance", "=", balance),
+            ]
+
+        candidatas = models.execute_kw(
+            db, uid, password,
+            "account.move.line", "search_read",
+            [domain_con_cuenta],
+            {"fields": campos_destino},
+        )
+
+        candidatas = [c for c in candidatas if not tiene_conciliacion_dest(c)]
+
+        if len(candidatas) == 1:
+            candidatas[0]["_metodo_busqueda"] = "fallback_move_cuenta_importe"
+            return candidatas[0]
+
+        # -----------------------------------------------------
+        # 4) Exacto sin cuenta
+        # -----------------------------------------------------
+
+        domain_sin_cuenta = [
+            ("move_id", "=", move_dest["id"]),
+            ("account_id.reconcile", "=", True),
+        ]
+
+        if debit:
+            domain_sin_cuenta += [
+                ("debit", "=", debit),
+                ("credit", "=", 0),
+            ]
+        elif credit:
+            domain_sin_cuenta += [
+                ("credit", "=", credit),
+                ("debit", "=", 0),
+            ]
+        else:
+            domain_sin_cuenta += [
+                ("balance", "=", balance),
+            ]
+
+        candidatas_sin_cuenta = models.execute_kw(
+            db, uid, password,
+            "account.move.line", "search_read",
+            [domain_sin_cuenta],
+            {"fields": campos_destino},
+        )
+
+        candidatas_sin_cuenta = [
+            c for c in candidatas_sin_cuenta
+            if not tiene_conciliacion_dest(c)
+        ]
+
+        if len(candidatas_sin_cuenta) == 1:
+            return aplicar_correcciones_linea_destino(
+                candidatas_sin_cuenta[0],
+                "fallback_importe_exacto_corrigiendo_cuenta",
+            )
+
+        # -----------------------------------------------------
+        # 5) Aproximado con cuenta correcta
+        # -----------------------------------------------------
+
+        candidatas_move_cuenta = models.execute_kw(
+            db, uid, password,
+            "account.move.line", "search_read",
+            [[
+                ("move_id", "=", move_dest["id"]),
+                ("account_id", "=", account_dest_id),
+                ("account_id.reconcile", "=", True),
+            ]],
+            {"fields": campos_destino},
+        )
+
+        candidatas_aprox = []
+
+        for c in candidatas_move_cuenta:
+            if tiene_conciliacion_dest(c):
+                continue
+
+            debit_dest = round(float(c.get("debit") or 0.0), 2)
+            credit_dest = round(float(c.get("credit") or 0.0), 2)
+            balance_dest = round(float(c.get("balance") or 0.0), 2)
+
+            if debit and debit_dest > 0:
+                if abs(debit_dest - debit) <= tolerancia_importe:
+                    candidatas_aprox.append(c)
+
+            elif credit and credit_dest > 0:
+                if abs(credit_dest - credit) <= tolerancia_importe:
+                    candidatas_aprox.append(c)
+
+            elif not debit and not credit:
+                if abs(balance_dest - balance) <= tolerancia_importe:
+                    candidatas_aprox.append(c)
+
+        if len(candidatas_aprox) == 1:
+            print("      ⚠️ Línea encontrada por importe aproximado con cuenta correcta")
+            print(f"         Origen debit={debit} credit={credit} balance={balance}")
+            print(
+                f"         Destino line={candidatas_aprox[0]['id']} "
+                f"debit={candidatas_aprox[0].get('debit')} "
+                f"credit={candidatas_aprox[0].get('credit')} "
+                f"balance={candidatas_aprox[0].get('balance')}"
+            )
+
+            return aplicar_correcciones_linea_destino(
+                candidatas_aprox[0],
+                "fallback_cuenta_importe_aprox_corrigiendo_importe",
+            )
+
+        # -----------------------------------------------------
+        # 6) Aproximado sin cuenta
+        # -----------------------------------------------------
+
+        candidatas_move = models.execute_kw(
+            db, uid, password,
+            "account.move.line", "search_read",
+            [[
+                ("move_id", "=", move_dest["id"]),
+                ("account_id.reconcile", "=", True),
+            ]],
+            {"fields": campos_destino},
+        )
+
+        candidatas_aprox_sin_cuenta = []
+
+        for c in candidatas_move:
+            if tiene_conciliacion_dest(c):
+                continue
+
+            debit_dest = round(float(c.get("debit") or 0.0), 2)
+            credit_dest = round(float(c.get("credit") or 0.0), 2)
+            balance_dest = round(float(c.get("balance") or 0.0), 2)
+
+            if debit and debit_dest > 0:
+                if abs(debit_dest - debit) <= tolerancia_importe:
+                    candidatas_aprox_sin_cuenta.append(c)
+
+            elif credit and credit_dest > 0:
+                if abs(credit_dest - credit) <= tolerancia_importe:
+                    candidatas_aprox_sin_cuenta.append(c)
+
+            elif not debit and not credit:
+                if abs(balance_dest - balance) <= tolerancia_importe:
+                    candidatas_aprox_sin_cuenta.append(c)
+
+        if len(candidatas_aprox_sin_cuenta) == 1:
+            print("      ⚠️ Línea encontrada por importe aproximado sin cuenta correcta")
+            print(f"         Origen debit={debit} credit={credit} balance={balance}")
+            print(
+                f"         Destino line={candidatas_aprox_sin_cuenta[0]['id']} "
+                f"cuenta={candidatas_aprox_sin_cuenta[0]['account_id'][1] if candidatas_aprox_sin_cuenta[0].get('account_id') else ''} "
+                f"debit={candidatas_aprox_sin_cuenta[0].get('debit')} "
+                f"credit={candidatas_aprox_sin_cuenta[0].get('credit')} "
+                f"balance={candidatas_aprox_sin_cuenta[0].get('balance')}"
+            )
+
+            return aplicar_correcciones_linea_destino(
+                candidatas_aprox_sin_cuenta[0],
+                "fallback_importe_aprox_corrigiendo_cuenta_importe",
+            )
+
+        # -----------------------------------------------------
+        # 7) No resuelto
+        # -----------------------------------------------------
+
+        print(f"      ⚠️ No se pudo resolver una única línea destino equivalente")
+        print(f"         Línea origen: {src_line_id}")
+        print(f"         Move origen: {linea_origen['move_id'][1] if linea_origen.get('move_id') else ''}")
+        print(f"         Move destino: {move_dest['name']} / id={move_dest['id']}")
+        print(f"         Cuenta origen code: {account_code}")
+        print(f"         Debit origen: {debit} | Credit origen: {credit} | Balance origen: {balance}")
+        print(f"         Candidatas exactas sin cuenta: {len(candidatas_sin_cuenta)}")
+        print(f"         Candidatas aprox con cuenta: {len(candidatas_aprox)}")
+        print(f"         Candidatas aprox sin cuenta: {len(candidatas_aprox_sin_cuenta)}")
+
+        for c in candidatas_move:
+            print(
+                f"           - Dest line {c['id']} | "
+                f"x_id_interno={c.get('x_id_interno')} | "
+                f"cuenta={c['account_id'][1] if c.get('account_id') else ''} | "
+                f"debit={c.get('debit')} | "
+                f"credit={c.get('credit')} | "
+                f"balance={c.get('balance')} | "
+                f"amount_residual={c.get('amount_residual')} | "
+                f"reconciled={c.get('reconciled')}"
+            )
+
+        return None
+
+    print("=" * 90)
+    print(f"🔗 Replicando conciliación de asiento origen: {asiento_origen_name}")
+    print(f"🏢 Company origen: {company_id_origen}")
+    print(f"🧪 Dry run: {dry_run}")
+    print("=" * 90)
+
+    # ---------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------
+
+    def tiene_conciliacion(linea):
+        return bool(
+            linea.get("reconciled")
+            or linea.get("full_reconcile_id")
+            or linea.get("matched_debit_ids")
+            or linea.get("matched_credit_ids")
+        )
+
+    def buscar_linea_destino_por_xid(line_id_origen):
+        res = models.execute_kw(
+            db, uid, password,
+            "account.move.line", "search_read",
+            [[
+                ("x_id_interno", "=", line_id_origen),
+                ("account_id.reconcile", "=", True),
+            ]],
+            {
+                "fields": [
+                    "id",
+                    "move_id",
+                    "account_id",
+                    "partner_id",
+                    "debit",
+                    "credit",
+                    "balance",
+                    "amount_residual",
+                    "reconciled",
+                    "full_reconcile_id",
+                    "matched_debit_ids",
+                    "matched_credit_ids",
+                    "x_id_interno",
+                ],
+                "limit": 1,
+            }
+        )
+        return res[0] if res else None
+
+    def leer_linea_origen(line_id):
+        res = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.move.line", "read",
+            [[line_id]],
+            {
+                "fields": [
+                    "id",
+                    "move_id",
+                    "account_id",
+                    "partner_id",
+                    "date",
+                    "name",
+                    "debit",
+                    "credit",
+                    "balance",
+                    "amount_residual",
+                    "reconciled",
+                    "full_reconcile_id",
+                    "matched_debit_ids",
+                    "matched_credit_ids",
+                    "matching_number",
+                ]
+            }
+        )
+        return res[0] if res else None
+
+    def leer_partial_origen(partial_id):
+        res = models_src.execute_kw(
+            db_src, uid_src, password_src,
+            "account.partial.reconcile", "read",
+            [[partial_id]],
+            {
+                "fields": [
+                    "id",
+                    "amount",
+                    "debit_move_id",
+                    "credit_move_id",
+                    "full_reconcile_id",
+                    "max_date",
+                ]
+            }
+        )
+        return res[0] if res else None
+
+    # ---------------------------------------------------------
+    # 1) Buscar asiento origen
+    # ---------------------------------------------------------
+
+    move_origen = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move", "search_read",
+        [[
+            ("name", "=", asiento_origen_name),
+            ("company_id", "=", company_id_origen),
+            ("state", "=", "posted"),
+        ]],
+        {
+            "fields": [
+                "id",
+                "name",
+                "date",
+                "journal_id",
+                "ref",
+                "line_ids",
+            ],
+            "limit": 1,
+        }
+    )
+
+    if not move_origen:
+        print(f"❌ No se encontró el asiento origen: {asiento_origen_name}")
+        return {
+            "ok": False,
+            "motivo": "asiento origen no encontrado",
+            "asiento": asiento_origen_name,
+        }
+
+    move_origen = move_origen[0]
+    move_origen_id = move_origen["id"]
+
+    print(f"✅ Asiento origen encontrado:")
+    print(f"   ID origen: {move_origen_id}")
+    print(f"   Nombre: {move_origen['name']}")
+    print(f"   Fecha: {move_origen.get('date')}")
+    print(f"   Diario: {move_origen['journal_id'][1] if move_origen.get('journal_id') else ''}")
+    print(f"   Ref: {move_origen.get('ref') or ''}")
+
+    # ---------------------------------------------------------
+    # 2) Leer líneas conciliables del asiento origen
+    # ---------------------------------------------------------
+
+    lineas_asiento_origen = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "search_read",
+        [[
+            ("move_id", "=", move_origen_id),
+            ("account_id.reconcile", "=", True),
+            "|",
+            ("matched_debit_ids", "!=", False),
+            ("matched_credit_ids", "!=", False),
+        ]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "account_id",
+                "partner_id",
+                "date",
+                "name",
+                "debit",
+                "credit",
+                "balance",
+                "amount_residual",
+                "reconciled",
+                "full_reconcile_id",
+                "matched_debit_ids",
+                "matched_credit_ids",
+                "matching_number",
+            ]
+        }
+    )
+
+    print(f"📊 Líneas conciliadas del asiento origen: {len(lineas_asiento_origen)}")
+
+    if not lineas_asiento_origen:
+        print("⚠️ El asiento origen no tiene líneas conciliadas.")
+        return {
+            "ok": False,
+            "motivo": "asiento origen sin líneas conciliadas",
+            "asiento": asiento_origen_name,
+        }
+
+    # ---------------------------------------------------------
+    # 3) Construir pares exactos desde account.partial.reconcile
+    # ---------------------------------------------------------
+
+    pares = []
+    partials_usados = set()
+
+    for linea in lineas_asiento_origen:
+        line_id = linea["id"]
+
+        partial_ids = []
+        partial_ids += linea.get("matched_debit_ids") or []
+        partial_ids += linea.get("matched_credit_ids") or []
+
+        print("")
+        print(f"🔎 Línea origen asiento base: {line_id}")
+        print(f"   Cuenta: {linea['account_id'][1] if linea.get('account_id') else ''}")
+        print(f"   Debe: {linea.get('debit')} | Haber: {linea.get('credit')} | Balance: {linea.get('balance')}")
+        print(f"   Matching: {linea.get('matching_number')}")
+        print(f"   Partials: {partial_ids}")
+
+        for partial_id in partial_ids:
+            if partial_id in partials_usados:
+                continue
+
+            partial = leer_partial_origen(partial_id)
+
+            if not partial:
+                print(f"   ❌ No se pudo leer partial origen {partial_id}")
+                continue
+
+            debit_line_id = partial["debit_move_id"][0]
+            credit_line_id = partial["credit_move_id"][0]
+
+            if line_id == debit_line_id:
+                otra_line_id = credit_line_id
+            elif line_id == credit_line_id:
+                otra_line_id = debit_line_id
+            else:
+                print(f"   ⚠️ Partial {partial_id} no corresponde con la línea {line_id}")
+                continue
+
+            otra_linea = leer_linea_origen(otra_line_id)
+
+            if not otra_linea:
+                print(f"   ❌ No se pudo leer línea contrapartida origen {otra_line_id}")
+                continue
+
+            pares.append({
+                "partial_id_origen": partial_id,
+                "amount": partial.get("amount"),
+                "linea_base_origen": linea,
+                "linea_contrapartida_origen": otra_linea,
+                "debit_line_id_origen": debit_line_id,
+                "credit_line_id_origen": credit_line_id,
+            })
+
+            partials_usados.add(partial_id)
+
+            print(f"   ✅ Partial origen {partial_id}:")
+            print(f"      Amount: {partial.get('amount')}")
+            print(f"      Debit origen: {debit_line_id}")
+            print(f"      Credit origen: {credit_line_id}")
+            print(f"      Contrapartida: {otra_linea['move_id'][1] if otra_linea.get('move_id') else ''}")
+
+    print("")
+    print(f"📦 Pares de conciliación detectados: {len(pares)}")
+
+    if not pares:
+        print("⚠️ No se detectaron pares de conciliación replicables.")
+        return {
+            "ok": False,
+            "motivo": "sin pares replicables",
+            "asiento": asiento_origen_name,
+        }
+
+    # ---------------------------------------------------------
+    # 4) Buscar líneas destino por x_id_interno y reconciliar pares
+    # ---------------------------------------------------------
+
+    resultado = {
+        "ok": True,
+        "asiento_origen": asiento_origen_name,
+        "move_id_origen": move_origen_id,
+        "partials_ok": [],
+        "partials_ya_conciliados": [],
+        "partials_error": [],
+        "partials_incompletos": [],
+    }
+
+    for par in pares:
+        partial_id = par["partial_id_origen"]
+        amount = par["amount"]
+
+        debit_src_id = par["debit_line_id_origen"]
+        credit_src_id = par["credit_line_id_origen"]
+
+        linea_debit_origen = leer_linea_origen(debit_src_id)
+        linea_credit_origen = leer_linea_origen(credit_src_id)
+
+        print("")
+        print("-" * 90)
+        print(f"🔹 Replicando partial origen {partial_id}")
+        print(f"   Amount origen: {amount}")
+        print(f"   Debit origen line_id: {debit_src_id}")
+        print(f"   Credit origen line_id: {credit_src_id}")
+
+        if linea_debit_origen:
+            print(
+                f"   Debit move origen: {linea_debit_origen['move_id'][1] if linea_debit_origen.get('move_id') else ''}")
+        if linea_credit_origen:
+            print(
+                f"   Credit move origen: {linea_credit_origen['move_id'][1] if linea_credit_origen.get('move_id') else ''}")
+
+        linea_debit_origen = leer_linea_origen(debit_src_id)
+        linea_credit_origen = leer_linea_origen(credit_src_id)
+
+        linea_debit_dest = buscar_linea_destino_equivalente(linea_debit_origen)
+        linea_credit_dest = buscar_linea_destino_equivalente(linea_credit_origen)
+
+        if not linea_debit_dest or not linea_credit_dest:
+            print("   ❌ No se encontraron ambas líneas en destino por x_id_interno")
+
+            if not linea_debit_dest:
+                print(f"      Falta debit destino x_id_interno={debit_src_id}")
+            if not linea_credit_dest:
+                print(f"      Falta credit destino x_id_interno={credit_src_id}")
+
+            resultado["partials_incompletos"].append({
+                "partial_id_origen": partial_id,
+                "amount": amount,
+                "debit_src_id": debit_src_id,
+                "credit_src_id": credit_src_id,
+                "falta_debit_dest": not bool(linea_debit_dest),
+                "falta_credit_dest": not bool(linea_credit_dest),
+            })
+            continue
+
+        debit_dest_id = linea_debit_dest["id"]
+        credit_dest_id = linea_credit_dest["id"]
+
+        print(f"   ✅ Debit destino line_id: {debit_dest_id}")
+        print(f"      Método búsqueda: {linea_debit_dest.get('_metodo_busqueda')}")
+        print(f"      x_id_interno destino: {linea_debit_dest.get('x_id_interno')}")
+        print(
+            f"      Move destino: {linea_debit_dest['move_id'][1] if linea_debit_dest.get('move_id') else ''}")
+        print(
+            f"      Balance: {linea_debit_dest.get('balance')} | Residual: {linea_debit_dest.get('amount_residual')}")
+
+        print(f"   ✅ Credit destino line_id: {credit_dest_id}")
+        print(f"      Método búsqueda: {linea_credit_dest.get('_metodo_busqueda')}")
+        print(f"      x_id_interno destino: {linea_credit_dest.get('x_id_interno')}")
+        print(
+            f"      Move destino: {linea_credit_dest['move_id'][1] if linea_credit_dest.get('move_id') else ''}")
+        print(
+            f"      Balance: {linea_credit_dest.get('balance')} | Residual: {linea_credit_dest.get('amount_residual')}")
+
+        debit_ya_conciliada = tiene_conciliacion(linea_debit_dest)
+        credit_ya_conciliada = tiene_conciliacion(linea_credit_dest)
+
+        if debit_ya_conciliada and credit_ya_conciliada:
+            print("   ⚠️ Ambas líneas destino ya tienen conciliación. Se salta.")
+
+            resultado["partials_ya_conciliados"].append({
+                "partial_id_origen": partial_id,
+                "amount": amount,
+                "debit_dest_id": debit_dest_id,
+                "credit_dest_id": credit_dest_id,
+                "motivo": "ambas líneas ya conciliadas",
+            })
+            continue
+
+        if dry_run:
+            print("   🧪 Dry run activo. No se concilia.")
+            resultado["partials_ok"].append({
+                "partial_id_origen": partial_id,
+                "amount": amount,
+                "debit_dest_id": debit_dest_id,
+                "credit_dest_id": credit_dest_id,
+                "dry_run": True,
+            })
+            continue
+
+        # -----------------------------------------------------
+        # 5) Conciliar par exacto en destino
+        # -----------------------------------------------------
+
+        try:
+            print("   🔗 Conciliando par en destino...")
+
+            models.execute_kw(
+                db, uid, password,
+                "account.move.line", "reconcile",
+                [[debit_dest_id, credit_dest_id]]
+            )
+
+            print("   ✅ Partial replicado correctamente en destino")
+
+            resultado["partials_ok"].append({
+                "partial_id_origen": partial_id,
+                "amount": amount,
+                "debit_src_id": debit_src_id,
+                "credit_src_id": credit_src_id,
+                "debit_dest_id": debit_dest_id,
+                "credit_dest_id": credit_dest_id,
+            })
+
+        except Exception as e:
+            msg = str(e)
+
+            if "cannot marshal None unless allow_none is enabled" in msg:
+                print("   ✅ Partial replicado correctamente en destino")
+
+                resultado["partials_ok"].append({
+                    "partial_id_origen": partial_id,
+                    "amount": amount,
+                    "debit_src_id": debit_src_id,
+                    "credit_src_id": credit_src_id,
+                    "debit_dest_id": debit_dest_id,
+                    "credit_dest_id": credit_dest_id,
+                    "warning": msg,
+                })
+
+            elif "Está tratando de conciliar algunos asientos que ya han sido conciliados" in msg:
+                print("   ⚠️ Alguna línea destino ya estaba conciliada.")
+
+                resultado["partials_ya_conciliados"].append({
+                    "partial_id_origen": partial_id,
+                    "amount": amount,
+                    "debit_dest_id": debit_dest_id,
+                    "credit_dest_id": credit_dest_id,
+                    "error": msg,
+                })
+
+            else:
+                print(f"   ❌ Error al conciliar partial {partial_id}: {e}")
+
+                resultado["partials_error"].append({
+                    "partial_id_origen": partial_id,
+                    "amount": amount,
+                    "debit_src_id": debit_src_id,
+                    "credit_src_id": credit_src_id,
+                    "debit_dest_id": debit_dest_id,
+                    "credit_dest_id": credit_dest_id,
+                    "error": msg,
+                })
+
+    # ---------------------------------------------------------
+    # 6) Resumen final
+    # ---------------------------------------------------------
+
+    print("")
+    print("=" * 90)
+    print("🏁 RESUMEN")
+    print("=" * 90)
+    print(f"✅ Partials replicados: {len(resultado['partials_ok'])}")
+    print(f"⚠️ Partials ya conciliados: {len(resultado['partials_ya_conciliados'])}")
+    print(f"❌ Partials incompletos: {len(resultado['partials_incompletos'])}")
+    print(f"💥 Partials con error: {len(resultado['partials_error'])}")
+
+    return resultado
+
+
+def conciliar_todos_asientos_2025_replicando_origen(
+        company_id_origen=2,
+        fecha_inicio="2025-01-01",
+        fecha_fin="2026-01-01",
+        limite_asientos=None,
+        dry_run=False,
+        saltar_nominas=True,
+):
+    """
+    Busca todos los asientos origen del rango indicado que tengan líneas conciliadas
+    y replica sus conciliaciones en destino usando la función ya probada:
+
+        conciliar_asiento_destino_replicando_origen(asiento_origen_name, ...)
+
+    Importante:
+    - Los asientos implicados de otros años también se resolverán dentro de la función individual.
+    - Aquí solo usamos 2025 para detectar los asientos base a procesar.
+    """
+
+    from collections import OrderedDict
+
+    print("=" * 100)
+    print("🚀 CONCILIACIÓN MASIVA DE ASIENTOS")
+    print("=" * 100)
+    print(f"🏢 Company origen: {company_id_origen}")
+    print(f"📅 Fecha inicio: {fecha_inicio}")
+    print(f"📅 Fecha fin:    {fecha_fin}")
+    print(f"🔢 Límite asientos: {limite_asientos}")
+    print(f"🧪 Dry run: {dry_run}")
+    print(f"⏭️ Saltar nóminas: {saltar_nominas}")
+    print("=" * 100)
+
+    # ---------------------------------------------------------
+    # 1) Buscar líneas conciliadas origen en el rango
+    # ---------------------------------------------------------
+
+    lineas_origen = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line", "search_read",
+        [[
+            ("company_id", "=", company_id_origen),
+            ("date", ">=", fecha_inicio),
+            ("date", "<", fecha_fin),
+            ("account_id.reconcile", "=", True),
+            "|",
+            ("matched_debit_ids", "!=", False),
+            ("matched_credit_ids", "!=", False),
+        ]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "date",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+                "matching_number",
+            ],
+            "order": "date asc, id asc",
+        }
+    )
+
+    print(f"📊 Líneas conciliadas origen encontradas: {len(lineas_origen)}")
+
+    if not lineas_origen:
+        print("✅ No hay líneas conciliadas origen en el rango indicado.")
+        return {
+            "ok": [],
+            "error": [],
+            "sin_pares": [],
+            "sin_lineas": [],
+            "procesados": 0,
+        }
+
+    # ---------------------------------------------------------
+    # 2) Obtener asientos únicos manteniendo orden
+    # ---------------------------------------------------------
+
+    asientos = OrderedDict()
+
+    for l in lineas_origen:
+        if not l.get("move_id"):
+            continue
+
+        move_id = l["move_id"][0]
+        move_name = l["move_id"][1]
+
+        if saltar_nominas and "NOMIN" in move_name.upper():
+            continue
+
+        asientos[move_id] = move_name
+
+    asientos_items = list(asientos.items())
+
+    if limite_asientos:
+        asientos_items = asientos_items[:limite_asientos]
+
+    print(f"📦 Asientos únicos a procesar: {len(asientos_items)}")
+
+    if not asientos_items:
+        print("⚠️ No quedan asientos a procesar después de aplicar filtros.")
+        return {
+            "ok": [],
+            "error": [],
+            "sin_pares": [],
+            "sin_lineas": [],
+            "procesados": 0,
+        }
+
+    # ---------------------------------------------------------
+    # 3) Procesar asiento por asiento
+    # ---------------------------------------------------------
+
+    resumen = {
+        "ok": [],
+        "error": [],
+        "sin_pares": [],
+        "sin_lineas": [],
+        "ya_conciliados": [],
+        "incompletos": [],
+        "procesados": 0,
+    }
+
+    for idx, (move_id, move_name) in enumerate(asientos_items, start=1):
+
+        print("\n" + "#" * 100)
+        print(f"📌 Procesando asiento {idx}/{len(asientos_items)}")
+        print(f"📄 Asiento origen: {move_name}")
+        print(f"🆔 Move origen ID: {move_id}")
+        print("#" * 100)
+
+        try:
+            res = conciliar_asiento_destino_replicando_origen(
+                move_name,
+                company_id_origen=company_id_origen,
+                dry_run=dry_run,
+            )
+
+            resumen["procesados"] += 1
+
+            if not res:
+                print("⚠️ La función individual no devolvió resultado.")
+                resumen["error"].append({
+                    "move_id": move_id,
+                    "move_name": move_name,
+                    "motivo": "sin resultado",
+                })
+                continue
+
+            if res.get("ok") is False:
+                motivo = res.get("motivo", "")
+
+                if motivo == "asiento origen sin líneas conciliadas":
+                    resumen["sin_lineas"].append({
+                        "move_id": move_id,
+                        "move_name": move_name,
+                        "resultado": res,
+                    })
+                elif motivo == "sin pares replicables":
+                    resumen["sin_pares"].append({
+                        "move_id": move_id,
+                        "move_name": move_name,
+                        "resultado": res,
+                    })
+                else:
+                    resumen["error"].append({
+                        "move_id": move_id,
+                        "move_name": move_name,
+                        "resultado": res,
+                    })
+
+                continue
+
+            partials_ok = len(res.get("partials_ok", []))
+            partials_ya = len(res.get("partials_ya_conciliados", []))
+            partials_inc = len(res.get("partials_incompletos", []))
+            partials_err = len(res.get("partials_error", []))
+
+            if partials_ok:
+                resumen["ok"].append({
+                    "move_id": move_id,
+                    "move_name": move_name,
+                    "partials_ok": partials_ok,
+                    "partials_ya_conciliados": partials_ya,
+                    "partials_incompletos": partials_inc,
+                    "partials_error": partials_err,
+                    "resultado": res,
+                })
+
+            elif partials_ya and not partials_inc and not partials_err:
+                resumen["ya_conciliados"].append({
+                    "move_id": move_id,
+                    "move_name": move_name,
+                    "partials_ya_conciliados": partials_ya,
+                    "resultado": res,
+                })
+
+            elif partials_inc:
+                resumen["incompletos"].append({
+                    "move_id": move_id,
+                    "move_name": move_name,
+                    "partials_incompletos": partials_inc,
+                    "partials_error": partials_err,
+                    "resultado": res,
+                })
+
+            elif partials_err:
+                resumen["error"].append({
+                    "move_id": move_id,
+                    "move_name": move_name,
+                    "partials_error": partials_err,
+                    "resultado": res,
+                })
+
+            else:
+                resumen["sin_pares"].append({
+                    "move_id": move_id,
+                    "move_name": move_name,
+                    "resultado": res,
+                })
+
+        except Exception as e:
+            print(f"💥 Error no controlado procesando {move_name}: {e}")
+
+            resumen["procesados"] += 1
+            resumen["error"].append({
+                "move_id": move_id,
+                "move_name": move_name,
+                "error": str(e),
+            })
+
+    # ---------------------------------------------------------
+    # 4) Resumen final
+    # ---------------------------------------------------------
+
+    print("\n" + "=" * 100)
+    print("🏁 RESUMEN FINAL CONCILIACIÓN MASIVA")
+    print("=" * 100)
+    print(f"📦 Asientos candidatos: {len(asientos_items)}")
+    print(f"🔁 Asientos procesados: {resumen['procesados']}")
+    print(f"✅ Asientos con partials replicados: {len(resumen['ok'])}")
+    print(f"⚠️ Asientos ya conciliados: {len(resumen['ya_conciliados'])}")
+    print(f"❌ Asientos incompletos: {len(resumen['incompletos'])}")
+    print(f"📭 Asientos sin líneas conciliadas: {len(resumen['sin_lineas'])}")
+    print(f"📭 Asientos sin pares replicables: {len(resumen['sin_pares'])}")
+    print(f"💥 Asientos con error: {len(resumen['error'])}")
+
+    if resumen["error"]:
+        print("\n💥 ASIENTOS CON ERROR:")
+        for item in resumen["error"][:50]:
+            print(
+                f"   - {item.get('move_name')} | {item.get('error') or item.get('resultado', {}).get('motivo', '')}")
+
+    if resumen["incompletos"]:
+        print("\n❌ ASIENTOS INCOMPLETOS:")
+        for item in resumen["incompletos"][:50]:
+            print(f"   - {item.get('move_name')} | incompletos={item.get('partials_incompletos')}")
+
+    print("=" * 100)
+
+    return resumen
+
+
+# resumen = conciliar_todos_asientos_2025_replicando_origen()
+
+# region Conciliacion asientos alternativos
+def _money(v):
+    return round(float(v or 0.0), 2)
+
+
+def corregir_tax_total_preventivo_si_descuadre(move_src_id, move_dest_id, tolerancia=0.009):
+    """
+    Corrige tax_total antes de resolver la línea conciliable cuando detectamos que
+    el total destino puede estar distinto al origen.
+
+    Sirve para casos donde la línea proveedor destino tiene -1002.75 pero origen
+    tiene -1003.13, y por eso falla la búsqueda de línea destino.
+    """
+
+    from App_Connection import models, db, uid, password
+
+    move_src = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move",
+        "read",
+        [[move_src_id]],
+        {"fields": ["id", "name", "amount_total", "amount_tax"]},
+    )[0]
+
+    move_dest = models.execute_kw(
+        db, uid, password,
+        "account.move",
+        "read",
+        [[move_dest_id]],
+        {"fields": ["id", "name", "amount_total", "amount_tax"]},
+    )[0]
+
+    total_src = _money(abs(move_src.get("amount_total") or 0.0))
+    total_dest = _money(abs(move_dest.get("amount_total") or 0.0))
+
+    tax_src = _money(abs(move_src.get("amount_tax") or 0.0))
+    tax_dest = _money(abs(move_dest.get("amount_tax") or 0.0))
+
+    diff_total = _money(total_src - total_dest)
+    diff_tax = _money(tax_src - tax_dest)
+
+    print(
+        f"   🧪 PRECHECK tax_total/amount_total | "
+        f"{move_src.get('name')} -> {move_dest.get('name')} | "
+        f"total_origen={total_src}, total_destino={total_dest}, diff_total={diff_total} | "
+        f"tax_origen={tax_src}, tax_destino={tax_dest}, diff_tax={diff_tax}"
+    )
+
+    if abs(diff_total) <= tolerancia and abs(diff_tax) <= tolerancia:
+        print("   ✅ PRECHECK OK: no hay descuadre previo")
+        return False
+
+    print("   🔧 PRECHECK detecta descuadre. Corrigiendo tax_total antes de buscar línea destino...")
+
+    corregir_tax_total_destino_desde_origen(
+        move_src_id,
+        move_dest_id,
+        tolerancia=tolerancia,
+    )
+
+    return True
+
+
+def _codigo_cuenta_destino(account_id):
+    from App_Connection import models, db, uid, password
+
+    if not account_id:
+        return ""
+
+    acc = models.execute_kw(
+        db, uid, password,
+        "account.account",
+        "read",
+        [[account_id[0]]],
+        {"fields": ["code"]},
+    )
+
+    return acc[0]["code"] if acc else ""
+
+
+def _codigo_cuenta_origen(account_id):
+    if not account_id:
+        return ""
+
+    acc = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.account",
+        "read",
+        [[account_id[0]]],
+        {"fields": ["code"]},
+    )
+
+    return acc[0]["code"] if acc else ""
+
+
+def corregir_tax_total_destino_desde_origen(move_src_id, move_dest_id, tolerancia=0.009):
+    """
+    DEBUG VERSION.
+
+    Compara amount_tax total origen vs destino.
+    Si hay diferencia, SIEMPRE modifica la línea de impuesto destino IVA 21%
+    y ajusta la contrapartida conciliable para mantener el asiento balanceado.
+
+    Imprime:
+    - Totales origen/destino antes
+    - Todas las tax lines destino antes
+    - Línea IVA 21 elegida
+    - Valores escritos
+    - Línea IVA 21 después del write
+    - Contrapartida antes/después
+    - Totales destino después
+    """
+
+    def _money(v):
+        return round(float(v or 0.0), 2)
+
+    def _leer_move_dest():
+        return models.execute_kw(
+            db, uid, password,
+            "account.move",
+            "read",
+            [[move_dest_id]],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "state",
+                    "move_type",
+                    "amount_untaxed",
+                    "amount_tax",
+                    "amount_total",
+                ]
+            },
+        )[0]
+
+    def _leer_tax_lines_dest():
+        return models.execute_kw(
+            db, uid, password,
+            "account.move.line",
+            "search_read",
+            [[
+                ("move_id", "=", move_dest_id),
+                ("tax_line_id", "!=", False),
+            ]],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "tax_line_id",
+                    "account_id",
+                    "debit",
+                    "credit",
+                    "balance",
+                    "amount_currency",
+                    "display_type",
+                ],
+                "order": "id asc",
+            },
+        )
+
+    def _leer_linea_dest(line_id):
+        return models.execute_kw(
+            db, uid, password,
+            "account.move.line",
+            "read",
+            [[line_id]],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "tax_line_id",
+                    "account_id",
+                    "debit",
+                    "credit",
+                    "balance",
+                    "amount_currency",
+                    "display_type",
+                ]
+            },
+        )[0]
+
+    def _write_line_debug(line_id, nuevo_balance, nuevo_amount_currency=None, label=""):
+        nuevo_balance = _money(nuevo_balance)
+
+        vals = {
+            "debit": nuevo_balance if nuevo_balance > 0 else 0.0,
+            "credit": abs(nuevo_balance) if nuevo_balance < 0 else 0.0,
+        }
+
+        if nuevo_amount_currency is not None:
+            vals["amount_currency"] = _money(nuevo_amount_currency)
+
+        print("")
+        print(f"      ✍️ WRITE {label} line_id={line_id}")
+        print(f"         vals={vals}")
+
+        before = _leer_linea_dest(line_id)
+        print(
+            f"         BEFORE | "
+            f"debit={before.get('debit')} "
+            f"credit={before.get('credit')} "
+            f"balance={before.get('balance')} "
+            f"amount_currency={before.get('amount_currency')} "
+            f"tax={before.get('tax_line_id')}"
+        )
+
+        res = models.execute_kw(
+            db, uid, password,
+            "account.move.line",
+            "write",
+            [[line_id], vals],
+            {
+                "context": {
+                    "check_move_validity": False,
+                    "skip_account_move_synchronization": True,
+                    "skip_invoice_sync": True,
+                    "skip_invoice_line_sync": True,
+                    "skip_account_move_synchronization": True,
+                    "tracking_disable": True,
+                }
+            },
+        )
+
+        print(f"         WRITE RESULT={res}")
+
+        after = _leer_linea_dest(line_id)
+        print(
+            f"         AFTER  | "
+            f"debit={after.get('debit')} "
+            f"credit={after.get('credit')} "
+            f"balance={after.get('balance')} "
+            f"amount_currency={after.get('amount_currency')} "
+            f"tax={after.get('tax_line_id')}"
+        )
+
+        return after
+
+    print("")
+    print("=" * 100)
+    print("🧾 DEBUG corregir_tax_total_destino_desde_origen")
+    print(f"   move_src_id={move_src_id}")
+    print(f"   move_dest_id={move_dest_id}")
+    print("=" * 100)
+
+    move_src = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move",
+        "read",
+        [[move_src_id]],
+        {
+            "fields": [
+                "id",
+                "name",
+                "state",
+                "move_type",
+                "amount_untaxed",
+                "amount_tax",
+                "amount_total",
+            ]
+        },
+    )[0]
+
+    move_dest_before = _leer_move_dest()
+
+    tax_src_total = _money(abs(move_src.get("amount_tax") or 0.0))
+    tax_dest_total_before = _money(abs(move_dest_before.get("amount_tax") or 0.0))
+
+    diff_total = _money(tax_src_total - tax_dest_total_before)
+
+    print("")
+    print("📌 MOVE ORIGEN")
+    print(
+        f"   name={move_src.get('name')} "
+        f"state={move_src.get('state')} "
+        f"type={move_src.get('move_type')} "
+        f"untaxed={move_src.get('amount_untaxed')} "
+        f"tax={move_src.get('amount_tax')} "
+        f"total={move_src.get('amount_total')}"
+    )
+
+    print("")
+    print("📌 MOVE DESTINO BEFORE")
+    print(
+        f"   name={move_dest_before.get('name')} "
+        f"state={move_dest_before.get('state')} "
+        f"type={move_dest_before.get('move_type')} "
+        f"untaxed={move_dest_before.get('amount_untaxed')} "
+        f"tax={move_dest_before.get('amount_tax')} "
+        f"total={move_dest_before.get('amount_total')}"
+    )
+
+    print("")
+    print(
+        f"📊 COMPARACIÓN TAX_TOTAL | "
+        f"origen={tax_src_total} destino={tax_dest_total_before} diff={diff_total}"
+    )
+
+    if abs(diff_total) <= tolerancia:
+        print("✅ Tax total OK. No se corrige nada.")
+        print("=" * 100)
+        return False
+
+    tax_lines_dest = _leer_tax_lines_dest()
+
+    print("")
+    print(f"📋 TAX LINES DESTINO BEFORE: {len(tax_lines_dest)}")
+
+    for l in tax_lines_dest:
+        tax_name = l["tax_line_id"][1] if l.get("tax_line_id") else ""
+        acc_name = l["account_id"][1] if l.get("account_id") else ""
+        print(
+            f"   TAX_LINE id={l['id']} | "
+            f"tax='{tax_name}' | "
+            f"account='{acc_name}' | "
+            f"debit={l.get('debit')} | "
+            f"credit={l.get('credit')} | "
+            f"balance={l.get('balance')} | "
+            f"amount_currency={l.get('amount_currency')} | "
+            f"display_type={l.get('display_type')}"
+        )
+
+    linea_iva_21 = None
+
+    for line in tax_lines_dest:
+        tax_name = line["tax_line_id"][1].lower() if line.get("tax_line_id") else ""
+
+        print(
+            f"   🔎 Evaluando tax_line_id={line['id']} "
+            f"tax_name='{tax_name}' contiene_21={'21' in tax_name}"
+        )
+
+        if "21" in tax_name:
+            linea_iva_21 = line
+            break
+
+    if not linea_iva_21:
+        raise Exception(
+            f"No se encontró línea de impuesto IVA 21% en destino "
+            f"para el asiento {move_dest_before.get('name')}"
+        )
+
+    print("")
+    print("✅ LÍNEA IVA 21 SELECCIONADA")
+    print(
+        f"   id={linea_iva_21['id']} | "
+        f"tax={linea_iva_21.get('tax_line_id')} | "
+        f"balance={linea_iva_21.get('balance')} | "
+        f"debit={linea_iva_21.get('debit')} | "
+        f"credit={linea_iva_21.get('credit')} | "
+        f"amount_currency={linea_iva_21.get('amount_currency')}"
+    )
+
+    old_tax_balance = _money(linea_iva_21.get("balance"))
+    new_tax_balance = _money(old_tax_balance + diff_total)
+
+    old_tax_amount_currency = _money(
+        linea_iva_21.get("amount_currency")
+        if linea_iva_21.get("amount_currency") is not None
+        else old_tax_balance
+    )
+    new_tax_amount_currency = _money(old_tax_amount_currency + diff_total)
+
+    print("")
+    print("🧮 CÁLCULO IVA 21")
+    print(f"   old_tax_balance={old_tax_balance}")
+    print(f"   diff_total={diff_total}")
+    print(f"   new_tax_balance={new_tax_balance}")
+    print(f"   old_tax_amount_currency={old_tax_amount_currency}")
+    print(f"   new_tax_amount_currency={new_tax_amount_currency}")
+
+    _write_line_debug(
+        linea_iva_21["id"],
+        new_tax_balance,
+        new_tax_amount_currency,
+        label="IVA 21",
+    )
+
+    print("")
+    print("📋 BUSCANDO CONTRAPARTIDA CONCILIABLE")
+
+    contrapartidas = models.execute_kw(
+        db, uid, password,
+        "account.move.line",
+        "search_read",
+        [[
+            ("move_id", "=", move_dest_id),
+            ("account_id.reconcile", "=", True),
+            ("tax_line_id", "=", False),
+        ]],
+        {
+            "fields": [
+                "id",
+                "name",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+                "amount_currency",
+                "amount_residual",
+                "display_type",
+            ],
+            "order": "id asc",
+        },
+    )
+
+    print(f"   Contrapartidas encontradas: {len(contrapartidas)}")
+
+    for c in contrapartidas:
+        acc_name = c["account_id"][1] if c.get("account_id") else ""
+        print(
+            f"   CONTRA id={c['id']} | "
+            f"name='{c.get('name')}' | "
+            f"account='{acc_name}' | "
+            f"debit={c.get('debit')} | "
+            f"credit={c.get('credit')} | "
+            f"balance={c.get('balance')} | "
+            f"amount_currency={c.get('amount_currency')} | "
+            f"residual={c.get('amount_residual')} | "
+            f"display_type={c.get('display_type')}"
+        )
+
+    if not contrapartidas:
+        raise Exception(
+            f"No se puede corregir tax_total: el asiento destino "
+            f"{move_dest_before.get('name')} no tiene contrapartida conciliable."
+        )
+
+    contrapartida = sorted(
+        contrapartidas,
+        key=lambda l: abs(float(l.get("balance") or 0.0)),
+        reverse=True,
+    )[0]
+
+    old_contra_balance = _money(contrapartida.get("balance"))
+    new_contra_balance = _money(old_contra_balance - diff_total)
+
+    old_contra_amount_currency = _money(
+        contrapartida.get("amount_currency")
+        if contrapartida.get("amount_currency") is not None
+        else old_contra_balance
+    )
+    new_contra_amount_currency = _money(old_contra_amount_currency - diff_total)
+
+    print("")
+    print("🧮 CÁLCULO CONTRAPARTIDA")
+    print(f"   contra_id={contrapartida['id']}")
+    print(f"   old_contra_balance={old_contra_balance}")
+    print(f"   diff_total={diff_total}")
+    print(f"   new_contra_balance={new_contra_balance}")
+    print(f"   old_contra_amount_currency={old_contra_amount_currency}")
+    print(f"   new_contra_amount_currency={new_contra_amount_currency}")
+
+    _write_line_debug(
+        contrapartida["id"],
+        new_contra_balance,
+        new_contra_amount_currency,
+        label="CONTRAPARTIDA",
+    )
+
+    print("")
+    print("📋 TAX LINES DESTINO AFTER WRITE")
+
+    tax_lines_after = _leer_tax_lines_dest()
+
+    for l in tax_lines_after:
+        tax_name = l["tax_line_id"][1] if l.get("tax_line_id") else ""
+        acc_name = l["account_id"][1] if l.get("account_id") else ""
+        print(
+            f"   TAX_LINE id={l['id']} | "
+            f"tax='{tax_name}' | "
+            f"account='{acc_name}' | "
+            f"debit={l.get('debit')} | "
+            f"credit={l.get('credit')} | "
+            f"balance={l.get('balance')} | "
+            f"amount_currency={l.get('amount_currency')} | "
+            f"display_type={l.get('display_type')}"
+        )
+
+    move_dest_after = _leer_move_dest()
+
+    tax_dest_after = _money(abs(move_dest_after.get("amount_tax") or 0.0))
+    diff_after = _money(tax_src_total - tax_dest_after)
+
+    print("")
+    print("📌 MOVE DESTINO AFTER")
+    print(
+        f"   name={move_dest_after.get('name')} "
+        f"state={move_dest_after.get('state')} "
+        f"type={move_dest_after.get('move_type')} "
+        f"untaxed={move_dest_after.get('amount_untaxed')} "
+        f"tax={move_dest_after.get('amount_tax')} "
+        f"total={move_dest_after.get('amount_total')}"
+    )
+
+    print("")
+    print(
+        f"📊 RESULTADO FINAL | "
+        f"origen_tax={tax_src_total} "
+        f"destino_tax_after={tax_dest_after} "
+        f"diff_after={diff_after}"
+    )
+
+    if abs(diff_after) > tolerancia:
+        print("")
+        print("❌ DEBUG IMPORTANTE")
+        print("   Las líneas se han escrito, pero amount_tax del move puede no estar recalculando.")
+        print("   Revisa arriba si TAX_LINE AFTER cambió realmente.")
+        print("   Si TAX_LINE AFTER sí cambió pero MOVE DESTINO AFTER no, el problema no es el write;")
+        print("   es que el total mostrado se está calculando desde otro origen/campo dinámico.")
+
+        raise Exception(
+            f"No se pudo igualar tax_total modificando IVA 21%. "
+            f"Origen={tax_src_total}, "
+            f"Destino_before={tax_dest_total_before}, "
+            f"Destino_after={tax_dest_after}, "
+            f"Diff_after={diff_after}"
+        )
+
+    print("")
+    print(
+        f"✅ Tax total corregido modificando IVA 21%: "
+        f"origen={tax_src_total}, destino={tax_dest_after}"
+    )
+    print("=" * 100)
+
+    return True
+
+
+def _total_grupo_lineas_origen_misma_cuenta_signo(move_src_id, origen_line_id):
+    """
+    Devuelve la suma absoluta de líneas conciliables origen del mismo move,
+    misma cuenta y mismo signo que origen_line_id.
+
+    Sirve para detectar casos:
+        origen:  30,29 + 30,29
+        destino: 60,58
+    """
+
+    src_line = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line",
+        "read",
+        [[origen_line_id]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "account_id",
+                "balance",
+            ]
+        },
+    )[0]
+
+    src_account_id = src_line["account_id"][0] if src_line.get("account_id") else False
+    src_balance = _money(src_line.get("balance"))
+    src_signo = -1 if src_balance < 0 else 1
+
+    lineas_mismo_grupo = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line",
+        "search_read",
+        [[
+            ("move_id", "=", move_src_id),
+            ("account_id", "=", src_account_id),
+            ("account_id.reconcile", "=", True),
+        ]],
+        {
+            "fields": [
+                "id",
+                "balance",
+                "debit",
+                "credit",
+                "amount_residual",
+            ],
+            "order": "id asc",
+        },
+    )
+
+    total = 0.0
+    ids = []
+
+    for l in lineas_mismo_grupo:
+        bal = _money(l.get("balance"))
+
+        if src_signo < 0 and bal >= 0:
+            continue
+
+        if src_signo > 0 and bal <= 0:
+            continue
+
+        total = _money(total + abs(bal))
+        ids.append(l["id"])
+
+    print(
+        f"   🧩 Grupo origen misma cuenta/signo para línea {origen_line_id}: "
+        f"lineas={ids}, total_abs={total}"
+    )
+
+    return total, ids
+
+
+def dividir_linea_destino_si_origen_esta_fraccionado(move_src_id, origen_line_id, line_dest_id,
+                                                     tolerancia=0.03):
+    """
+    Si en ORIGEN hay varias líneas conciliables de la misma cuenta/signo
+    y en DESTINO existe una única línea agrupada por el total,
+    divide la línea destino en varias líneas equivalentes a origen.
+
+    Ejemplo:
+        ORIGEN:
+            400000 -30,29
+            400000 -30,29
+
+        DESTINO:
+            400000 -60,58
+
+        Resultado:
+            400000 -30,29 x_id_interno=linea_origen_1
+            400000 -30,29 x_id_interno=linea_origen_2
+    """
+
+    from App_Connection import models, db, uid, password
+
+    src_line_ref = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line",
+        "read",
+        [[origen_line_id]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "account_id",
+                "balance",
+            ]
+        },
+    )[0]
+
+    src_account_id = src_line_ref["account_id"][0] if src_line_ref.get("account_id") else False
+    src_balance_ref = _money(src_line_ref.get("balance"))
+    src_signo = -1 if src_balance_ref < 0 else 1
+
+    lineas_origen_grupo = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line",
+        "search_read",
+        [[
+            ("move_id", "=", move_src_id),
+            ("account_id", "=", src_account_id),
+            ("account_id.reconcile", "=", True),
+        ]],
+        {
+            "fields": [
+                "id",
+                "name",
+                "account_id",
+                "partner_id",
+                "balance",
+                "debit",
+                "credit",
+                "amount_currency",
+                "currency_id",
+                "date_maturity",
+            ],
+            "order": "id asc",
+        },
+    )
+
+    lineas_origen_grupo = [
+        l for l in lineas_origen_grupo
+        if (
+                (src_signo < 0 and _money(l.get("balance")) < 0)
+                or
+                (src_signo > 0 and _money(l.get("balance")) > 0)
+        )
+    ]
+
+    if len(lineas_origen_grupo) <= 1:
+        return line_dest_id
+
+    total_origen = _money(sum(abs(_money(l.get("balance"))) for l in lineas_origen_grupo))
+
+    dest_line = models.execute_kw(
+        db, uid, password,
+        "account.move.line",
+        "read",
+        [[line_dest_id]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "name",
+                "account_id",
+                "partner_id",
+                "balance",
+                "debit",
+                "credit",
+                "amount_currency",
+                "currency_id",
+                "date_maturity",
+                "x_id_interno",
+            ]
+        },
+    )[0]
+
+    dest_balance = _money(dest_line.get("balance"))
+    total_dest = abs(dest_balance)
+
+    if abs(total_dest - total_origen) > tolerancia:
+        print(
+            f"   ℹ️ No se divide línea destino {line_dest_id}: "
+            f"total_dest={total_dest}, total_origen_grupo={total_origen}"
+        )
+        return line_dest_id
+
+    # Si ya está dividida, intentar devolver la línea correspondiente al origen_line_id
+    existente = models.execute_kw(
+        db, uid, password,
+        "account.move.line",
+        "search",
+        [[
+            ("move_id", "=", dest_line["move_id"][0]),
+            ("x_id_interno", "=", origen_line_id),
+        ]],
+        {"limit": 1},
+    )
+
+    if existente:
+        print(
+            f"   ✅ Línea destino ya estaba dividida para origen_line_id={origen_line_id}: "
+            f"{existente[0]}"
+        )
+        return existente[0]
+
+    print(
+        f"   ✂️ Dividiendo línea destino agrupada {line_dest_id}: "
+        f"total_dest={total_dest}, líneas_origen={[l['id'] for l in lineas_origen_grupo]}"
+    )
+
+    move_dest_id = dest_line["move_id"][0]
+    account_dest_id = dest_line["account_id"][0] if dest_line.get("account_id") else False
+    partner_dest_id = dest_line["partner_id"][0] if dest_line.get("partner_id") else False
+    currency_dest_id = dest_line["currency_id"][0] if dest_line.get("currency_id") else False
+
+    lineas_creadas_por_origen = {}
+
+    for idx, src_l in enumerate(lineas_origen_grupo):
+        src_id = src_l["id"]
+        src_balance = _money(src_l.get("balance"))
+
+        nuevo_balance = src_balance
+
+        vals_base = {
+            "move_id": move_dest_id,
+            "name": src_l.get("name") or dest_line.get("name") or "/",
+            "account_id": account_dest_id,
+            "partner_id": partner_dest_id,
+            "debit": nuevo_balance if nuevo_balance > 0 else 0.0,
+            "credit": abs(nuevo_balance) if nuevo_balance < 0 else 0.0,
+            "amount_currency": nuevo_balance,
+            "x_id_interno": src_id,
+        }
+
+        if currency_dest_id:
+            vals_base["currency_id"] = currency_dest_id
+
+        if dest_line.get("date_maturity"):
+            vals_base["date_maturity"] = dest_line.get("date_maturity")
+
+        if idx == 0:
+            print(
+                f"      ✍️ Reutilizando línea destino {line_dest_id} "
+                f"para origen_line_id={src_id}, balance={nuevo_balance}"
+            )
+
+            models.execute_kw(
+                db, uid, password,
+                "account.move.line",
+                "write",
+                [[line_dest_id], vals_base],
+                {
+                    "context": {
+                        "check_move_validity": False,
+                        "skip_account_move_synchronization": True,
+                        "skip_invoice_sync": True,
+                        "skip_invoice_line_sync": True,
+                        "tracking_disable": True,
+                    }
+                },
+            )
+
+            lineas_creadas_por_origen[src_id] = line_dest_id
+
+        else:
+            print(
+                f"      ➕ Creando nueva línea destino para "
+                f"origen_line_id={src_id}, balance={nuevo_balance}"
+            )
+
+            nueva_linea_id = models.execute_kw(
+                db, uid, password,
+                "account.move.line",
+                "create",
+                [vals_base],
+                {
+                    "context": {
+                        "check_move_validity": False,
+                        "skip_account_move_synchronization": True,
+                        "skip_invoice_sync": True,
+                        "skip_invoice_line_sync": True,
+                        "tracking_disable": True,
+                    }
+                },
+            )
+
+            lineas_creadas_por_origen[src_id] = nueva_linea_id
+
+    line_dest_final = lineas_creadas_por_origen.get(origen_line_id, line_dest_id)
+
+    print(
+        f"   ✅ División completada. "
+        f"origen_line_id={origen_line_id} -> destino_line_id={line_dest_final}"
+    )
+
+    return line_dest_final
+
+
+def obtener_linea_destino_corrigiendo_cuenta_y_tax(origen_line_id, amount=None):
+    """
+    Primero intenta usar obtener_linea_destino_desde_linea_origen.
+    Si falla porque la cuenta destino es distinta, busca la línea destino ignorando cuenta,
+    corrige la cuenta destino según origen y revisa/corrige tax_total.
+    """
+
+    from App_Connection import models, db, uid, password
+
+    try:
+        return obtener_linea_destino_desde_linea_origen(
+            origen_line_id,
+            amount=amount,
+        )
+    except Exception as e:
+        error_original = str(e)
+
+        if (
+                "No se encontró línea destino" not in error_original
+                and "candidatas=0" not in error_original
+                and "No se pudo resolver" not in error_original
+        ):
+            raise
+
+        print(
+            f"   ⚠️ No se resolvió línea por cuenta exacta. "
+            f"Se intentará buscar ignorando cuenta. Error original: {error_original}"
+        )
+
+    src_line = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line",
+        "read",
+        [[origen_line_id]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+                "amount_currency",
+                "name",
+            ]
+        },
+    )[0]
+
+    move_src_id = src_line["move_id"][0]
+    src_balance = _money(src_line.get("balance"))
+    src_abs = abs(src_balance)
+    amount_abs = abs(_money(amount if amount is not None else src_abs))
+
+    move_dest_ids = models.execute_kw(
+        db, uid, password,
+        "account.move",
+        "search",
+        [[("x_id_interno", "=", move_src_id)]],
+        {"limit": 1},
+    )
+
+    if not move_dest_ids:
+        raise Exception(
+            f"No se encontró move destino para move origen {move_src_id}"
+        )
+
+    move_dest_id = move_dest_ids[0]
+
+    # 1) Si la línea destino tiene x_id_interno, es la vía más segura.
+    line_dest_ids = models.execute_kw(
+        db, uid, password,
+        "account.move.line",
+        "search",
+        [[("x_id_interno", "=", origen_line_id)]],
+        {"limit": 2},
+    )
+
+    if len(line_dest_ids) == 1:
+        line_dest_id = line_dest_ids[0]
+    else:
+        # 2) Fallback: buscar dentro del asiento destino por signo + importe,
+        # ignorando la cuenta porque precisamente puede estar mal migrada.
+        dest_lines = models.execute_kw(
+            db, uid, password,
+            "account.move.line",
+            "search_read",
+            [[
+                ("move_id", "=", move_dest_id),
+                ("account_id.reconcile", "=", True),
+            ]],
+            {
+                "fields": [
+                    "id",
+                    "account_id",
+                    "debit",
+                    "credit",
+                    "balance",
+                    "amount_currency",
+                    "amount_residual",
+                    "matching_number",
+                    "name",
+                ],
+                "order": "id asc",
+            },
+        )
+
+        candidatas = []
+
+        for dl in dest_lines:
+            dest_balance = _money(dl.get("balance"))
+
+            if src_balance < 0 and dest_balance >= 0:
+                continue
+
+            if src_balance > 0 and dest_balance <= 0:
+                continue
+
+            score = 0
+
+            if abs(abs(dest_balance) - src_abs) <= 0.03:
+                score += 10
+
+            if abs(abs(dest_balance) - amount_abs) <= 0.03:
+                score += 5
+
+            if abs(abs(_money(dl.get("amount_residual"))) - amount_abs) <= 0.03:
+                score += 3
+
+            if score:
+                candidatas.append((score, dl))
+
+        if not candidatas:
+            print(
+                f"   ⚠️ No hay candidatas por importe exacto para origen_line_id={origen_line_id}. "
+                f"Se intentará corrección preventiva de tax_total antes de fallar."
+            )
+
+            corregido_preventivo = corregir_tax_total_preventivo_si_descuadre(
+                move_src_id,
+                move_dest_id,
+            )
+
+            if corregido_preventivo:
+                print("   🔁 Releyendo líneas destino tras corrección preventiva...")
+
+                dest_lines = models.execute_kw(
+                    db, uid, password,
+                    "account.move.line",
+                    "search_read",
+                    [[
+                        ("move_id", "=", move_dest_id),
+                        ("account_id.reconcile", "=", True),
+                    ]],
+                    {
+                        "fields": [
+                            "id",
+                            "account_id",
+                            "debit",
+                            "credit",
+                            "balance",
+                            "amount_currency",
+                            "amount_residual",
+                            "matching_number",
+                            "name",
+                        ],
+                        "order": "id asc",
+                    },
+                )
+
+                candidatas = []
+
+                for dl in dest_lines:
+                    dest_balance = _money(dl.get("balance"))
+
+                    print(
+                        f"      🔎 Recheck línea destino {dl['id']} | "
+                        f"balance={dest_balance}, residual={_money(dl.get('amount_residual'))}, "
+                        f"account={dl['account_id'][1] if dl.get('account_id') else ''}"
+                    )
+
+                    if src_balance < 0 and dest_balance >= 0:
+                        continue
+
+                    if src_balance > 0 and dest_balance <= 0:
+                        continue
+
+                    score = 0
+
+                    if abs(abs(dest_balance) - src_abs) <= 0.03:
+                        score += 10
+
+                    if abs(abs(dest_balance) - amount_abs) <= 0.03:
+                        score += 5
+
+                    if abs(abs(_money(dl.get("amount_residual"))) - amount_abs) <= 0.03:
+                        score += 3
+
+                    if score:
+                        candidatas.append((score, dl))
+
+            # -------------------------------------------------
+            # Fallback agrupado:
+            # origen puede tener 2 líneas de 30,29
+            # destino puede tener 1 línea de 60,58
+            # -------------------------------------------------
+
+            if not candidatas:
+                print(
+                    f"   🧩 Intentando fallback agrupado para origen_line_id={origen_line_id}. "
+                    f"Se buscará una línea destino cuyo balance sea la suma del grupo origen."
+                )
+
+                total_grupo_src, ids_grupo_src = _total_grupo_lineas_origen_misma_cuenta_signo(
+                    move_src_id,
+                    origen_line_id,
+                )
+
+                dest_lines = models.execute_kw(
+                    db, uid, password,
+                    "account.move.line",
+                    "search_read",
+                    [[
+                        ("move_id", "=", move_dest_id),
+                        ("account_id.reconcile", "=", True),
+                    ]],
+                    {
+                        "fields": [
+                            "id",
+                            "account_id",
+                            "debit",
+                            "credit",
+                            "balance",
+                            "amount_currency",
+                            "amount_residual",
+                            "matching_number",
+                            "name",
+                        ],
+                        "order": "id asc",
+                    },
+                )
+
+                candidatas_agrupadas = []
+
+                for dl in dest_lines:
+                    dest_balance = _money(dl.get("balance"))
+                    dest_abs = abs(dest_balance)
+                    residual_abs = abs(_money(dl.get("amount_residual")))
+
+                    print(
+                        f"      🔎 Fallback agrupado línea destino {dl['id']} | "
+                        f"balance={dest_balance}, residual={residual_abs}, "
+                        f"account={dl['account_id'][1] if dl.get('account_id') else ''}"
+                    )
+
+                    if src_balance < 0 and dest_balance >= 0:
+                        continue
+
+                    if src_balance > 0 and dest_balance <= 0:
+                        continue
+
+                    score = 0
+
+                    # Caso exacto: destino tiene 60,58 y origen agrupa 30,29 + 30,29
+                    if abs(dest_abs - total_grupo_src) <= 0.03:
+                        score += 50
+
+                    # La línea destino debe tener residual suficiente para este partial concreto
+                    if residual_abs + 0.03 >= amount_abs:
+                        score += 20
+
+                    # Caso después de crear el primer partial:
+                    # balance sigue siendo 60,58 pero residual queda 30,29
+                    if abs(residual_abs - amount_abs) <= 0.03:
+                        score += 15
+
+                    # Si el destino es múltiplo exacto del importe origen, también suma
+                    if amount_abs and abs((dest_abs / amount_abs) - round(dest_abs / amount_abs)) <= 0.01:
+                        score += 10
+
+                    if score:
+                        candidatas_agrupadas.append((score, dl))
+
+                if candidatas_agrupadas:
+                    candidatas_agrupadas = sorted(
+                        candidatas_agrupadas,
+                        key=lambda x: x[0],
+                        reverse=True,
+                    )
+
+                    mejor_score = candidatas_agrupadas[0][0]
+                    mejores_agrupadas = [
+                        x[1]
+                        for x in candidatas_agrupadas
+                        if x[0] == mejor_score
+                    ]
+
+                    if len(mejores_agrupadas) == 1:
+                        dl = mejores_agrupadas[0]
+
+                        print(
+                            f"   ✅ Fallback agrupado resuelto: "
+                            f"origen_line_id={origen_line_id} -> destino_line_id={dl['id']} | "
+                            f"score={mejor_score} | "
+                            f"balance_destino={dl.get('balance')} | "
+                            f"residual_destino={dl.get('amount_residual')}"
+                        )
+
+                        candidatas.append((mejor_score, dl))
+                    else:
+                        print(
+                            f"   ⚠️ Fallback agrupado ambiguo: "
+                            f"{len(mejores_agrupadas)} candidatas con score={mejor_score}"
+                        )
+
+            if not candidatas:
+                raise Exception(
+                    f"No se encontró línea destino alternativa para "
+                    f"origen_line_id={origen_line_id}, "
+                    f"move={src_line['move_id'][1]}, "
+                    f"balance={src_balance}, amount={amount_abs}"
+                )
+
+        candidatas = sorted(candidatas, key=lambda x: x[0], reverse=True)
+        mejor_score = candidatas[0][0]
+        mejores = [x[1] for x in candidatas if x[0] == mejor_score]
+
+        if len(mejores) != 1:
+            raise Exception(
+                f"No se pudo resolver una única línea destino alternativa para "
+                f"origen_line_id={origen_line_id}, "
+                f"move={src_line['move_id'][1]}, "
+                f"candidatas={len(mejores)}"
+            )
+
+        line_dest_id = mejores[0]["id"]
+
+    dest_line = models.execute_kw(
+        db, uid, password,
+        "account.move.line",
+        "read",
+        [[line_dest_id]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "account_id",
+                "balance",
+                "debit",
+                "credit",
+            ]
+        },
+    )[0]
+
+    cuenta_src = _codigo_cuenta_origen(src_line.get("account_id"))
+    cuenta_dest = _codigo_cuenta_destino(dest_line.get("account_id"))
+
+    if cuenta_src and cuenta_dest and cuenta_src != cuenta_dest:
+        print(
+            f"   🔧 Cuenta distinta en línea destino {line_dest_id}: "
+            f"{cuenta_dest} -> {cuenta_src}"
+        )
+
+        corregir_cuenta_linea_destino_desde_origen(
+            origen_line_id,
+            line_dest_id,
+        )
+
+    line_dest_id = dividir_linea_destino_si_origen_esta_fraccionado(
+        move_src_id,
+        origen_line_id,
+        line_dest_id,
+    )
+
+    return line_dest_id
+
+
+def obtener_move_destino_desde_linea_destino(line_dest_id):
+    from App_Connection import models, db, uid, password
+
+    line = models.execute_kw(
+        db, uid, password,
+        "account.move.line",
+        "read",
+        [[line_dest_id]],
+        {"fields": ["move_id"]},
+    )[0]
+
+    return line["move_id"][0]
+
+
+def conciliar_un_asiento_por_name_origen(
+        move_name_origen,
+        company_id_origen=2,
+        migrar_si_falta=True,
+):
+    """
+    Replica en DESTINO las conciliaciones de UN asiento origen indicado por name.
+
+    Flujo:
+    1) Busca account.move en ORIGEN por name + company_id.
+    2) Busca account.move destino por x_id_interno = id origen.
+    3) Lee las líneas conciliables del asiento origen.
+    4) Obtiene los account.partial.reconcile implicados.
+    5) Para cada partial:
+        - resuelve debit_move_id y credit_move_id origen
+        - busca sus líneas destino por x_id_interno
+        - si falta algún move destino, opcionalmente lo migra
+        - crea el partial exacto en destino
+        - si las cuentas son distintas, corrige la cuenta destino según origen y reintenta
+
+    Requiere que existan en tu script:
+        models_src, db_src, uid_src, password_src
+        models, db, uid, password
+        obtener_linea_destino_desde_linea_origen
+        crear_partial_reconcile_exacto
+        corregir_cuenta_linea_destino_desde_origen
+        migrar_pago_origen_a_destino
+    """
+
+    from App_Connection import models, db, uid, password
+
+    print("=" * 100)
+    print("🔗 Conciliando UN asiento por name origen")
+    print(f"📄 Asiento origen name: {move_name_origen}")
+    print(f"🏢 Company origen: {company_id_origen}")
+    print(f"📦 Migrar si falta contraparte: {migrar_si_falta}")
+    print("=" * 100)
+
+    resultado = {
+        "ok": False,
+        "move_name_origen": move_name_origen,
+        "move_src_id": None,
+        "move_dest_id": None,
+        "partials_procesados": 0,
+        "partials_creados": 0,
+        "partials_ya_existian": 0,
+        "partials_omitidos": 0,
+        "partials_error": 0,
+        "contrapartes_migradas": 0,
+        "errores": [],
+    }
+
+    # -------------------------------------------------
+    # 1) Buscar asiento origen por name
+    # -------------------------------------------------
+
+    moves_src = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move",
+        "search_read",
+        [[
+            ("name", "=", move_name_origen),
+            ("company_id", "=", company_id_origen),
+            ("state", "=", "posted"),
+        ]],
+        {
+            "fields": [
+                "id",
+                "name",
+                "date",
+                "journal_id",
+                "move_type",
+                "state",
+            ],
+            "limit": 1,
+        },
+    )
+
+    if not moves_src:
+        print(f"❌ No se encontró asiento origen publicado: {move_name_origen}")
+        resultado["errores"].append("asiento origen no encontrado")
+        return resultado
+
+    move_src = moves_src[0]
+    move_src_id = move_src["id"]
+    resultado["move_src_id"] = move_src_id
+
+    print("✅ Asiento origen encontrado")
+    print(f"   ID origen: {move_src_id}")
+    print(f"   Name: {move_src.get('name')}")
+    print(f"   Fecha: {move_src.get('date')}")
+    print(f"   Diario: {move_src['journal_id'][1] if move_src.get('journal_id') else ''}")
+    print(f"   Tipo: {move_src.get('move_type')}")
+
+    # -------------------------------------------------
+    # 2) Buscar asiento destino por x_id_interno
+    # -------------------------------------------------
+
+    move_dest_ids = models.execute_kw(
+        db, uid, password,
+        "account.move",
+        "search",
+        [[("x_id_interno", "=", move_src_id)]],
+        {"limit": 1},
+    )
+
+    if not move_dest_ids:
+        print(f"❌ No se encontró asiento destino por x_id_interno={move_src_id}")
+        resultado["errores"].append("asiento destino no encontrado por x_id_interno")
+        return resultado
+
+    move_dest_id = move_dest_ids[0]
+    resultado["move_dest_id"] = move_dest_id
+
+    print(f"✅ Asiento destino encontrado por x_id_interno")
+    print(f"   ID destino: {move_dest_id}")
+
+    # -------------------------------------------------
+    # 3) Leer líneas conciliables del asiento origen
+    # -------------------------------------------------
+
+    lineas_conciliables = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line",
+        "search_read",
+        [[
+            ("move_id", "=", move_src_id),
+            ("account_id.reconcile", "=", True),
+        ]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "account_id",
+                "matched_debit_ids",
+                "matched_credit_ids",
+                "debit",
+                "credit",
+                "balance",
+                "amount_residual",
+                "matching_number",
+            ],
+            "order": "id asc",
+        },
+    )
+
+    print(f"📊 Líneas conciliables origen: {len(lineas_conciliables)}")
+
+    if not lineas_conciliables:
+        print("ℹ️ El asiento origen no tiene líneas conciliables.")
+        resultado["errores"].append("sin líneas conciliables")
+        return resultado
+
+    partial_ids_origen = set()
+
+    for line in lineas_conciliables:
+        partials_linea = set(line.get("matched_debit_ids") or []) | set(
+            line.get("matched_credit_ids") or []
+        )
+
+        if partials_linea:
+            partial_ids_origen.update(partials_linea)
+
+            print(
+                f"   🔎 Línea origen {line['id']} | "
+                f"Cuenta: {line['account_id'][1] if line.get('account_id') else ''} | "
+                f"Debe: {line.get('debit')} | Haber: {line.get('credit')} | "
+                f"Balance: {line.get('balance')} | "
+                f"Matching: {line.get('matching_number')} | "
+                f"Partials: {list(partials_linea)}"
+            )
+
+    if not partial_ids_origen:
+        print("ℹ️ El asiento origen no tiene partial reconciles.")
+        resultado["errores"].append("sin partials")
+        return resultado
+
+    print(f"🔎 Partials origen detectados: {len(partial_ids_origen)}")
+
+    # -------------------------------------------------
+    # 4) Leer partials origen
+    # -------------------------------------------------
+
+    partials = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.partial.reconcile",
+        "read",
+        [list(partial_ids_origen)],
+        {
+            "fields": [
+                "id",
+                "debit_move_id",
+                "credit_move_id",
+                "amount",
+                "debit_amount_currency",
+                "credit_amount_currency",
+            ]
+        },
+    )
+
+    # -------------------------------------------------
+    # 5) Procesar cada partial
+    # -------------------------------------------------
+    tax_moves_revisados = set()
+
+    for pr in partials:
+        partial_id = pr["id"]
+        resultado["partials_procesados"] += 1
+
+        try:
+            debit_line_src_id = pr["debit_move_id"][0]
+            credit_line_src_id = pr["credit_move_id"][0]
+
+            # -------------------------------------------------
+            # Leer líneas origen del partial
+            # -------------------------------------------------
+
+            src_lines = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.move.line",
+                "read",
+                [[debit_line_src_id, credit_line_src_id]],
+                {
+                    "fields": [
+                        "id",
+                        "move_id",
+                        "account_id",
+                        "debit",
+                        "credit",
+                        "balance",
+                    ]
+                },
+            )
+
+            line_by_id = {l["id"]: l for l in src_lines}
+
+            debit_move_src_id = line_by_id[debit_line_src_id]["move_id"][0]
+            credit_move_src_id = line_by_id[credit_line_src_id]["move_id"][0]
+
+            src_moves = models_src.execute_kw(
+                db_src, uid_src, password_src,
+                "account.move",
+                "read",
+                [[debit_move_src_id, credit_move_src_id]],
+                {
+                    "fields": [
+                        "id",
+                        "name",
+                        "move_type",
+                        "date",
+                    ]
+                },
+            )
+
+            move_by_id = {m["id"]: m for m in src_moves}
+
+            debit_move_name = move_by_id[debit_move_src_id]["name"]
+            credit_move_name = move_by_id[credit_move_src_id]["name"]
+
+            print("")
+            print("-" * 100)
+            print(
+                f"🔹 Partial origen {partial_id}: "
+                f"{debit_move_name} ↔ {credit_move_name} "
+                f"amount={pr['amount']}"
+            )
+            print(f"   Debit line origen: {debit_line_src_id}")
+            print(f"   Credit line origen: {credit_line_src_id}")
+
+            # -------------------------------------------------
+            # 5.1) Asegurar que ambos moves existen en destino
+            # -------------------------------------------------
+
+            for move_src_id_tmp, move_name_tmp in [
+                (debit_move_src_id, debit_move_name),
+                (credit_move_src_id, credit_move_name),
+            ]:
+                move_dest_tmp = models.execute_kw(
+                    db, uid, password,
+                    "account.move",
+                    "search",
+                    [[("x_id_interno", "=", move_src_id_tmp)]],
+                    {"limit": 1},
+                )
+
+                if not move_dest_tmp:
+                    if migrar_si_falta:
+                        print(
+                            f"   ⚠️ Move destino no existe, se migra: "
+                            f"{move_name_tmp} | origen_id={move_src_id_tmp}"
+                        )
+
+                        migrar_pago_origen_a_destino(move_src_id_tmp)
+                        resultado["contrapartes_migradas"] += 1
+                    else:
+                        msg = (
+                            f"Move destino no existe: "
+                            f"{move_name_tmp} | origen_id={move_src_id_tmp}"
+                        )
+                        print(f"   ❌ {msg}")
+                        resultado["partials_omitidos"] += 1
+                        resultado["errores"].append(msg)
+                        continue
+
+            # -------------------------------------------------
+            # 5.2) Resolver líneas destino
+            # -------------------------------------------------
+
+            debit_line_dest_id = obtener_linea_destino_corrigiendo_cuenta_y_tax(
+                debit_line_src_id,
+                amount=pr["amount"],
+            )
+
+            credit_line_dest_id = obtener_linea_destino_corrigiendo_cuenta_y_tax(
+                credit_line_src_id,
+                amount=pr["amount"],
+            )
+
+            print(f"   ✅ Debit destino line_id: {debit_line_dest_id}")
+            print(f"   ✅ Credit destino line_id: {credit_line_dest_id}")
+
+            if not debit_line_dest_id or not credit_line_dest_id:
+                msg = (
+                    f"No se pudieron resolver líneas destino "
+                    f"debit={debit_line_src_id}->{debit_line_dest_id}, "
+                    f"credit={credit_line_src_id}->{credit_line_dest_id}"
+                )
+                print(f"   ❌ {msg}")
+                resultado["partials_omitidos"] += 1
+                resultado["errores"].append(msg)
+                continue
+
+            # -------------------------------------------------
+            # 5.2.1) Revisar/corregir tax_total SIEMPRE
+            #        independientemente de si la cuenta coincide o no
+            # -------------------------------------------------
+
+            for move_src_tmp, line_dest_tmp, etiqueta in [
+                (debit_move_src_id, debit_line_dest_id, "debit"),
+                (credit_move_src_id, credit_line_dest_id, "credit"),
+            ]:
+                move_dest_tmp = obtener_move_destino_desde_linea_destino(line_dest_tmp)
+
+                key_tax = (move_src_tmp, move_dest_tmp)
+
+                if key_tax in tax_moves_revisados:
+                    continue
+
+                print(
+                    f"   🧾 Revisando tax_total {etiqueta}: "
+                    f"move_origen_id={move_src_tmp}, move_destino_id={move_dest_tmp}"
+                )
+
+                corregir_tax_total_destino_desde_origen(
+                    move_src_tmp,
+                    move_dest_tmp,
+                )
+
+                tax_moves_revisados.add(key_tax)
+
+            # -------------------------------------------------
+            # 5.3) Ver si ya existe partial destino
+            # -------------------------------------------------
+
+            amount_abs = abs(float(pr["amount"] or 0.0))
+
+            partial_dest_existente = models.execute_kw(
+                db, uid, password,
+                "account.partial.reconcile",
+                "search",
+                [[
+                    ("debit_move_id", "=", debit_line_dest_id),
+                    ("credit_move_id", "=", credit_line_dest_id),
+                    ("amount", "=", amount_abs),
+                ]],
+                {"limit": 1},
+            )
+
+            if partial_dest_existente:
+                print(
+                    f"   ⏭️ Partial ya existe en destino: "
+                    f"debit={debit_line_dest_id}, credit={credit_line_dest_id}, amount={amount_abs}"
+                )
+                resultado["partials_ya_existian"] += 1
+                continue
+
+            # -------------------------------------------------
+            # 5.4) Crear partial exacto
+            # -------------------------------------------------
+
+            try:
+                crear_partial_reconcile_exacto(
+                    debit_line_dest_id,
+                    credit_line_dest_id,
+                    pr["amount"],
+                    pr.get("debit_amount_currency") or pr["amount"],
+                    pr.get("credit_amount_currency") or pr["amount"],
+                )
+
+                print("   ✅ Partial creado correctamente")
+                resultado["partials_creados"] += 1
+
+            except Exception as e:
+                msg = str(e)
+
+                if "Las líneas no son de la misma cuenta" in msg:
+                    print(
+                        f"   🔧 Cuentas distintas. Corrigiendo líneas para partial {partial_id}"
+                    )
+
+                    corregir_cuenta_linea_destino_desde_origen(
+                        debit_line_src_id,
+                        debit_line_dest_id,
+                    )
+
+                    corregir_tax_total_destino_desde_origen(
+                        debit_move_src_id,
+                        line_by_id[debit_line_src_id]["move_id"][0]
+                        and models.execute_kw(
+                            db, uid, password,
+                            "account.move.line",
+                            "read",
+                            [[debit_line_dest_id]],
+                            {"fields": ["move_id"]},
+                        )[0]["move_id"][0],
+                    )
+
+                    corregir_cuenta_linea_destino_desde_origen(
+                        credit_line_src_id,
+                        credit_line_dest_id,
+                    )
+
+                    corregir_tax_total_destino_desde_origen(
+                        credit_move_src_id,
+                        line_by_id[credit_line_src_id]["move_id"][0]
+                        and models.execute_kw(
+                            db, uid, password,
+                            "account.move.line",
+                            "read",
+                            [[credit_line_dest_id]],
+                            {"fields": ["move_id"]},
+                        )[0]["move_id"][0],
+                    )
+
+                    crear_partial_reconcile_exacto(
+                        debit_line_dest_id,
+                        credit_line_dest_id,
+                        pr["amount"],
+                        pr.get("debit_amount_currency") or pr["amount"],
+                        pr.get("credit_amount_currency") or pr["amount"],
+                    )
+
+                    print("   ✅ Partial creado correctamente tras corregir cuentas")
+                    resultado["partials_creados"] += 1
+                    continue
+
+                if (
+                        "Residual insuficiente" in msg
+                        or "residual insuficiente" in msg
+                        or "residual menor a 0,10" in msg
+                        or "sin residual útil" in msg
+                        or "Partial ya existe" in msg
+                ):
+                    print(f"   ⏭️ Partial omitido por residual/ya existente: {msg}")
+                    resultado["partials_omitidos"] += 1
+                    continue
+
+                raise
+
+        except Exception as e:
+            msg = str(e)
+            print(f"❌ Error procesando partial origen {partial_id}: {msg}")
+            resultado["partials_error"] += 1
+            resultado["errores"].append({
+                "partial_id": partial_id,
+                "error": msg,
+            })
+            continue
+
+    # -------------------------------------------------
+    # 6) Resumen
+    # -------------------------------------------------
+
+    resultado["ok"] = resultado["partials_creados"] > 0 or resultado["partials_ya_existian"] > 0
+
+    print("")
+    print("=" * 100)
+    print("🏁 RESUMEN CONCILIACIÓN UN ASIENTO")
+    print("=" * 100)
+    print(f"📄 Asiento origen: {move_name_origen}")
+    print(f"🆔 Move origen ID: {resultado['move_src_id']}")
+    print(f"🆔 Move destino ID: {resultado['move_dest_id']}")
+    print(f"🔎 Partials procesados: {resultado['partials_procesados']}")
+    print(f"✅ Partials creados: {resultado['partials_creados']}")
+    print(f"⏭️ Partials ya existentes: {resultado['partials_ya_existian']}")
+    print(f"⚠️ Partials omitidos: {resultado['partials_omitidos']}")
+    print(f"📦 Contrapartes migradas: {resultado['contrapartes_migradas']}")
+    print(f"💥 Errores: {resultado['partials_error']}")
+    print("=" * 100)
+
+    return resultado
+
+
+def conciliar_asientos_2025_origen_conciliados_destino_no(
+        company_id_origen=2,
+        fecha_inicio="2025-01-01",
+        fecha_fin="2026-01-01",
+        limite_asientos=None,
+        migrar_si_falta=True,
+        saltar_nominas=False,
+):
+    """
+    Busca asientos origen del año 2025 que están conciliados en ORIGEN,
+    pero cuyas líneas equivalentes en DESTINO no están conciliadas.
+
+    Para cada asiento detectado llama a:
+
+        conciliar_un_asiento_por_name_origen(...)
+
+    Importante:
+    - El rango 2025 solo se usa para decidir qué asientos base procesar.
+    - Las contrapartes pueden ser de otros años.
+    - Se asume que los asientos implicados ya están migrados.
+    - La búsqueda destino se hace por x_id_interno.
+    """
+
+    from App_Connection import models, db, uid, password
+    from collections import OrderedDict
+
+    print("=" * 100)
+    print("🚀 CONCILIACIÓN MASIVA 2025 USANDO FUNCIÓN INDIVIDUAL")
+    print("=" * 100)
+    print(f"🏢 Company origen: {company_id_origen}")
+    print(f"📅 Fecha inicio: {fecha_inicio}")
+    print(f"📅 Fecha fin:    {fecha_fin}")
+    print(f"🔢 Límite asientos: {limite_asientos}")
+    print(f"📦 Migrar si falta: {migrar_si_falta}")
+    print(f"⏭️ Saltar nóminas: {saltar_nominas}")
+    print("=" * 100)
+
+    # -------------------------------------------------
+    # 1) Buscar líneas origen conciliadas en 2025
+    # -------------------------------------------------
+
+    lineas_origen = models_src.execute_kw(
+        db_src, uid_src, password_src,
+        "account.move.line",
+        "search_read",
+        [[
+            ("company_id", "=", company_id_origen),
+            ("date", ">=", fecha_inicio),
+            ("date", "<", fecha_fin),
+            ("account_id.reconcile", "=", True),
+            "|",
+            ("matched_debit_ids", "!=", False),
+            ("matched_credit_ids", "!=", False),
+        ]],
+        {
+            "fields": [
+                "id",
+                "move_id",
+                "date",
+                "account_id",
+                "debit",
+                "credit",
+                "balance",
+                "matched_debit_ids",
+                "matched_credit_ids",
+                "matching_number",
+            ],
+            "order": "date asc, id asc",
+        },
+    )
+
+    print(f"📊 Líneas origen conciliadas en rango: {len(lineas_origen)}")
+
+    if not lineas_origen:
+        print("✅ No hay líneas origen conciliadas en el rango.")
+        return {
+            "procesados": 0,
+            "candidatos": 0,
+            "conciliados": [],
+            "ya_conciliados": [],
+            "omitidos": [],
+            "errores": [],
+        }
+
+    # -------------------------------------------------
+    # 2) Agrupar por asiento origen
+    # -------------------------------------------------
+
+    asientos_origen = OrderedDict()
+
+    for l in lineas_origen:
+        if not l.get("move_id"):
+            continue
+
+        move_id = l["move_id"][0]
+        move_name = l["move_id"][1]
+
+        if saltar_nominas and "NOMIN" in move_name.upper():
+            continue
+
+        if move_id not in asientos_origen:
+            asientos_origen[move_id] = {
+                "move_id": move_id,
+                "move_name": move_name,
+                "lineas": [],
+            }
+
+        asientos_origen[move_id]["lineas"].append(l)
+
+    print(f"📦 Asientos origen con conciliación en 2025: {len(asientos_origen)}")
+
+    # -------------------------------------------------
+    # 3) Detectar cuáles NO están conciliados en destino
+    # -------------------------------------------------
+
+    candidatos = OrderedDict()
+    ya_conciliados = []
+    omitidos = []
+
+    print("")
+    print("🔎 Comparando conciliación contra DESTINO...")
+
+    for move_id, data in asientos_origen.items():
+        move_name = data["move_name"]
+        lineas = data["lineas"]
+
+        # Buscar asiento destino por x_id_interno del move origen.
+        move_dest_ids = models.execute_kw(
+            db, uid, password,
+            "account.move",
+            "search",
+            [[("x_id_interno", "=", move_id)]],
+            {"limit": 1},
+        )
+
+        if not move_dest_ids:
+            print(f"   ❌ Sin asiento destino: {move_name} | origen_id={move_id}")
+            omitidos.append({
+                "move_id": move_id,
+                "move_name": move_name,
+                "motivo": "asiento destino no encontrado por x_id_interno",
+            })
+            continue
+
+        faltan_conciliaciones = False
+        lineas_destino_no_conciliadas = []
+        lineas_destino_no_encontradas = []
+
+        for lo in lineas:
+            line_src_id = lo["id"]
+
+            line_dest = models.execute_kw(
+                db, uid, password,
+                "account.move.line",
+                "search_read",
+                [[
+                    ("x_id_interno", "=", line_src_id),
+                    ("account_id.reconcile", "=", True),
+                ]],
+                {
+                    "fields": [
+                        "id",
+                        "move_id",
+                        "account_id",
+                        "reconciled",
+                        "full_reconcile_id",
+                        "matched_debit_ids",
+                        "matched_credit_ids",
+                        "amount_residual",
+                        "debit",
+                        "credit",
+                        "balance",
+                    ],
+                    "limit": 1,
+                },
+            )
+
+            if not line_dest:
+                # No descartamos automáticamente.
+                # Puede ser un caso como los que ya has visto: la línea existe,
+                # pero no conserva x_id_interno exacto y tu función individual
+                # la resuelve por fallback.
+                faltan_conciliaciones = True
+                lineas_destino_no_encontradas.append(line_src_id)
+                continue
+
+            ld = line_dest[0]
+
+            destino_conciliado = bool(
+                ld.get("reconciled")
+                or ld.get("full_reconcile_id")
+                or ld.get("matched_debit_ids")
+                or ld.get("matched_credit_ids")
+            )
+
+            if not destino_conciliado:
+                faltan_conciliaciones = True
+                lineas_destino_no_conciliadas.append(ld["id"])
+
+        if faltan_conciliaciones:
+            candidatos[move_id] = {
+                "move_id": move_id,
+                "move_name": move_name,
+                "lineas_destino_no_conciliadas": lineas_destino_no_conciliadas,
+                "lineas_destino_no_encontradas": lineas_destino_no_encontradas,
+            }
+
+            print(
+                f"   🔴 Candidato: {move_name} | "
+                f"no conciliadas destino={len(lineas_destino_no_conciliadas)} | "
+                f"no encontradas por x_id={len(lineas_destino_no_encontradas)}"
+            )
+        else:
+            ya_conciliados.append({
+                "move_id": move_id,
+                "move_name": move_name,
+            })
+
+    candidatos_items = list(candidatos.values())
+
+    if limite_asientos:
+        candidatos_items = candidatos_items[:limite_asientos]
+
+    print("")
+    print("=" * 100)
+    print("📊 DETECCIÓN FINALIZADA")
+    print("=" * 100)
+    print(f"📦 Asientos origen revisados: {len(asientos_origen)}")
+    print(f"🔴 Asientos candidatos a conciliar: {len(candidatos_items)}")
+    print(f"✅ Asientos ya conciliados destino: {len(ya_conciliados)}")
+    print(f"⚠️ Asientos omitidos: {len(omitidos)}")
+    print("=" * 100)
+
+    # -------------------------------------------------
+    # 4) Conciliar candidatos usando la función individual
+    # -------------------------------------------------
+
+    resumen = {
+        "procesados": 0,
+        "candidatos": len(candidatos_items),
+        "conciliados": [],
+        "ya_conciliados": ya_conciliados,
+        "omitidos": omitidos,
+        "errores": [],
+    }
+
+    for idx, item in enumerate(candidatos_items, start=1):
+        move_name = item["move_name"]
+        move_id = item["move_id"]
+
+        print("")
+        print("#" * 100)
+        print(f"📌 Procesando candidato {idx}/{len(candidatos_items)}")
+        print(f"📄 Asiento origen: {move_name}")
+        print(f"🆔 Move origen ID: {move_id}")
+        print("#" * 100)
+
+        try:
+            res = conciliar_un_asiento_por_name_origen(
+                move_name,
+                company_id_origen=company_id_origen,
+                migrar_si_falta=migrar_si_falta,
+            )
+
+            resumen["procesados"] += 1
+
+            partials_creados = res.get("partials_creados", 0) if res else 0
+            partials_ya = res.get("partials_ya_existian", 0) if res else 0
+            partials_omitidos = res.get("partials_omitidos", 0) if res else 0
+            partials_error = res.get("partials_error", 0) if res else 0
+
+            if partials_creados or partials_ya:
+                resumen["conciliados"].append({
+                    "move_id": move_id,
+                    "move_name": move_name,
+                    "partials_creados": partials_creados,
+                    "partials_ya_existian": partials_ya,
+                    "partials_omitidos": partials_omitidos,
+                    "partials_error": partials_error,
+                    "resultado": res,
+                })
+            else:
+                resumen["errores"].append({
+                    "move_id": move_id,
+                    "move_name": move_name,
+                    "motivo": "sin partials creados ni existentes",
+                    "resultado": res,
+                })
+
+        except Exception as e:
+            print(f"💥 Error procesando asiento {move_name}: {e}")
+
+            resumen["procesados"] += 1
+            resumen["errores"].append({
+                "move_id": move_id,
+                "move_name": move_name,
+                "error": str(e),
+            })
+
+    # -------------------------------------------------
+    # 5) Resumen final
+    # -------------------------------------------------
+
+    print("")
+    print("=" * 100)
+    print("🏁 RESUMEN FINAL MASIVO")
+    print("=" * 100)
+    print(f"🔴 Candidatos detectados: {resumen['candidatos']}")
+    print(f"🔁 Procesados: {resumen['procesados']}")
+    print(f"✅ Conciliados / ya existentes: {len(resumen['conciliados'])}")
+    print(f"✅ Ya conciliados desde detección: {len(resumen['ya_conciliados'])}")
+    print(f"⚠️ Omitidos en detección: {len(resumen['omitidos'])}")
+    print(f"💥 Errores: {len(resumen['errores'])}")
+
+    if resumen["errores"]:
+        print("")
+        print("💥 ERRORES / NO CONCILIADOS:")
+        # Filtramos primero para mantener el límite máximo de 80 impresiones
+        errores_filtrados = [
+            e for e in resumen["errores"]
+            if not str(e.get('move_name') or '').startswith('F')
+        ]
+        for e in errores_filtrados[:80]:
+            print(
+                f"   - {e.get('move_name')} | "
+                f"{e.get('error') or e.get('motivo') or ''}"
+            )
+
+    if resumen["omitidos"]:
+        print("")
+        print("⚠️ OMITIDOS:")
+        # Aplicamos el mismo filtro para los omitidos
+        omitidos_filtrados = [
+            o for o in resumen["omitidos"]
+            if not str(o.get('move_name') or '').startswith('F')
+        ]
+        for o in omitidos_filtrados[:80]:
+            print(
+                f"   - {o.get('move_name')} | "
+                f"{o.get('motivo')}"
+            )
+
+    print("=" * 100)
+
+    return resumen
+
+
+# conciliar_un_asiento_por_name_origen("FC1OP/25/1317")
+
+# endregion
+
+def eliminar_movimientos_hasta_2025(
+        company_id=None,
+        dry_run=True,
+):
+    """
+    Elimina movimientos contables con fecha <= 2025-12-31,
+    independientemente de su estado y move_type.
+
+    PROTECCIÓN OBLIGATORIA:
+        Si alguna conciliación del movimiento está relacionada con
+        un asiento de 2026 o posterior, el movimiento se omite por completo:
+
+            - No se rompe la conciliación.
+            - No se pasa a borrador.
+            - No se elimina.
+
+    Los movimientos que únicamente estén conciliados con asientos
+    de 2025 o anteriores sí podrán desconciliarse y eliminarse.
+    """
+
+    fecha_limite = "2025-12-31"
+
+    dominio = [
+        ("date", "<=", fecha_limite),
+    ]
+
+    if company_id:
+        dominio.append(("company_id", "=", company_id))
+
+    resultado = {
+        "encontrados": 0,
+        "simulados": [],
+        "eliminados": [],
+        "omitidos_por_2026": [],
+        "pasados_a_borrador": 0,
+        "conciliaciones_rotas": 0,
+        "errores": [],
+    }
+
+    def obtener_id_many2one(valor):
+        if isinstance(valor, (list, tuple)) and valor:
+            return valor[0]
+
+        return valor or False
+
+    def obtener_conciliaciones_y_contrapartes(
+            move_id,
+            line_ids,
+    ):
+        """
+        Devuelve:
+
+            partials:
+                Conciliaciones parciales en las que participan las líneas
+                del asiento.
+
+            movimientos_relacionados:
+                Todos los account.move implicados en esas conciliaciones,
+                excepto el asiento actual.
+
+            movimientos_2026:
+                Contrapartes cuya fecha es posterior a 2025-12-31.
+        """
+
+        if not line_ids:
+            return [], [], []
+
+        partials = models.execute_kw(
+            db,
+            uid,
+            password,
+            "account.partial.reconcile",
+            "search_read",
+            [[
+                "|",
+                ("debit_move_id", "in", line_ids),
+                ("credit_move_id", "in", line_ids),
+            ]],
+            {
+                "fields": [
+                    "debit_move_id",
+                    "credit_move_id",
+                    "amount",
+                    "full_reconcile_id",
+                ],
+            },
+        )
+
+        if not partials:
+            return [], [], []
+
+        lineas_implicadas = set()
+
+        for partial in partials:
+            debit_line_id = obtener_id_many2one(
+                partial.get("debit_move_id")
+            )
+            credit_line_id = obtener_id_many2one(
+                partial.get("credit_move_id")
+            )
+
+            if debit_line_id:
+                lineas_implicadas.add(debit_line_id)
+
+            if credit_line_id:
+                lineas_implicadas.add(credit_line_id)
+
+        if not lineas_implicadas:
+            return partials, [], []
+
+        datos_lineas = models.execute_kw(
+            db,
+            uid,
+            password,
+            "account.move.line",
+            "read",
+            [list(lineas_implicadas)],
+            {
+                "fields": [
+                    "move_id",
+                    "date",
+                    "name",
+                ],
+            },
+        )
+
+        move_ids_relacionados = set()
+
+        for linea in datos_lineas:
+            related_move_id = obtener_id_many2one(
+                linea.get("move_id")
+            )
+
+            if related_move_id and related_move_id != move_id:
+                move_ids_relacionados.add(related_move_id)
+
+        if not move_ids_relacionados:
+            return partials, [], []
+
+        movimientos_relacionados = models.execute_kw(
+            db,
+            uid,
+            password,
+            "account.move",
+            "read",
+            [list(move_ids_relacionados)],
+            {
+                "fields": [
+                    "name",
+                    "ref",
+                    "date",
+                    "state",
+                    "move_type",
+                ],
+            },
+        )
+
+        movimientos_2026 = [
+            move
+            for move in movimientos_relacionados
+            if move.get("date")
+               and move["date"] > fecha_limite
+        ]
+
+        return (
+            partials,
+            movimientos_relacionados,
+            movimientos_2026,
+        )
+
+    move_ids = models.execute_kw(
+        db,
+        uid,
+        password,
+        "account.move",
+        "search",
+        [dominio],
+        {
+            "order": "date, id",
+        },
+    )
+
+    resultado["encontrados"] = len(move_ids)
+
+    modo = "SIMULACIÓN" if dry_run else "ELIMINACIÓN REAL"
+
+    print("=" * 100)
+    print(f"🧹 {modo}")
+    print(f"📅 Movimientos hasta: {fecha_limite}")
+    print(f"📄 Movimientos encontrados: {len(move_ids)}")
+    print("🛡️ Protección de conciliaciones con 2026: ACTIVADA")
+    print("=" * 100)
+
+    for posicion, move_id in enumerate(move_ids, start=1):
+        try:
+            datos = models.execute_kw(
+                db,
+                uid,
+                password,
+                "account.move",
+                "read",
+                [[move_id]],
+                {
+                    "fields": [
+                        "name",
+                        "ref",
+                        "date",
+                        "state",
+                        "move_type",
+                        "line_ids",
+                        "company_id",
+                    ],
+                },
+            )
+
+            if not datos:
+                print(
+                    f"\n[{posicion}/{len(move_ids)}] "
+                    f"⚠️ El movimiento ID {move_id} ya no existe."
+                )
+                continue
+
+            movimiento = datos[0]
+
+            nombre = movimiento.get("name") or "/"
+            referencia = movimiento.get("ref") or ""
+            fecha = movimiento.get("date")
+            estado = movimiento.get("state")
+            move_type = movimiento.get("move_type")
+            line_ids = movimiento.get("line_ids") or []
+
+            print(
+                f"\n[{posicion}/{len(move_ids)}] "
+                f"📄 {nombre} | ID={move_id} | Fecha={fecha} "
+                f"| Estado={estado} | Tipo={move_type} "
+                f"| Ref={referencia}"
+            )
+
+            (
+                partials,
+                movimientos_relacionados,
+                movimientos_2026,
+            ) = obtener_conciliaciones_y_contrapartes(
+                move_id,
+                line_ids,
+            )
+
+            partial_ids = [
+                partial["id"]
+                for partial in partials
+            ]
+
+            # -----------------------------------------------------
+            # PROTECCIÓN PRINCIPAL:
+            # si toca cualquier asiento posterior a 2025, no hacer nada
+            # -----------------------------------------------------
+            if movimientos_2026:
+                print(
+                    "   🛡️ OMITIDO: tiene conciliaciones relacionadas "
+                    "con uno o más asientos de 2026 o posteriores."
+                )
+
+                relacionados = []
+
+                for relacionado in movimientos_2026:
+                    detalle = {
+                        "move_id": relacionado["id"],
+                        "name": relacionado.get("name") or "/",
+                        "date": relacionado.get("date"),
+                        "state": relacionado.get("state"),
+                        "move_type": relacionado.get("move_type"),
+                    }
+
+                    relacionados.append(detalle)
+
+                    print(
+                        f"      - {detalle['name']} "
+                        f"| ID={detalle['move_id']} "
+                        f"| Fecha={detalle['date']} "
+                        f"| Estado={detalle['state']}"
+                    )
+
+                print(
+                    "   ✅ No se ha roto ninguna conciliación, "
+                    "no se ha pasado a borrador y no se ha eliminado."
+                )
+
+                resultado["omitidos_por_2026"].append(
+                    {
+                        "move_id": move_id,
+                        "name": nombre,
+                        "date": fecha,
+                        "state": estado,
+                        "move_type": move_type,
+                        "partial_ids": partial_ids,
+                        "relacionados_2026": relacionados,
+                    }
+                )
+
+                continue
+
+            if dry_run:
+                if partial_ids:
+                    print(
+                        f"   🔎 Se romperían {len(partial_ids)} "
+                        "conciliaciones."
+                    )
+
+                    if movimientos_relacionados:
+                        print(
+                            "   🔗 Contrapartes permitidas "
+                            "(todas son de 2025 o anteriores):"
+                        )
+
+                        for relacionado in movimientos_relacionados:
+                            print(
+                                f"      - "
+                                f"{relacionado.get('name') or '/'} "
+                                f"| ID={relacionado['id']} "
+                                f"| Fecha={relacionado.get('date')}"
+                            )
+
+                if estado != "draft":
+                    print(
+                        f"   🔎 Se pasaría del estado '{estado}' "
+                        "a borrador."
+                    )
+
+                print("   🔎 Se eliminaría el movimiento.")
+
+                resultado["simulados"].append(
+                    {
+                        "move_id": move_id,
+                        "name": nombre,
+                        "date": fecha,
+                        "state": estado,
+                        "move_type": move_type,
+                        "conciliaciones": len(partial_ids),
+                    }
+                )
+
+                continue
+
+            # -----------------------------------------------------
+            # SEGUNDA COMPROBACIÓN justo antes de tocar conciliaciones
+            # Evita actuar con información desactualizada.
+            # -----------------------------------------------------
+            (
+                partials_actuales,
+                _movimientos_relacionados_actuales,
+                movimientos_2026_actuales,
+            ) = obtener_conciliaciones_y_contrapartes(
+                move_id,
+                line_ids,
+            )
+
+            partial_ids_actuales = [
+                partial["id"]
+                for partial in partials_actuales
+            ]
+
+            if movimientos_2026_actuales:
+                print(
+                    "   🛡️ OMITIDO EN SEGUNDA COMPROBACIÓN: "
+                    "se ha detectado una conciliación con 2026."
+                )
+                print("   ✅ No se modifica el movimiento.")
+
+                relacionados = []
+
+                for relacionado in movimientos_2026_actuales:
+                    detalle = {
+                        "move_id": relacionado["id"],
+                        "name": relacionado.get("name") or "/",
+                        "date": relacionado.get("date"),
+                        "state": relacionado.get("state"),
+                        "move_type": relacionado.get("move_type"),
+                    }
+
+                    relacionados.append(detalle)
+
+                    print(
+                        f"      - {detalle['name']} "
+                        f"| ID={detalle['move_id']} "
+                        f"| Fecha={detalle['date']}"
+                    )
+
+                resultado["omitidos_por_2026"].append(
+                    {
+                        "move_id": move_id,
+                        "name": nombre,
+                        "date": fecha,
+                        "state": estado,
+                        "move_type": move_type,
+                        "partial_ids": partial_ids_actuales,
+                        "relacionados_2026": relacionados,
+                    }
+                )
+
+                continue
+
+            # Solo llegamos aquí si todas las contrapartes son
+            # de 2025 o anteriores.
+            if partial_ids_actuales:
+                print(
+                    f"   🔓 Rompiendo {len(partial_ids_actuales)} "
+                    "conciliaciones permitidas..."
+                )
+
+                models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    "account.move.line",
+                    "remove_move_reconcile",
+                    [line_ids],
+                )
+
+                partials_restantes = models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    "account.partial.reconcile",
+                    "search_count",
+                    [[
+                        "|",
+                        ("debit_move_id", "in", line_ids),
+                        ("credit_move_id", "in", line_ids),
+                    ]],
+                )
+
+                if partials_restantes:
+                    raise RuntimeError(
+                        f"Siguen existiendo {partials_restantes} "
+                        "conciliaciones después de intentar romperlas."
+                    )
+
+                resultado["conciliaciones_rotas"] += len(
+                    partial_ids_actuales
+                )
+
+                print("   ✅ Conciliaciones eliminadas.")
+
+            if estado != "draft":
+                print(
+                    f"   ↩️ Pasando movimiento desde '{estado}' "
+                    "a borrador..."
+                )
+
+                models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    "account.move",
+                    "button_draft",
+                    [[move_id]],
+                )
+
+                estado_actual = models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    "account.move",
+                    "read",
+                    [[move_id]],
+                    {
+                        "fields": ["state"],
+                    },
+                )
+
+                if not estado_actual:
+                    raise RuntimeError(
+                        "El movimiento desapareció antes de eliminarlo."
+                    )
+
+                nuevo_estado = estado_actual[0].get("state")
+
+                if nuevo_estado != "draft":
+                    raise RuntimeError(
+                        "No se pudo pasar el movimiento a borrador. "
+                        f"Estado actual: {nuevo_estado}"
+                    )
+
+                resultado["pasados_a_borrador"] += 1
+
+                print("   ✅ Movimiento pasado a borrador.")
+
+            eliminado = models.execute_kw(
+                db,
+                uid,
+                password,
+                "account.move",
+                "unlink",
+                [[move_id]],
+            )
+
+            if not eliminado:
+                raise RuntimeError(
+                    "Odoo devolvió False al intentar eliminar "
+                    "el movimiento."
+                )
+
+            print("   ✅ Movimiento eliminado.")
+
+            resultado["eliminados"].append(
+                {
+                    "move_id": move_id,
+                    "name": nombre,
+                    "date": fecha,
+                    "state_original": estado,
+                    "move_type": move_type,
+                    "conciliaciones_rotas": len(
+                        partial_ids_actuales
+                    ),
+                }
+            )
+
+        except Exception as error:
+            mensaje = str(error)
+
+            print(f"   ❌ Error: {mensaje}")
+
+            resultado["errores"].append(
+                {
+                    "move_id": move_id,
+                    "error": mensaje,
+                }
+            )
+
+    restantes = models.execute_kw(
+        db,
+        uid,
+        password,
+        "account.move",
+        "search_count",
+        [dominio],
+    )
+
+    print("\n" + "=" * 100)
+    print("📊 RESUMEN")
+    print("=" * 100)
+    print(f"📄 Encontrados inicialmente: {resultado['encontrados']}")
+    print(f"🔎 Simulados: {len(resultado['simulados'])}")
+    print(f"🛡️ Omitidos por tocar 2026: {len(resultado['omitidos_por_2026'])}")
+    print(f"↩️ Pasados a borrador: {resultado['pasados_a_borrador']}")
+    print(f"🔓 Conciliaciones rotas: {resultado['conciliaciones_rotas']}")
+    print(f"✅ Eliminados: {len(resultado['eliminados'])}")
+    print(f"❌ Errores: {len(resultado['errores'])}")
+    print(f"📄 Movimientos hasta 2025 que permanecen: {restantes}")
+    print("=" * 100)
+
+    return resultado
+
 #endregion
 
 #endregion
@@ -8155,7 +12575,6 @@ def migrar_pago_origen_a_destino(move_origen_id):
     print(f"✅ Movimiento migrado: {move_name}")
     return dest_move_id
 
-
 # ============================================================
 # DETECTAR PARTIALS EXACTOS EN ORIGEN
 # ============================================================
@@ -8901,14 +13320,6 @@ def conciliar_factura(id, factura_name, estado=None):
                         [[("x_id_interno", "=", move_src_id)]],
                         {"limit": 1}
                     )
-
-                    if not move_dest_ids:
-                        move_dest_ids = models.execute_kw(
-                            db, uid, password,
-                            "account.move", "search",
-                            [[("name", "=", move_src["name"])]],
-                            {"limit": 1}
-                        )
 
                     if not move_dest_ids:
                         raise Exception(f"Move destino no encontrado: {move_src['name']}")

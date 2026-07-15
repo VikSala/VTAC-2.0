@@ -73,7 +73,7 @@ def _get_product_links(driver, modo_scrap, only_new_products, file_path="", prog
         'https://www.vtacexports.com/default/top-products.html'
     ]
 
-    SCRAP_SELECTIVO = True
+    SCRAP_SELECTIVO = False
 
     if not SCRAP_SELECTIVO:
 
