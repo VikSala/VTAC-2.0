@@ -53,6 +53,14 @@ def _init_driver():
     options.add_argument("--profile-directory=Default")
     return uc.Chrome(options=options)
 
+def _reiniciar_driver(driver):
+    try:
+        driver.quit()
+    except:
+        pass
+    driver = _init_driver()
+    time.sleep(3)
+    return driver
 
 # 🔍 Extrae los enlaces de productos UK según el modo de scraping
 def _get_product_links(driver, modo_scrap, only_new_products, file_path="", progress_callback=None):
@@ -270,6 +278,10 @@ def _scrape_productos(driver, product_links, progress_callback=None):
     emit_progress(f"🚀 Iniciando scraping de {productos_totales} productos de Reino Unido...")
 
     for i, url in enumerate(product_links, 1):
+
+        if i > 1 and i % 300 == 0:
+            driver = _reiniciar_driver(driver)
+
         # Mostrar progreso cada 10 productos o en hitos importantes
         if i % 10 == 0 or i == 1:
             porcentaje = int((i / productos_totales) * 100)
